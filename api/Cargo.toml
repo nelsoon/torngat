@@ -1,0 +1,18 @@
+[package]
+name = "torngat-api"
+description = "Torngat resource model (API types). Licensed Apache-2.0 so clients and integrations can reuse it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+time.workspace = true
+
+[lints]
+workspace = true

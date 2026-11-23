@@ -1,0 +1,5 @@
+/target
+*.raw
+*.qcow2
+/out
+mkosi.key
