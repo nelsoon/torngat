@@ -248,12 +248,12 @@ where
 fn range_boundary<RB: RangeBounds<u64>>(range: RB) -> (u64, u64) {
     let start = match range.start_bound() {
         Bound::Included(&n) => n,
-        Bound::Excluded(&n) => n + 1,
+        Bound::Excluded(&n) => n.saturating_add(1),
         Bound::Unbounded => 0,
     };
 
     let end = match range.end_bound() {
-        Bound::Included(&n) => n + 1,
+        Bound::Included(&n) => n.saturating_add(1),
         Bound::Excluded(&n) => n,
         Bound::Unbounded => u64::MAX,
     };

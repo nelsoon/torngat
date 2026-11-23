@@ -42,6 +42,10 @@ fn check_segment(s: &str) -> Result<(), KeyError> {
 }
 
 /// A validated key.
+///
+/// Keys are re-validated when log entries and snapshots are decoded, so a peer cannot inject an
+/// invalid key. Consequence: key rules may be relaxed in later releases but never tightened, or
+/// committed entries would stop decoding on replay.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Key(String);
