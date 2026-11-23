@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+// Internal protocol between node agents and controllers. Never exposed to tenants.
+// Agents connect to a controller over mTLS; the caller's node identity comes from its client
+// certificate, never from message fields. Resource payloads are JSON-encoded types of the
+// `torngat-api` crate (single schema source), tagged with `api_version`.
+package torngat.control.v1;
+
+service Control {
+  // Report (or refresh) this node's inventory. Idempotent.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  // Liveness. Soft state on the controller; never written to Raft.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // Stream of the full set of instances assigned to the caller, sent on every change.
+  rpc Assignments(AssignmentsRequest) returns (stream AssignmentSet);
+  // Observed state of one instance assigned to the caller.
+  rpc ReportInstance(InstanceReport) returns (ReportResponse);
+}
+
+message RegisterRequest {
+  string api_version = 1;
+  // JSON of torngat_api::node::NodeStatus.
+  bytes node_status_json = 2;
+}
+message RegisterResponse {}
+
+message HeartbeatRequest {}
+message HeartbeatResponse {}
+
+message AssignmentsRequest {}
+message AssignmentSet {
+  string api_version = 1;
+  // JSON of torngat_api::compute::Instance, one per assigned instance.
+  repeated bytes instances_json = 2;
+}
+
+message InstanceReport {
+  string org = 1;
+  string project = 2;
+  string name = 3;
+  // The instance's metadata.uid, so a report never applies to a recreated instance.
+  string uid = 4;
+  // One of: starting, running, stopping, stopped, failed.
+  string phase = 5;
+  uint64 observed_generation = 6;
+  // One of: qemu, cloud_hypervisor, or empty.
+  string runtime = 7;
+  string message = 8;
+}
+message ReportResponse {}

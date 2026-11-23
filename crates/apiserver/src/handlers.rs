@@ -183,7 +183,10 @@ pub async fn create_instance(
         let obj: Instance = Object {
             metadata,
             spec: input.spec,
-            status: InstanceStatus::default(),
+            status: InstanceStatus {
+                pending_operation: Some(op.id),
+                ..InstanceStatus::default()
+            },
         };
         st.store
             .put(

@@ -1,0 +1,39 @@
+[package]
+name = "torngat-controller"
+description = "Torngat controller: node registry, scheduler and agent control service."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio = { version = "1.35", features = ["sync", "time", "rt", "macros", "net"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", default-features = false, features = ["transport", "tls-ring", "server", "router"] }
+tracing = "0.1"
+uuid.workspace = true
+x509-parser = "0.18"
+torngat-api = { path = "../../api" }
+torngat-proto = { path = "../proto" }
+torngat-store = { path = "../store" }
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false }
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tonic = { version = "0.14", default-features = false, features = ["transport", "tls-ring", "channel"] }
+rcgen = "0.14"
+tempfile = "3.4"
+tokio = { version = "1.35", features = ["rt-multi-thread", "macros"] }
+torngat-agent = { path = "../agent" }
+torngat-apiserver = { path = "../apiserver" }
+torngat-store = { path = "../store", features = ["test-util"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true

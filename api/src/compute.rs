@@ -109,6 +109,9 @@ pub struct InstanceStatus {
     pub observed_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Operation to complete when the instance first reaches its desired power state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_operation: Option<uuid::Uuid>,
 }
 
 #[cfg(test)]
