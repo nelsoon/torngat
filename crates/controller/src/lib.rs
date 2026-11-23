@@ -12,6 +12,7 @@
 
 pub mod identity;
 pub mod keys;
+mod ops;
 mod scheduler;
 mod service;
 
@@ -22,6 +23,7 @@ use std::time::{Duration, Instant};
 use torngat_api::Name;
 use torngat_store::Store;
 
+pub use ops::complete_operations_once;
 pub use scheduler::schedule_once;
 pub use service::ControlService;
 
@@ -63,11 +65,14 @@ impl Controller {
         }
     }
 
-    /// Runs the scheduler forever.
+    /// Runs the reconcile loops (scheduling, operation completion) forever.
     pub async fn run_scheduler(self, every: Duration) {
         loop {
             if let Err(e) = schedule_once(&self).await {
                 tracing::warn!(error = %e, "scheduling pass failed");
+            }
+            if let Err(e) = complete_operations_once(&self).await {
+                tracing::warn!(error = %e, "operation pass failed");
             }
             tokio::time::sleep(every).await;
         }
