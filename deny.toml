@@ -1,0 +1,15 @@
+[advisories]
+yanked = "deny"
+
+[licenses]
+# Must be compatible with AGPL-3.0 (core) and Apache-2.0 (api crate).
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib", "AGPL-3.0-only", "MPL-2.0", "CDLA-Permissive-2.0"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
