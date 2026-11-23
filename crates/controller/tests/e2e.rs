@@ -192,7 +192,6 @@ async fn instance_lifecycle_through_agent() {
     .await;
     assert_eq!(vm["status"]["node"], "n1");
     assert_eq!(vm["status"]["observed_generation"], 1);
-    assert!(vm["status"].get("pending_operation").is_none());
     let op = eventually(
         &e.api,
         &format!("/v1/operations/{}", op["id"].as_str().unwrap()),
@@ -201,6 +200,14 @@ async fn instance_lifecycle_through_agent() {
     )
     .await;
     assert!(op.get("error").is_none());
+    // The link is cleared by the controller once the operation is durably done.
+    eventually(
+        &e.api,
+        &format!("{BASE}/vm-1"),
+        "pending_operation cleared",
+        |v| v["status"].get("pending_operation").is_none(),
+    )
+    .await;
     assert_eq!(runtime.running().await.len(), 1);
 
     // A failing start completes the operation with an error.
