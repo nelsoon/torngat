@@ -202,10 +202,9 @@ pub async fn create_instance(
         // Only a definite rejection releases the claim; on an unknown outcome (store error) the
         // claim stays so a retry replays instead of creating twice.
         if let (Some(k), ApiError::AlreadyExists(_) | ApiError::InvalidArgument(_)) = (&claimed, &e)
+            && let Err(release) = st.store.delete(k.clone(), Precondition::None).await
         {
-            if let Err(release) = st.store.delete(k.clone(), Precondition::None).await {
-                tracing::warn!(error = %release, "could not release request_id claim");
-            }
+            tracing::warn!(error = %release, "could not release request_id claim");
         }
         return Err(e);
     }
