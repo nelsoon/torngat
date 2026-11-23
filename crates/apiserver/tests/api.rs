@@ -329,3 +329,101 @@ async fn list_paginates_and_isolates_projects() {
     assert!(p2.get("next_page_token").is_none());
     e.store.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_paths_need_auth_and_bearer_is_case_insensitive() {
+    let e = env().await;
+    let (s, _) = call(&e.app, "GET", "/v1/nope", None, false).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = call(&e.app, "GET", "/v1/nope", None, true).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let req = Request::builder()
+        .uri(BASE)
+        .header("authorization", format!("bearer {TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        e.app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK
+    );
+    e.store.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_etags_are_rejected() {
+    let e = env().await;
+    call(
+        &e.app,
+        "POST",
+        &format!("{BASE}?instance_id=vm-e"),
+        Some(json!({"spec": spec()})),
+        true,
+    )
+    .await;
+    let (_, vm) = call(&e.app, "GET", &format!("{BASE}/vm-e"), None, true).await;
+    let good = vm["metadata"]["etag"]
+        .as_str()
+        .unwrap()
+        .trim_matches('"')
+        .to_owned();
+    for bad in [
+        good.clone(),
+        format!("\"+{good}\""),
+        format!("\"\"{good}\"\""),
+        "\"\"".into(),
+    ] {
+        let (s, v) = call(
+            &e.app,
+            "PATCH",
+            &format!("{BASE}/vm-e"),
+            Some(json!({"etag": bad, "labels": {}})),
+            true,
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+    e.store.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_duplicate_creates_share_one_operation() {
+    let e = env().await;
+    let rid = "0a1b2c3d-0000-4000-8000-000000000001";
+    let uri = format!("{BASE}?instance_id=vm-c&request_id={rid}");
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let app = e.app.clone();
+        let uri = uri.clone();
+        set.spawn(
+            async move { call(&app, "POST", &uri, Some(json!({"spec": spec()})), true).await },
+        );
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    while let Some(r) = set.join_next().await {
+        let (s, op) = r.unwrap();
+        // Every duplicate either gets the operation or is told to retry; never ALREADY_EXISTS.
+        assert!(
+            s == StatusCode::OK || s == StatusCode::SERVICE_UNAVAILABLE,
+            "{s} {op}"
+        );
+        if s == StatusCode::OK {
+            ids.insert(op["id"].as_str().unwrap().to_owned());
+        }
+    }
+    assert_eq!(ids.len(), 1);
+    // A retry after the dust settles returns the same operation.
+    let (s, op) = call(&e.app, "POST", &uri, Some(json!({"spec": spec()})), true).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(ids.contains(op["id"].as_str().unwrap()));
+    // The same request id in another project is independent.
+    let (s, _) = call(
+        &e.app,
+        "POST",
+        &format!("/v1/orgs/acme/projects/other/instances?instance_id=vm-c&request_id={rid}"),
+        Some(json!({"spec": spec()})),
+        true,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    e.store.shutdown().await.unwrap();
+}
