@@ -1,0 +1,7 @@
+This crate is copied from the `examples/log-wal` directory of openraft
+(https://github.com/databendlabs/openraft), tag v0.10.1, licensed MIT OR Apache-2.0
+(see LICENSE-MIT and LICENSE-APACHE in this directory). Original authors: the openraft
+contributors. Local changes, if any, are listed below.
+
+Local changes:
+- Cargo.toml rewritten to use crates.io dependencies instead of workspace paths.

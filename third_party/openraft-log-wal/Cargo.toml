@@ -1,0 +1,19 @@
+[package]
+name = "openraft-log-wal"
+description = "Write-ahead-log storage for openraft. Vendored from the openraft examples (v0.10.1), see NOTICE."
+version = "0.10.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+openraft = { version = "=0.10.1", features = ["serde", "type-alias"] }
+raft-log = "0.4.5"
+rmp-serde = "1.3.0"
+serde = "1"
+tokio = { version = "1.35", features = ["sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+openraft-memstore = "=0.10.1"
+tempfile = "3.4"
