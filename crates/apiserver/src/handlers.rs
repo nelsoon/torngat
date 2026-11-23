@@ -56,9 +56,15 @@ fn etag(rev: u64) -> Etag {
 }
 
 fn parse_etag(e: &Etag) -> Result<u64, ApiError> {
-    e.0.trim_matches('"')
-        .parse()
-        .map_err(|_| ApiError::InvalidArgument("malformed etag".into()))
+    let bad = || ApiError::InvalidArgument("malformed etag".into());
+    let inner =
+        e.0.strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .ok_or_else(bad)?;
+    if inner.is_empty() || !inner.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    inner.parse().map_err(|_| bad())
 }
 
 fn decode<S, St>(v: Versioned) -> Result<Object<S, St>, ApiError>
@@ -124,23 +130,39 @@ pub async fn create_instance(
         .map_err(|e| ApiError::InvalidArgument(e.to_string()))?;
     let target = resource_path(&scope, "instances", &n);
 
-    // Idempotency: a retried create with the same request_id returns the original operation.
-    let req_key = match q.request_id {
-        Some(rid) => {
-            let k = store_key("ops", &["requests", &rid.hyphenated().to_string()])?;
-            if let Some(v) = st.store.get(&k).await? {
-                let rec: RequestRecord = serde_json::from_slice(&v.value)?;
-                if rec.target != target {
-                    return Err(ApiError::InvalidArgument(
-                        "request_id was already used for a different request".into(),
-                    ));
-                }
-                return get_op(&st, rec.operation).await.map(Json);
-            }
-            Some(k)
-        }
-        None => None,
+    let op = Operation {
+        id: Uuid::now_v7(),
+        target: target.clone(),
+        done: false,
+        error: None,
     };
+
+    // Idempotency (AIP-155): claim the request_id *before* creating anything, so concurrent or
+    // crashed-and-retried duplicates always converge on the same operation.
+    let mut claimed: Option<Key> = None;
+    if let Some(rid) = q.request_id {
+        // Namespaced by scope, so tenants cannot observe each other's request ids.
+        let rid = rid.hyphenated().to_string();
+        let mut segs = vec!["requests"];
+        segs.extend(scope.segments());
+        segs.push(&rid);
+        let k = store_key("ops", &segs)?;
+        let rec = RequestRecord {
+            target: target.clone(),
+            operation: op.id,
+        };
+        match st
+            .store
+            .put(k.clone(), serde_json::to_vec(&rec)?, Precondition::Absent)
+            .await
+        {
+            Ok(_) => claimed = Some(k),
+            Err(StoreError::PreconditionFailed { .. }) => {
+                return replay(&st, &k, &target).await.map(Json);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 
     let metadata = ObjectMeta {
         name: n.clone(),
@@ -154,52 +176,93 @@ pub async fn create_instance(
         update_time: Some(now()),
         delete_time: None,
     };
-    metadata
-        .validate()
-        .map_err(|e| ApiError::InvalidArgument(e.to_string()))?;
-    let obj: Instance = Object {
-        metadata,
-        spec: input.spec,
-        status: InstanceStatus::default(),
-    };
-    st.store
-        .put(
-            instance_key(&scope, &n)?,
-            serde_json::to_vec(&obj)?,
-            Precondition::Absent,
-        )
-        .await
-        .map_err(|e| match e {
-            StoreError::PreconditionFailed { .. } => ApiError::AlreadyExists(target.clone()),
-            e => e.into(),
-        })?;
-
-    let op = Operation {
-        id: Uuid::now_v7(),
-        target: target.clone(),
-        done: false,
-        error: None,
-    };
-    st.store
-        .put(
-            store_key("ops", &["operations", &op.id.hyphenated().to_string()])?,
-            serde_json::to_vec(&op)?,
-            Precondition::Absent,
-        )
-        .await?;
-    if let Some(k) = req_key {
-        let rec = RequestRecord {
-            target,
-            operation: op.id,
+    let created = async {
+        metadata
+            .validate()
+            .map_err(|e| ApiError::InvalidArgument(e.to_string()))?;
+        let obj: Instance = Object {
+            metadata,
+            spec: input.spec,
+            status: InstanceStatus::default(),
         };
-        // Losing a race here means a concurrent retry already recorded its own operation; the
-        // instance itself was created exactly once (Absent precondition).
-        let _ = st
-            .store
-            .put(k, serde_json::to_vec(&rec)?, Precondition::Absent)
-            .await;
+        st.store
+            .put(
+                instance_key(&scope, &n)?,
+                serde_json::to_vec(&obj)?,
+                Precondition::Absent,
+            )
+            .await
+            .map_err(|e| match e {
+                StoreError::PreconditionFailed { .. } => ApiError::AlreadyExists(target.clone()),
+                e => e.into(),
+            })
     }
+    .await;
+    if let Err(e) = created {
+        // Only a definite rejection releases the claim; on an unknown outcome (store error) the
+        // claim stays so a retry replays instead of creating twice.
+        if let (Some(k), ApiError::AlreadyExists(_) | ApiError::InvalidArgument(_)) = (&claimed, &e)
+        {
+            if let Err(release) = st.store.delete(k.clone(), Precondition::None).await {
+                tracing::warn!(error = %release, "could not release request_id claim");
+            }
+        }
+        return Err(e);
+    }
+    put_op_if_absent(&st, &op).await?;
     Ok(Json(op))
+}
+
+/// Writes `op` unless it already exists.
+async fn put_op_if_absent(st: &AppState, op: &Operation) -> Result<(), ApiError> {
+    let k = store_key("ops", &["operations", &op.id.hyphenated().to_string()])?;
+    match st
+        .store
+        .put(k, serde_json::to_vec(op)?, Precondition::Absent)
+        .await
+    {
+        Ok(_) | Err(StoreError::PreconditionFailed { .. }) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Answers a create whose request_id was already claimed.
+async fn replay(st: &AppState, k: &Key, target: &str) -> Result<Operation, ApiError> {
+    let v = st.store.get(k).await?.ok_or(ApiError::Unavailable)?; // released concurrently: let the client retry
+    let rec: RequestRecord = serde_json::from_slice(&v.value)?;
+    if rec.target != target {
+        return Err(ApiError::InvalidArgument(
+            "request_id was already used for a different request".into(),
+        ));
+    }
+    match get_op(st, rec.operation).await {
+        Ok(op) => Ok(op),
+        Err(ApiError::NotFound(_)) => {
+            // The first attempt claimed the id but has not (or never will) finish. If the
+            // resource exists, complete the bookkeeping; otherwise the first attempt is still in
+            // flight or failed with an unknown outcome: ask the client to retry.
+            let exists = target_exists(st, target).await?;
+            if !exists {
+                return Err(ApiError::Unavailable);
+            }
+            let op = Operation {
+                id: rec.operation,
+                target: target.to_owned(),
+                done: false,
+                error: None,
+            };
+            put_op_if_absent(st, &op).await?;
+            get_op(st, rec.operation).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn target_exists(st: &AppState, target: &str) -> Result<bool, ApiError> {
+    // `target` was built by `resource_path` from validated names.
+    let segs: Vec<&str> = target.split('/').collect();
+    let k = store_key("compute", &segs)?;
+    Ok(st.store.get(&k).await?.is_some())
 }
 
 pub async fn get_instance(

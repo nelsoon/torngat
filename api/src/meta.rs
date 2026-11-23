@@ -91,14 +91,11 @@ pub enum MetaError {
     BadLabelKey(String),
     #[error("label value for {0:?} is invalid")]
     BadLabelValue(String),
-    #[error(transparent)]
-    Scope(#[from] crate::name::ScopeError),
 }
 
 impl ObjectMeta {
     /// Validates user-controlled fields. `name` is already valid by construction.
     pub fn validate(&self) -> Result<(), MetaError> {
-        self.scope.validate()?;
         if self.labels.len() > MAX_LABELS {
             return Err(MetaError::TooManyLabels);
         }

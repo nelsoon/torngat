@@ -37,6 +37,10 @@ pub struct AppState {
     pub token: AdminToken,
 }
 
+async fn not_found() -> ApiError {
+    ApiError::NotFound("resource".into())
+}
+
 /// Builds the HTTP router.
 pub fn router(state: AppState) -> Router {
     use handlers::*;
@@ -54,6 +58,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/operations/{id}", get(get_operation))
         .route("/v1/platform/nodes", get(list_nodes))
         .route("/v1/platform/nodes/{node}", get(get_node))
+        // Unknown paths go through authentication too, so they cannot be used to probe the API.
+        .fallback(not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_admin,

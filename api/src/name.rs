@@ -106,7 +106,7 @@ impl AsRef<str> for Name {
 /// of the Project resource (used for policy inheritance), not part of its path, so moving a project
 /// between folders never renames the resources inside it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Scope {
     /// Infrastructure owned by the platform operator (nodes, regions, releases).
     Platform,
@@ -116,15 +116,7 @@ pub enum Scope {
     Project { org: Name, project: Name },
 }
 
-/// Maximum folder nesting depth (folders are Project attributes; see the resource model).
-pub const MAX_FOLDER_DEPTH: usize = 8;
-
 impl Scope {
-    /// Kept for API stability; every scope is currently valid by construction.
-    pub fn validate(&self) -> Result<(), ScopeError> {
-        Ok(())
-    }
-
     /// Path segments of this scope, outermost first. Every segment is a validated [`Name`] or a
     /// fixed literal, so joining them with `/` cannot produce `..` or empty segments.
     pub fn segments(&self) -> Vec<&str> {
@@ -136,12 +128,6 @@ impl Scope {
             }
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ScopeError {
-    #[error("folder nesting is deeper than {MAX_FOLDER_DEPTH}")]
-    TooDeep,
 }
 
 #[cfg(test)]
@@ -194,5 +180,11 @@ mod tests {
         };
         assert_eq!(s.segments(), ["orgs", "acme", "projects", "web"]);
         assert_eq!(Scope::Platform.segments(), ["platform"]);
+    }
+
+    #[test]
+    fn scope_rejects_unknown_fields() {
+        let old = r#"{"kind":"project","org":"acme","folders":["eng"],"project":"web"}"#;
+        assert!(serde_json::from_str::<Scope>(old).is_err());
     }
 }

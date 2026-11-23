@@ -48,7 +48,9 @@ pub async fn require_admin(
         .headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(|v| v.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, t)| t.trim())
         .is_some_and(|t| state.token.matches(t));
     if !ok {
         return Err(ApiError::Unauthenticated);
