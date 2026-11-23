@@ -1,0 +1,33 @@
+[package]
+name = "torngat-apiserver"
+description = "Torngat public and operator API server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+subtle = "2.6"
+thiserror.workspace = true
+time.workspace = true
+tokio = { version = "1.35", features = ["net", "rt", "macros"] }
+tracing = "0.1"
+uuid.workspace = true
+torngat-api = { path = "../../api" }
+torngat-store = { path = "../store" }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3.4"
+tokio = { version = "1.35", features = ["rt-multi-thread", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+torngat-store = { path = "../store", features = ["test-util"] }
+
+[lints]
+workspace = true

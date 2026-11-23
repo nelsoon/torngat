@@ -1,0 +1,82 @@
+//! Torngat API server.
+//!
+//! REST/JSON following Google's API Improvement Proposals (AIP): resource-oriented paths, standard
+//! methods, etags for concurrency (AIP-154), long-running operations (AIP-151), `request_id` for
+//! idempotent creates (AIP-155), AIP-193 errors.
+//!
+//! Security rules enforced here (see docs/SECURITY-NOTES.md):
+//! - every request is authenticated before routing;
+//! - server-set fields in request bodies are ignored;
+//! - all user input is validated at this boundary (names in paths, specs, labels, sizes).
+//!
+//! M0 serves plain HTTP on loopback only; TLS comes with the internal CA.
+
+#![forbid(unsafe_code)]
+
+pub mod auth;
+mod error;
+mod handlers;
+
+use std::net::SocketAddr;
+
+use axum::Router;
+use axum::extract::DefaultBodyLimit;
+use axum::middleware;
+use axum::routing::get;
+use torngat_store::Store;
+
+pub use auth::AdminToken;
+pub use error::ApiError;
+
+/// Largest accepted request body.
+pub const MAX_BODY: usize = 256 * 1024;
+
+#[derive(Clone, Debug)]
+pub struct AppState {
+    pub store: Store,
+    pub token: AdminToken,
+}
+
+/// Builds the HTTP router.
+pub fn router(state: AppState) -> Router {
+    use handlers::*;
+    Router::new()
+        .route(
+            "/v1/orgs/{org}/projects/{project}/instances",
+            get(list_instances).post(create_instance),
+        )
+        .route(
+            "/v1/orgs/{org}/projects/{project}/instances/{instance}",
+            get(get_instance)
+                .patch(update_instance)
+                .delete(delete_instance),
+        )
+        .route("/v1/operations/{id}", get(get_operation))
+        .route("/v1/platform/nodes", get(list_nodes))
+        .route("/v1/platform/nodes/{node}", get(get_node))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_admin,
+        ))
+        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .with_state(state)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServeError {
+    #[error("refusing to listen on non-loopback address {0} without TLS")]
+    NotLoopback(SocketAddr),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+/// Serves the API until the process ends. Plain HTTP is only allowed on loopback, because the
+/// bearer token would otherwise cross the network in clear text.
+pub async fn serve(addr: SocketAddr, state: AppState) -> Result<(), ServeError> {
+    if !addr.ip().is_loopback() {
+        return Err(ServeError::NotLoopback(addr));
+    }
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, router(state)).await?;
+    Ok(())
+}
