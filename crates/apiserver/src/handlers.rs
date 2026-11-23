@@ -396,19 +396,48 @@ pub async fn delete_instance(
     let n = name("instance", &instance)?;
     let q = query(q)?;
     let key = instance_key(&scope, &n)?;
+    let cur = st
+        .store
+        .get(&key)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(resource_path(&scope, "instances", &n)))?;
     let pre = match q.etag {
         Some(e) => Precondition::Revision(parse_etag(&Etag(e))?),
-        None => match st.store.get(&key).await? {
-            Some(v) => Precondition::Revision(v.revision),
-            None => return Err(ApiError::NotFound(resource_path(&scope, "instances", &n))),
-        },
+        None => Precondition::Revision(cur.revision),
     };
+    let pending = serde_json::from_slice::<Instance>(&cur.value)
+        .ok()
+        .and_then(|i| i.status.pending_operation);
     st.store.delete(key, pre).await.map_err(|e| match e {
         StoreError::PreconditionFailed { current: None } => {
             ApiError::NotFound(resource_path(&scope, "instances", &n))
         }
         e => e.into(),
     })?;
+    // A create still in flight ends now, cancelled.
+    if let Some(id) = pending {
+        let op = Operation {
+            id,
+            target: resource_path(&scope, "instances", &n),
+            done: true,
+            error: Some(torngat_api::operation::OperationError {
+                code: "CANCELLED".into(),
+                message: "the instance was deleted".into(),
+            }),
+        };
+        let k = store_key("ops", &["operations", &id.hyphenated().to_string()])?;
+        // Never overwrite an operation that already finished.
+        let pre = match st.store.get(&k).await? {
+            Some(v) if serde_json::from_slice::<Operation>(&v.value).is_ok_and(|o| o.done) => None,
+            Some(v) => Some(Precondition::Revision(v.revision)),
+            None => Some(Precondition::Absent),
+        };
+        if let Some(pre) = pre
+            && let Err(e) = st.store.put(k, serde_json::to_vec(&op)?, pre).await
+        {
+            tracing::warn!(error = %e, "could not cancel operation of deleted instance");
+        }
+    }
     Ok(Json(serde_json::json!({})))
 }
 

@@ -70,11 +70,16 @@ async fn connect(cfg: &AgentConfig) -> Result<ControlClient<Channel>, AgentError
 
 /// Runs the agent forever, reconnecting on errors.
 pub async fn run<R: Runtime>(cfg: AgentConfig, runtime: R) {
-    let mut backoff = Duration::from_millis(200);
+    const MIN: Duration = Duration::from_millis(200);
+    let mut backoff = MIN;
     loop {
-        match session(&cfg, &runtime).await {
-            Ok(()) => backoff = Duration::from_millis(200),
-            Err(e) => tracing::warn!(error = %e, "controller session ended"),
+        let started = std::time::Instant::now();
+        if let Err(e) = session(&cfg, &runtime).await {
+            tracing::warn!(error = %e, "controller session ended");
+        }
+        // A session that ran for a while was healthy: start backing off from scratch.
+        if started.elapsed() > Duration::from_secs(30) {
+            backoff = MIN;
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(10));
@@ -96,10 +101,11 @@ pub async fn session<R: Runtime>(cfg: &AgentConfig, runtime: &R) -> Result<(), A
         .await?;
 
     let mut hb = client.clone();
+    // Heartbeats keep going through transient errors (e.g. a controller leader change).
     let heartbeat = tokio::spawn(async move {
         loop {
-            if hb.heartbeat(HeartbeatRequest {}).await.is_err() {
-                return;
+            if let Err(e) = hb.heartbeat(HeartbeatRequest {}).await {
+                tracing::warn!(error = %e, "heartbeat failed");
             }
             tokio::time::sleep(HEARTBEAT_EVERY).await;
         }
@@ -115,11 +121,13 @@ pub async fn session<R: Runtime>(cfg: &AgentConfig, runtime: &R) -> Result<(), A
             if set.api_version != API_VERSION {
                 return Err(tonic::Status::failed_precondition("api_version mismatch").into());
             }
-            let instances: Vec<Instance> = set
+            // An undecodable entry (e.g. a newer controller) must not look "unassigned", or its
+            // workload would be stopped: give up on this session instead.
+            let instances = set
                 .instances_json
                 .iter()
-                .filter_map(|b| serde_json::from_slice(b).ok())
-                .collect();
+                .map(|b| serde_json::from_slice::<Instance>(b))
+                .collect::<Result<Vec<_>, _>>()?;
             reconcile(&mut client, runtime, &instances, &mut reported).await?;
         }
         Ok(())
@@ -172,7 +180,7 @@ pub async fn reconcile<R: Runtime>(
             Some(RuntimeKind::CloudHypervisor) => "cloud_hypervisor",
             None => "",
         };
-        client
+        let report = client
             .report_instance(InstanceReport {
                 org: org.to_string(),
                 project: project.to_string(),
@@ -181,10 +189,56 @@ pub async fn reconcile<R: Runtime>(
                 phase: phase.into(),
                 observed_generation: gen_,
                 runtime: runtime_name.into(),
-                message,
+                message: sanitize(&message),
             })
-            .await?;
-        reported.insert(uid, (phase.to_owned(), gen_));
+            .await;
+        match report {
+            Ok(_) => {
+                reported.insert(uid, (phase.to_owned(), gen_));
+            }
+            // A rejected report concerns this instance only (e.g. just reassigned or deleted):
+            // keep reconciling the others.
+            Err(s)
+                if matches!(
+                    s.code(),
+                    tonic::Code::InvalidArgument
+                        | tonic::Code::PermissionDenied
+                        | tonic::Code::NotFound
+                ) =>
+            {
+                tracing::warn!(%uid, status = %s, "report rejected");
+            }
+            Err(s) => return Err(s.into()),
+        }
     }
     Ok(())
+}
+
+/// Longest message the controller accepts.
+const MAX_MESSAGE: usize = 1024;
+
+/// Makes runtime error text acceptable to the controller: no control characters, bounded length.
+pub fn sanitize(m: &str) -> String {
+    let mut out = String::new();
+    for c in m.chars() {
+        let c = if c.is_control() { ' ' } else { c };
+        if out.len() + c.len_utf8() > MAX_MESSAGE {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_bounds_and_strips() {
+        assert_eq!(sanitize("a\nb\tc"), "a b c");
+        let long = "é".repeat(2000);
+        let s = sanitize(&long);
+        assert!(s.len() <= MAX_MESSAGE && s.chars().all(|c| c == 'é'));
+    }
 }

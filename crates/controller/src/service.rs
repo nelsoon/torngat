@@ -7,10 +7,9 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
-use torngat_api::compute::{Instance, InstancePhase, PowerState, Runtime};
+use torngat_api::compute::{Instance, InstancePhase, Runtime};
 use torngat_api::meta::Cell;
 use torngat_api::node::{Node, NodePhase, NodeSpec, NodeStatus, Role};
-use torngat_api::operation::{Operation, OperationError};
 use torngat_api::{Name, Object, ObjectMeta, Scope};
 use torngat_proto::API_VERSION;
 use torngat_proto::v1::control_server::Control;
@@ -185,7 +184,10 @@ impl Control for ControlService {
                     }
                     last = Some(set);
                 }
-                tokio::time::sleep(ASSIGNMENT_POLL).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(ASSIGNMENT_POLL) => {}
+                    _ = tx.closed() => return, // agent disconnected
+                }
             }
         });
         Ok(Response::new(Box::pin(
@@ -226,35 +228,20 @@ impl Control for ControlService {
         let key = keys::instance(&scope, &name).map_err(internal)?;
 
         for _ in 0..CAS_RETRIES {
+            // Same answer for "missing" and "not yours": no existence oracle for other nodes.
+            let denied = || Status::permission_denied("instance is not assigned to this node");
             let Some(v) = self.ctl.store.get(&key).await.map_err(store_err)? else {
-                return Err(Status::not_found("instance"));
+                return Err(denied());
             };
             let mut inst: Instance = serde_json::from_slice(&v.value).map_err(internal)?;
             // An agent may only report on what is assigned to it, and only for this incarnation.
             if inst.metadata.uid != uid || inst.status.node.as_ref() != Some(&me) {
-                return Err(Status::permission_denied(
-                    "instance is not assigned to this node",
-                ));
+                return Err(denied());
             }
             inst.status.phase = phase;
             inst.status.runtime = runtime;
             inst.status.observed_generation = r.observed_generation.min(inst.metadata.generation);
             inst.status.message = (!r.message.is_empty()).then(|| r.message.clone());
-            let reached = matches!(
-                (inst.spec.power_state, phase),
-                (PowerState::Running, InstancePhase::Running)
-                    | (PowerState::Stopped, InstancePhase::Stopped)
-            );
-            let done_op = match (
-                reached || phase == InstancePhase::Failed,
-                inst.status.pending_operation,
-            ) {
-                (true, Some(op)) => {
-                    inst.status.pending_operation = None;
-                    Some(op)
-                }
-                _ => None,
-            };
             inst.metadata.etag = None;
             match self
                 .ctl
@@ -266,13 +253,8 @@ impl Control for ControlService {
                 )
                 .await
             {
-                Ok(_) => {
-                    if let Some(op) = done_op {
-                        let failed = (phase == InstancePhase::Failed).then(|| r.message.clone());
-                        complete_operation(&self.ctl, op, failed).await?;
-                    }
-                    return Ok(Response::new(ReportResponse {}));
-                }
+                // Operations are completed by the controller's reconcile pass, from state.
+                Ok(_) => return Ok(Response::new(ReportResponse {})),
                 Err(StoreError::PreconditionFailed { .. }) => continue,
                 Err(e) => return Err(store_err(e)),
             }
@@ -293,44 +275,4 @@ async fn assigned_to(store: &torngat_store::Store, node: &Name) -> Result<Vec<Ve
             (i.status.node.as_ref() == Some(node)).then_some(v.value)
         })
         .collect())
-}
-
-async fn complete_operation(
-    ctl: &Controller,
-    id: Uuid,
-    failure: Option<String>,
-) -> Result<(), Status> {
-    let key = keys::operation(id).map_err(internal)?;
-    for _ in 0..CAS_RETRIES {
-        let Some(v) = ctl.store.get(&key).await.map_err(store_err)? else {
-            return Ok(()); // operation record not written (yet); nothing to complete
-        };
-        let mut op: Operation = serde_json::from_slice(&v.value).map_err(internal)?;
-        if op.done {
-            return Ok(());
-        }
-        op.done = true;
-        op.error = failure.clone().map(|m| OperationError {
-            code: "INTERNAL".into(),
-            message: if m.is_empty() {
-                "instance failed".into()
-            } else {
-                m
-            },
-        });
-        match ctl
-            .store
-            .put(
-                key.clone(),
-                serde_json::to_vec(&op).map_err(internal)?,
-                Precondition::Revision(v.revision),
-            )
-            .await
-        {
-            Ok(_) => return Ok(()),
-            Err(StoreError::PreconditionFailed { .. }) => continue,
-            Err(e) => return Err(store_err(e)),
-        }
-    }
-    Err(Status::aborted("concurrent operation update, retry"))
 }

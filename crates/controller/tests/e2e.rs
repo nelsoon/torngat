@@ -337,3 +337,43 @@ async fn agents_cannot_impersonate_or_touch_others() {
     assert!(res, "foreign certificate was accepted");
     e.store.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operations_complete_without_a_node_or_after_delete() {
+    let e = env().await; // no agent: nothing can be scheduled
+    // Created stopped: nothing to run, the operation completes anyway.
+    let (_, op) = call(
+        &e.api,
+        "POST",
+        &format!("{BASE}?instance_id=vm-off"),
+        Some(json!({"spec": {"vcpus": 1, "memory_mib": 256, "power_state": "stopped"}})),
+    )
+    .await;
+    let op = eventually(
+        &e.api,
+        &format!("/v1/operations/{}", op["id"].as_str().unwrap()),
+        "stopped create done",
+        |v| v["done"] == true,
+    )
+    .await;
+    assert!(op.get("error").is_none());
+    // Deleted while still pending: the operation ends as cancelled.
+    let (_, op) = call(
+        &e.api,
+        "POST",
+        &format!("{BASE}?instance_id=vm-pending"),
+        Some(json!({"spec": {"vcpus": 1, "memory_mib": 256}})),
+    )
+    .await;
+    let (s, _) = call(&e.api, "DELETE", &format!("{BASE}/vm-pending"), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let op = eventually(
+        &e.api,
+        &format!("/v1/operations/{}", op["id"].as_str().unwrap()),
+        "cancelled",
+        |v| v["done"] == true,
+    )
+    .await;
+    assert_eq!(op["error"]["code"], "CANCELLED");
+    e.store.shutdown().await.unwrap();
+}
