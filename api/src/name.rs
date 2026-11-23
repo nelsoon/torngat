@@ -102,8 +102,9 @@ impl AsRef<str> for Name {
     }
 }
 
-/// Where a resource lives in the hierarchy. Inheritance of IAM grants and policies follows this
-/// chain (platform → organization → folders → project).
+/// Where a resource lives. Identity only: a project's position in the folder tree is an attribute
+/// of the Project resource (used for policy inheritance), not part of its path, so moving a project
+/// between folders never renames the resources inside it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Scope {
@@ -111,27 +112,17 @@ pub enum Scope {
     Platform,
     /// A tenant organization.
     Organization { org: Name },
-    /// A project, reached through its organization and zero or more nested folders.
-    Project {
-        org: Name,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        folders: Vec<Name>,
-        project: Name,
-    },
+    /// A project inside an organization.
+    Project { org: Name, project: Name },
 }
 
-/// Maximum folder nesting depth, to bound key length and inheritance walks.
+/// Maximum folder nesting depth (folders are Project attributes; see the resource model).
 pub const MAX_FOLDER_DEPTH: usize = 8;
 
 impl Scope {
-    /// Rejects folder chains deeper than [`MAX_FOLDER_DEPTH`].
+    /// Kept for API stability; every scope is currently valid by construction.
     pub fn validate(&self) -> Result<(), ScopeError> {
-        match self {
-            Scope::Project { folders, .. } if folders.len() > MAX_FOLDER_DEPTH => {
-                Err(ScopeError::TooDeep)
-            }
-            _ => Ok(()),
-        }
+        Ok(())
     }
 
     /// Path segments of this scope, outermost first. Every segment is a validated [`Name`] or a
@@ -140,19 +131,8 @@ impl Scope {
         match self {
             Scope::Platform => vec!["platform"],
             Scope::Organization { org } => vec!["orgs", org.as_str()],
-            Scope::Project {
-                org,
-                folders,
-                project,
-            } => {
-                let mut v = vec!["orgs", org.as_str()];
-                for f in folders {
-                    v.push("folders");
-                    v.push(f.as_str());
-                }
-                v.push("projects");
-                v.push(project.as_str());
-                v
+            Scope::Project { org, project } => {
+                vec!["orgs", org.as_str(), "projects", project.as_str()]
             }
         }
     }
@@ -206,22 +186,13 @@ mod tests {
     }
 
     #[test]
-    fn scope_segments_and_depth() {
+    fn scope_segments() {
         let n = |s: &str| Name::new(s).unwrap_or_else(|e| unreachable!("{e}"));
         let s = Scope::Project {
             org: n("acme"),
-            folders: vec![n("eng")],
             project: n("web"),
         };
-        assert_eq!(
-            s.segments(),
-            ["orgs", "acme", "folders", "eng", "projects", "web"]
-        );
-        let deep = Scope::Project {
-            org: n("acme"),
-            folders: vec![n("f"); MAX_FOLDER_DEPTH + 1],
-            project: n("web"),
-        };
-        assert_eq!(deep.validate(), Err(ScopeError::TooDeep));
+        assert_eq!(s.segments(), ["orgs", "acme", "projects", "web"]);
+        assert_eq!(Scope::Platform.segments(), ["platform"]);
     }
 }
