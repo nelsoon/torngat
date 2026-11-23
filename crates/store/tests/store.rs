@@ -100,6 +100,16 @@ async fn single_node_crud_cas_list_watch() {
     );
     let page2 = s.list(&p, Some(&key("a")), 100).await.unwrap();
     assert_eq!(page2.len(), 1);
+    assert!(s.list(&p, None, 0).await.unwrap().is_empty());
+    // A sibling whose name extends the prefix with '-' sorts inside the scan range; it must not leak.
+    s.put(
+        Key::new("compute", ["orgs", "acme-x", "instances", "z"]).unwrap(),
+        vec![],
+        Precondition::None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(s.list(&p, None, 100).await.unwrap().len(), 2);
 
     // Delete with a stale revision fails; with the current one succeeds; missing key is a no-op.
     assert!(
@@ -127,7 +137,12 @@ async fn single_node_crud_cas_list_watch() {
         .await,
         Err(StoreError::ValueTooLarge)
     ));
+
+    // Shutdown wakes watchers instead of leaving them blocked.
+    let mut w = s.watch(Prefix::new("compute", []).unwrap());
     s.shutdown().await.unwrap();
+    let r = tokio::time::timeout(Duration::from_secs(5), w.next()).await;
+    assert!(matches!(r, Ok(Err(StoreError::Closed))), "{r:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -201,11 +216,24 @@ async fn grow_to_three_and_fail_over() {
     net.isolate(old);
     let new = wait_leader(&all, Some(old)).await;
     assert_ne!(new, old);
-    let leader = all.iter().find(|s| s.id() == new).unwrap();
-    let r2 = leader
-        .put(key("after-failover"), b"2".to_vec(), Precondition::None)
-        .await
-        .unwrap();
+    // Right after an election a node may still step down or hand over; retry like a client.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (leader, r2) = loop {
+        let id = wait_leader(&all, Some(old)).await;
+        let l = all.iter().find(|s| s.id() == id).unwrap();
+        match l
+            .put(key("after-failover"), b"2".to_vec(), Precondition::None)
+            .await
+        {
+            Ok(r) => break (l, r),
+            Err(e) if Instant::now() < deadline => {
+                let _ = e;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("write after failover failed: {e}"),
+        }
+    };
+    let _ = new;
     assert!(r2 > r);
     // Data written before the failover is still there.
     assert!(leader.get(&key("before-growth")).await.unwrap().is_some());
@@ -271,4 +299,76 @@ async fn write_budget_boot_storm() {
         (per * 64) as f64 / secs
     );
     s.shutdown().await.unwrap();
+}
+
+/// A follower that catches up through a snapshot must tell its watchers to re-list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_install_resets_watchers() {
+    let net = TestNet::default();
+    let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+    let mut stores = Vec::new();
+    for (i, d) in dirs.iter().enumerate() {
+        let id = i as NodeId + 1;
+        let cfg = torngat_store::default_config();
+        let cfg = openraft::Config {
+            max_in_snapshot_log_to_keep: 0,
+            ..cfg
+        };
+        let s = Store::open(d.path(), id, cfg, net.factory(id))
+            .await
+            .unwrap();
+        net.register(id, s.raft().clone());
+        stores.push(s);
+    }
+    stores[0].initialize(members(&[1, 2, 3])).await.unwrap();
+    let leader_id = wait_leader(&stores.iter().collect::<Vec<_>>(), None).await;
+    let leader = stores.iter().find(|s| s.id() == leader_id).unwrap();
+    let follower = stores.iter().find(|s| s.id() != leader_id).unwrap();
+
+    let mut w = follower.watch(Prefix::new("compute", []).unwrap());
+    net.isolate(follower.id());
+    let mut last = 0;
+    for i in 0..50 {
+        last = leader
+            .put(
+                Key::new("compute", ["snap", &format!("k{i}")]).unwrap(),
+                vec![1],
+                Precondition::None,
+            )
+            .await
+            .unwrap();
+    }
+    // Compact the leader's log past what the isolated follower has.
+    leader.raft().trigger().snapshot().await.unwrap();
+    leader
+        .raft()
+        .wait(Some(Duration::from_secs(10)))
+        .metrics(
+            |m| m.snapshot.map(|l| l.index) >= Some(last),
+            "snapshot built",
+        )
+        .await
+        .unwrap();
+    leader.raft().trigger().purge_log(last).await.unwrap();
+    leader
+        .raft()
+        .wait(Some(Duration::from_secs(10)))
+        .metrics(|m| m.purged.map(|l| l.index) >= Some(last), "log purged")
+        .await
+        .unwrap();
+    net.heal();
+
+    let r = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match w.next().await {
+                Ok(_) => continue,
+                Err(e) => return e,
+            }
+        }
+    })
+    .await;
+    assert!(matches!(r, Ok(StoreError::WatchLagged)), "{r:?}");
+    for s in &stores {
+        s.shutdown().await.unwrap();
+    }
 }

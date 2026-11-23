@@ -44,6 +44,16 @@ pub struct Event {
     pub value: Option<Arc<Vec<u8>>>,
 }
 
+/// What travels on the change channel.
+#[derive(Debug, Clone)]
+pub(crate) enum Signal {
+    Change(Event),
+    /// State was replaced wholesale (snapshot install): watchers must re-list.
+    Reset,
+    /// The store is shutting down.
+    Closed,
+}
+
 #[derive(Clone)]
 pub struct StateMachine {
     db: Database,
@@ -51,7 +61,7 @@ pub struct StateMachine {
     meta: Keyspace,
     snapshot: Keyspace,
     snapshot_lock: Arc<Mutex<()>>,
-    events: broadcast::Sender<Event>,
+    events: broadcast::Sender<Signal>,
 }
 
 impl std::fmt::Debug for StateMachine {
@@ -92,20 +102,38 @@ impl StateMachine {
         start_after: Option<&Key>,
         limit: usize,
     ) -> io::Result<Vec<(Key, Versioned)>> {
-        let view = self.db.snapshot();
         let mut out = Vec::new();
-        for item in view.prefix(&self.data, prefix.as_str()) {
+        if limit == 0 {
+            return Ok(out);
+        }
+        let p = prefix.as_str().as_bytes();
+        // Keys under `p` are `p` itself or `p/...`. They all sort below `p0` ('0' follows '/'),
+        // so the scan is bounded; seek past `start_after` instead of skipping one by one.
+        let mut end = p.to_vec();
+        end.push(b'0');
+        let start: Vec<u8> = match start_after {
+            Some(s) if s.as_str().as_bytes() >= p => {
+                let mut v = s.as_str().as_bytes().to_vec();
+                v.push(0); // smallest key strictly greater than `start_after`
+                v
+            }
+            _ => p.to_vec(),
+        };
+        if start >= end {
+            return Ok(out);
+        }
+        let view = self.db.snapshot();
+        for item in view.range(&self.data, start..end) {
             let (k, v) = item.into_inner().map_err(io::Error::other)?;
-            let key = std::str::from_utf8(&k)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-                .and_then(|s| {
-                    Key::try_from(s.to_owned())
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-                })?;
-            // Byte-prefix iteration can return `ab` for prefix `a`; keep whole-segment matches.
-            if !key.has_prefix(prefix) || start_after.is_some_and(|s| &key <= s) {
+            // Cheap byte check first: `p-x` sorts inside the range but is a different segment.
+            let under = k.len() == p.len() || k.get(p.len()) == Some(&b'/');
+            if !under {
                 continue;
             }
+            let key = std::str::from_utf8(&k)
+                .ok()
+                .and_then(|s| Key::try_from(s.to_owned()).ok())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid stored key"))?;
             out.push((key, deserialize(&v)?));
             if out.len() >= limit {
                 break;
@@ -114,8 +142,13 @@ impl StateMachine {
         Ok(out)
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<Signal> {
         self.events.subscribe()
+    }
+
+    /// Tells every watcher the store is closing.
+    pub(crate) fn close(&self) {
+        let _ = self.events.send(Signal::Closed);
     }
 
     fn read_applied<R: Readable>(&self, view: &R) -> io::Result<SnapshotMetaOf<TypeConfig>> {
@@ -187,7 +220,10 @@ impl StateMachine {
         );
         batch.insert(&self.snapshot, SNAPSHOT_META, serialize(meta)?);
         batch.insert(&self.snapshot, SNAPSHOT_DATA, data);
-        batch.commit().map_err(io::Error::other)
+        batch.commit().map_err(io::Error::other)?;
+        // Watchers cannot be told what changed key by key; make them re-list.
+        let _ = self.events.send(Signal::Reset);
+        Ok(())
     }
 }
 
@@ -228,10 +264,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
             let response = match entry.payload {
                 EntryPayload::Blank => Response::None,
                 EntryPayload::Membership(m) => {
-                    last_membership = Some(StoredMembershipOf::<TypeConfig>::new(
-                        Some(log_id),
-                        m,
-                    ));
+                    last_membership = Some(StoredMembershipOf::<TypeConfig>::new(Some(log_id), m));
                     Response::None
                 }
                 EntryPayload::Normal(cmd) => {
@@ -309,7 +342,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         }
         for e in events {
             // No receivers is fine.
-            let _ = self.events.send(e);
+            let _ = self.events.send(Signal::Change(e));
         }
         Ok(())
     }

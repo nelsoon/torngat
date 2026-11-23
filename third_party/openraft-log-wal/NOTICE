@@ -5,3 +5,4 @@ contributors. Local changes, if any, are listed below.
 
 Local changes:
 - Cargo.toml rewritten to use crates.io dependencies instead of workspace paths.
+- range_boundary: saturating_add instead of `+ 1` to avoid overflow at u64::MAX.

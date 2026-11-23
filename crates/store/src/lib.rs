@@ -42,6 +42,8 @@ pub enum StoreError {
     NotLeader { leader: Option<NodeId> },
     #[error("watch fell behind; re-list and watch again")]
     WatchLagged,
+    #[error("store closed")]
+    Closed,
     #[error("raft: {0}")]
     Raft(String),
     #[error("storage: {0}")]
@@ -92,7 +94,16 @@ impl Store {
                 .validate()
                 .map_err(|e| StoreError::Raft(e.to_string()))?,
         );
-        let log = WalLogStore::<TypeConfig>::open(dir.join("log").display())?;
+        // Both stores must open the same directory: refuse paths that are not valid UTF-8 rather
+        // than letting a lossy conversion point the log somewhere else.
+        let log_dir = dir.join("log");
+        let log_dir = log_dir.to_str().ok_or_else(|| {
+            StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "data directory path is not valid UTF-8",
+            ))
+        })?;
+        let log = WalLogStore::<TypeConfig>::open(log_dir)?;
         let sm = sm::StateMachine::open(dir.join("sm"))?;
         let raft = openraft::Raft::new(id, config, network, log, sm.clone())
             .await
@@ -183,8 +194,8 @@ impl Store {
         Ok(self.sm.get(key)?)
     }
 
-    /// Linearizable list of up to `limit` (≤ [`MAX_LIST`]) keys under `prefix`, after
-    /// `start_after`.
+    /// Linearizable list of up to `limit` (capped at [`MAX_LIST`]; 0 returns nothing) keys under
+    /// `prefix`, after `start_after`.
     pub async fn list(
         &self,
         prefix: &Prefix,
@@ -192,9 +203,7 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<(Key, Versioned)>, StoreError> {
         self.linearize().await?;
-        Ok(self
-            .sm
-            .list(prefix, start_after, limit.clamp(1, MAX_LIST))?)
+        Ok(self.sm.list(prefix, start_after, limit.min(MAX_LIST))?)
     }
 
     /// Subscribes to changes under `prefix`, as they are applied on *this* replica. To watch
@@ -208,6 +217,7 @@ impl Store {
     }
 
     pub async fn shutdown(&self) -> Result<(), StoreError> {
+        self.sm.close();
         self.raft
             .shutdown()
             .await
@@ -218,21 +228,24 @@ impl Store {
 /// A stream of changes under a prefix.
 #[derive(Debug)]
 pub struct Watch {
-    rx: broadcast::Receiver<Event>,
+    rx: broadcast::Receiver<sm::Signal>,
     prefix: Prefix,
 }
 
 impl Watch {
     /// Next change under the prefix. Returns [`StoreError::WatchLagged`] if events were dropped
-    /// because this watcher was too slow; the caller must re-list.
+    /// (this watcher was too slow, or the replica installed a snapshot); the caller must re-list.
+    /// Returns [`StoreError::Closed`] once the store shuts down.
     pub async fn next(&mut self) -> Result<Event, StoreError> {
         loop {
             match self.rx.recv().await {
-                Ok(e) if e.key.has_prefix(&self.prefix) => return Ok(e),
-                Ok(_) => continue,
-                Err(broadcast::error::RecvError::Lagged(_)) => return Err(StoreError::WatchLagged),
-                Err(broadcast::error::RecvError::Closed) => {
-                    return Err(StoreError::Raft("store closed".into()));
+                Ok(sm::Signal::Change(e)) if e.key.has_prefix(&self.prefix) => return Ok(e),
+                Ok(sm::Signal::Change(_)) => continue,
+                Ok(sm::Signal::Reset) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                    return Err(StoreError::WatchLagged);
+                }
+                Ok(sm::Signal::Closed) | Err(broadcast::error::RecvError::Closed) => {
+                    return Err(StoreError::Closed);
                 }
             }
         }
