@@ -38,12 +38,12 @@ impl ControlService {
     }
 }
 
-fn internal(e: impl std::fmt::Display) -> Status {
+pub(crate) fn internal(e: impl std::fmt::Display) -> Status {
     tracing::error!(error = %e, "control service internal error");
     Status::internal("internal error")
 }
 
-fn store_err(e: StoreError) -> Status {
+pub(crate) fn store_err(e: StoreError) -> Status {
     match e {
         StoreError::NotLeader { .. } | StoreError::Closed => Status::unavailable("retry"),
         e => internal(e),
@@ -68,7 +68,7 @@ impl Control for ControlService {
         &self,
         req: Request<RegisterRequest>,
     ) -> Result<Response<RegisterResponse>, Status> {
-        let me = identity::caller(&req)?;
+        let me = identity::authenticate(&self.ctl.store, &req).await?;
         let req = req.into_inner();
         check_version(&req.api_version)?;
         let mut reported: NodeStatus = serde_json::from_slice(&req.node_status_json)
@@ -145,7 +145,7 @@ impl Control for ControlService {
         &self,
         req: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
-        let me = identity::caller(&req)?;
+        let me = identity::authenticate(&self.ctl.store, &req).await?;
         // Only registered nodes count as live.
         let key = keys::node(&me).map_err(internal)?;
         if self.ctl.store.get(&key).await.map_err(store_err)?.is_none() {
@@ -161,12 +161,21 @@ impl Control for ControlService {
         &self,
         req: Request<AssignmentsRequest>,
     ) -> Result<Response<Self::AssignmentsStream>, Status> {
-        let me = identity::caller(&req)?;
+        let me = identity::authenticate(&self.ctl.store, &req).await?;
+        // Kept to re-check enrollment while the stream is open: revoking a node ends it.
+        let cert = req
+            .peer_certs()
+            .and_then(|c| c.first().map(|c| c.as_ref().to_vec()))
+            .ok_or_else(|| Status::unauthenticated("no client certificate"))?;
         let store = self.ctl.store.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         tokio::spawn(async move {
             let mut last: Option<Vec<Vec<u8>>> = None;
             loop {
+                if let Err(e) = identity::check_enrolled(&store, &me, &cert).await {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
                 let set = match assigned_to(&store, &me).await {
                     Ok(s) => s,
                     Err(e) => {
@@ -199,7 +208,7 @@ impl Control for ControlService {
         &self,
         req: Request<InstanceReport>,
     ) -> Result<Response<ReportResponse>, Status> {
-        let me = identity::caller(&req)?;
+        let me = identity::authenticate(&self.ctl.store, &req).await?;
         let r = req.into_inner();
         let bad = |what: &str| Status::invalid_argument(format!("invalid {what}"));
         let scope = Scope::Project {

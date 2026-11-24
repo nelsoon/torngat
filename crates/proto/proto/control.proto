@@ -48,3 +48,25 @@ message InstanceReport {
   string message = 8;
 }
 message ReportResponse {}
+
+// Enrollment of a new node. Served on its own port with server-only TLS: the caller has no
+// certificate yet. It has already checked the controller's CA against the pin in its token.
+service Join {
+  rpc Join(JoinRequest) returns (JoinResponse);
+}
+
+message JoinRequest {
+  string api_version = 1;
+  string token_id = 2;
+  bytes token_secret = 3;
+  // Name the node asks for. Must be unused, and match the token's node if the token names one.
+  string node_name = 4;
+  // PKCS#10 CSR (DER) for the node's key. Only its public key is used.
+  bytes csr_der = 5;
+  // How the key is held: "file" or "tpm".
+  string key_storage = 6;
+}
+message JoinResponse {
+  // Node certificate followed by the CA certificate.
+  string cert_chain_pem = 1;
+}

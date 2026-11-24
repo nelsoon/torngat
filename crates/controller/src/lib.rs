@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod identity;
+pub mod join;
 pub mod keys;
 mod ops;
 mod scheduler;
@@ -23,6 +24,7 @@ use std::time::{Duration, Instant};
 use torngat_api::Name;
 use torngat_store::Store;
 
+pub use join::{JoinService, expire_join_tokens_once, serve_join};
 pub use ops::complete_operations_once;
 pub use scheduler::schedule_once;
 pub use service::ControlService;
@@ -74,6 +76,9 @@ impl Controller {
             if let Err(e) = complete_operations_once(&self).await {
                 tracing::warn!(error = %e, "operation pass failed");
             }
+            if let Err(e) = expire_join_tokens_once(&self.store).await {
+                tracing::warn!(error = %e, "join token expiry pass failed");
+            }
             tokio::time::sleep(every).await;
         }
     }
@@ -95,7 +100,7 @@ impl std::fmt::Debug for TlsConfig {
 }
 
 /// Serves the control protocol on a bound listener, with mandatory client certificates signed
-/// by `tls.client_ca_pem`.
+/// by `tls.client_ca_pem`. Callers must also be enrolled (see [`identity::authenticate`]).
 pub async fn serve(
     ctl: Controller,
     listener: tokio::net::TcpListener,

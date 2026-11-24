@@ -16,6 +16,7 @@
 pub mod auth;
 mod error;
 mod handlers;
+mod join_tokens;
 
 use std::net::SocketAddr;
 
@@ -35,6 +36,8 @@ pub const MAX_BODY: usize = 256 * 1024;
 pub struct AppState {
     pub store: Store,
     pub token: AdminToken,
+    /// Pin of the cluster CA, embedded in the join tokens this server hands out.
+    pub ca_hash: torngat_pki::CaHash,
 }
 
 async fn not_found() -> ApiError {
@@ -58,6 +61,14 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/operations/{id}", get(get_operation))
         .route("/v1/platform/nodes", get(list_nodes))
         .route("/v1/platform/nodes/{node}", get(get_node))
+        .route(
+            "/v1/platform/joinTokens",
+            get(join_tokens::list_join_tokens).post(join_tokens::create_join_token),
+        )
+        .route(
+            "/v1/platform/joinTokens/{id}",
+            get(join_tokens::get_join_token).delete(join_tokens::delete_join_token),
+        )
         // Unknown paths go through authentication too, so they cannot be used to probe the API.
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(

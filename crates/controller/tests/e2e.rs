@@ -23,29 +23,44 @@ use tower::ServiceExt;
 const TOKEN: &str = "e2e-token-0123456789-0123456789-abcdef";
 const BASE: &str = "/v1/orgs/acme/projects/web/instances";
 
+/// The cluster CA (as `init` creates it) plus a raw issuer for hand-made test certificates.
 struct Pki {
-    ca: CertifiedIssuer<'static, KeyPair>,
+    ca: torngat_pki::Ca,
+    raw: rcgen::Issuer<'static, KeyPair>,
 }
 
 impl Pki {
     fn new() -> Self {
-        let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
-        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        Self {
-            ca: CertifiedIssuer::self_signed(p, KeyPair::generate().unwrap()).unwrap(),
-        }
+        let ca = torngat_pki::Ca::generate().unwrap();
+        let dir = TempDir::new().unwrap();
+        ca.save(dir.path()).unwrap();
+        let key = KeyPair::from_pem(&std::fs::read_to_string(dir.path().join("ca.key")).unwrap())
+            .unwrap();
+        let raw = rcgen::Issuer::from_ca_cert_pem(ca.cert_pem(), key).unwrap();
+        Self { ca, raw }
     }
     fn ca_pem(&self) -> Vec<u8> {
-        self.ca.pem().into_bytes()
+        self.ca.cert_pem().as_bytes().to_vec()
     }
-    /// Leaf certificate with the given DNS SANs: (cert, key).
+    /// Hand-made leaf with the given DNS SANs, not enrolled: (cert, key).
     fn leaf(&self, sans: &[&str]) -> (Vec<u8>, Vec<u8>) {
         let key = KeyPair::generate().unwrap();
         let p =
             CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
-        let cert = p.signed_by(&key, &self.ca).unwrap();
+        let cert = p.signed_by(&key, &self.raw).unwrap();
         (cert.pem().into_bytes(), key.serialize_pem().into_bytes())
     }
+}
+
+/// A foreign CA, unrelated to the cluster.
+fn foreign_leaf(sans: &[&str]) -> (Vec<u8>, Vec<u8>) {
+    let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
+    p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = CertifiedIssuer::self_signed(p, KeyPair::generate().unwrap()).unwrap();
+    let key = KeyPair::generate().unwrap();
+    let p = CertificateParams::new(sans.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
+    let cert = p.signed_by(&key, &ca).unwrap();
+    (cert.pem().into_bytes(), key.serialize_pem().into_bytes())
 }
 
 struct Env {
@@ -75,7 +90,11 @@ async fn env() -> Env {
         .unwrap();
 
     let pki = Pki::new();
-    let (cert, key) = pki.leaf(&["controller.torngat"]);
+    let ctl_cert = pki.ca.issue_controller().unwrap();
+    let (cert, key) = (
+        ctl_cert.chain_pem.into_bytes(),
+        ctl_cert.key_pem.unwrap().into_bytes(),
+    );
     let ctl = Controller::new(store.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
@@ -95,6 +114,7 @@ async fn env() -> Env {
     let api = torngat_apiserver::router(AppState {
         store: store.clone(),
         token: AdminToken::new(TOKEN).unwrap(),
+        ca_hash: pki.ca.hash(),
     });
     Env {
         api,
@@ -105,14 +125,61 @@ async fn env() -> Env {
     }
 }
 
-fn agent_cfg(e: &Env, node: &str) -> AgentConfig {
-    let (cert, key) = e.pki.leaf(&[&format!("{node}.node.torngat")]);
+/// Credentials for `node`, enrolled as `init` does for its own node.
+async fn agent_cfg(e: &Env, node: &str) -> AgentConfig {
+    let name = torngat_api::Name::new(node).unwrap();
+    let issued = e.pki.ca.issue_node(&name).unwrap();
+    torngat_controller::identity::enroll(
+        &e.store,
+        &name,
+        &issued.identity(torngat_pki::KeyStorage::File).unwrap(),
+    )
+    .await
+    .unwrap();
+    unenrolled_cfg(
+        e,
+        issued.chain_pem.into_bytes(),
+        issued.key_pem.unwrap().into_bytes(),
+    )
+}
+
+fn unenrolled_cfg(e: &Env, cert_pem: Vec<u8>, key_pem: Vec<u8>) -> AgentConfig {
     AgentConfig {
         controller_url: e.url.clone(),
         controller_name: "controller.torngat".into(),
         ca_pem: e.pki.ca_pem(),
-        cert_pem: cert,
-        key_pem: key,
+        cert_pem,
+        key_pem,
+    }
+}
+
+async fn control_client(
+    cfg: &AgentConfig,
+) -> Result<ControlClient<tonic::transport::Channel>, tonic::transport::Error> {
+    let tls = tonic::transport::ClientTlsConfig::new()
+        .ca_certificate(tonic::transport::Certificate::from_pem(&cfg.ca_pem))
+        .identity(tonic::transport::Identity::from_pem(
+            &cfg.cert_pem,
+            &cfg.key_pem,
+        ))
+        .domain_name("controller.torngat");
+    let ch = tonic::transport::Channel::from_shared(cfg.controller_url.clone())
+        .unwrap()
+        .tls_config(tls)?
+        .connect()
+        .await?;
+    Ok(ControlClient::new(ch))
+}
+
+async fn heartbeat_code(cfg: &AgentConfig) -> Option<tonic::Code> {
+    match control_client(cfg).await {
+        Err(_) => None, // handshake refused
+        Ok(mut c) => Some(
+            match c.heartbeat(torngat_proto::v1::HeartbeatRequest {}).await {
+                Ok(_) => tonic::Code::Ok,
+                Err(s) => s.code(),
+            },
+        ),
     }
 }
 
@@ -163,7 +230,10 @@ async fn eventually(
 async fn instance_lifecycle_through_agent() {
     let e = env().await;
     let runtime = FakeRuntime::default();
-    tokio::spawn(torngat_agent::run(agent_cfg(&e, "n1"), runtime.clone()));
+    tokio::spawn(torngat_agent::run(
+        agent_cfg(&e, "n1").await,
+        runtime.clone(),
+    ));
 
     // Node registers with inventory; identity comes from its certificate.
     let node = eventually(&e.api, "/v1/platform/nodes/n1", "node n1", |v| {
@@ -253,7 +323,7 @@ async fn instance_lifecycle_through_agent() {
 async fn agents_cannot_impersonate_or_touch_others() {
     let e = env().await;
     tokio::spawn(torngat_agent::run(
-        agent_cfg(&e, "n1"),
+        agent_cfg(&e, "n1").await,
         FakeRuntime::default(),
     ));
     eventually(&e.api, "/v1/platform/nodes/n1", "node n1", |v| {
@@ -273,22 +343,8 @@ async fn agents_cannot_impersonate_or_touch_others() {
     .await;
 
     // A different, legitimately enrolled node cannot report on n1's instance.
-    let n2 = agent_cfg(&e, "n2");
-    let tls = tonic::transport::ClientTlsConfig::new()
-        .ca_certificate(tonic::transport::Certificate::from_pem(&n2.ca_pem))
-        .identity(tonic::transport::Identity::from_pem(
-            &n2.cert_pem,
-            &n2.key_pem,
-        ))
-        .domain_name("controller.torngat");
-    let ch = tonic::transport::Channel::from_shared(e.url.clone())
-        .unwrap()
-        .tls_config(tls)
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
-    let mut c = ControlClient::new(ch);
+    let n2 = agent_cfg(&e, "n2").await;
+    let mut c = control_client(&n2).await.unwrap();
     let err = c
         .report_instance(InstanceReport {
             org: "acme".into(),
@@ -303,45 +359,60 @@ async fn agents_cannot_impersonate_or_touch_others() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    // Authenticated (it gets past identity checks), just not registered yet.
+    assert_eq!(
+        heartbeat_code(&n2).await,
+        Some(tonic::Code::FailedPrecondition)
+    );
 
     // A certificate without a node name is refused.
-    let (cert, key) = e.pki.leaf(&["something.else"]);
-    let tls = tonic::transport::ClientTlsConfig::new()
-        .ca_certificate(tonic::transport::Certificate::from_pem(e.pki.ca_pem()))
-        .identity(tonic::transport::Identity::from_pem(cert, key))
-        .domain_name("controller.torngat");
-    let ch = tonic::transport::Channel::from_shared(e.url.clone())
-        .unwrap()
-        .tls_config(tls)
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
-    let err = ControlClient::new(ch)
-        .heartbeat(torngat_proto::v1::HeartbeatRequest {})
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    let (cert, key) = e.pki.leaf(&["something.torngat"]);
+    assert_eq!(
+        heartbeat_code(&unenrolled_cfg(&e, cert, key)).await,
+        Some(tonic::Code::PermissionDenied)
+    );
+
+    // A valid cluster certificate for n1's name but another key is refused: the name alone is
+    // not an identity.
+    let (cert, key) = e.pki.leaf(&["n1.node.torngat"]);
+    assert_eq!(
+        heartbeat_code(&unenrolled_cfg(&e, cert, key)).await,
+        Some(tonic::Code::PermissionDenied)
+    );
+
+    // A certificate for a name that never joined is refused.
+    let (cert, key) = e.pki.leaf(&["n9.node.torngat"]);
+    assert_eq!(
+        heartbeat_code(&unenrolled_cfg(&e, cert, key)).await,
+        Some(tonic::Code::PermissionDenied)
+    );
 
     // A certificate from another CA cannot even complete the handshake.
-    let other = Pki::new();
-    let (cert, key) = other.leaf(&["n1.node.torngat"]);
-    let tls = tonic::transport::ClientTlsConfig::new()
-        .ca_certificate(tonic::transport::Certificate::from_pem(e.pki.ca_pem()))
-        .identity(tonic::transport::Identity::from_pem(cert, key))
-        .domain_name("controller.torngat");
-    let ch = tonic::transport::Channel::from_shared(e.url.clone())
-        .unwrap()
-        .tls_config(tls)
+    let (cert, key) = foreign_leaf(&["n1.node.torngat"]);
+    // Depending on timing the client sees a failed connect or a transport error on the call;
+    // what matters is that the request never reaches the service.
+    let code = heartbeat_code(&unenrolled_cfg(&e, cert, key)).await;
+    assert!(
+        !matches!(
+            code,
+            Some(tonic::Code::Ok | tonic::Code::PermissionDenied | tonic::Code::FailedPrecondition)
+        ),
+        "foreign certificate reached the service: {code:?}"
+    );
+
+    // Deleting a node's identity record revokes it.
+    let n2_name = torngat_api::Name::new("n2").unwrap();
+    e.store
+        .delete(
+            torngat_controller::keys::node_identity(&n2_name).unwrap(),
+            torngat_store::Precondition::None,
+        )
+        .await
         .unwrap();
-    let res = match ch.connect().await {
-        Err(_) => true,
-        Ok(ch) => ControlClient::new(ch)
-            .heartbeat(torngat_proto::v1::HeartbeatRequest {})
-            .await
-            .is_err(),
-    };
-    assert!(res, "foreign certificate was accepted");
+    assert_eq!(
+        heartbeat_code(&n2).await,
+        Some(tonic::Code::PermissionDenied)
+    );
     e.store.shutdown().await.unwrap();
 }
 

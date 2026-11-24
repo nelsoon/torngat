@@ -20,6 +20,7 @@ tokio = { version = "1.35", features = ["net", "rt", "macros"] }
 tracing = "0.1"
 uuid.workspace = true
 torngat-api = { path = "../../api" }
+torngat-pki = { path = "../pki" }
 torngat-store = { path = "../store" }
 
 [dev-dependencies]
