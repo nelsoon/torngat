@@ -41,6 +41,9 @@ pub enum TpmError {
     Tss(#[from] tss_esapi::Error),
     #[error("tpm: {0}")]
     Other(String),
+    /// The saved key blob is damaged (not a TPM refusal).
+    #[error("malformed key blob")]
+    BadBlob,
 }
 
 fn other(e: impl std::fmt::Display) -> TpmError {
@@ -172,7 +175,7 @@ fn encode_blob(public: &Public, private: &Private) -> Result<Vec<u8>, TpmError> 
 }
 
 fn decode_blob(b: &[u8]) -> Result<(Public, Private), TpmError> {
-    let bad = || other("malformed key blob");
+    let bad = || TpmError::BadBlob;
     let take = |b: &[u8]| -> Result<(Vec<u8>, usize), TpmError> {
         let n = usize::from(u16::from_be_bytes([
             *b.first().ok_or_else(bad)?,
@@ -185,7 +188,10 @@ fn decode_blob(b: &[u8]) -> Result<(Public, Private), TpmError> {
     if n1 + n2 != b.len() {
         return Err(bad());
     }
-    Ok((Public::unmarshall(&pubb)?, Private::try_from(privb)?))
+    Ok((
+        Public::unmarshall(&pubb).map_err(|_| TpmError::BadBlob)?,
+        Private::try_from(privb).map_err(|_| TpmError::BadBlob)?,
+    ))
 }
 
 impl TpmKey {
@@ -266,16 +272,27 @@ impl TpmKey {
         let ctx = &mut g.ctx;
         let ek_cert = ek::retrieve_ek_pubcert(ctx, AsymmetricAlgorithm::Rsa.try_into()?)?;
         let ek = ek::create_ek_object(ctx, AsymmetricAlgorithm::Rsa, None)?;
-        let created = ak::create_ak(
-            ctx,
-            ek,
-            HashingAlgorithm::Sha256,
-            SignatureSchemeAlgorithm::EcDsa,
-            None,
-            None,
-        )?;
-        let ak_public = created.out_public.marshall()?;
-        let ak = ak::load_ak(ctx, ek, None, created.out_private, created.out_public)?;
+        let with_ek = |ctx: &mut Context| -> Result<(KeyHandle, Vec<u8>), TpmError> {
+            let created = ak::create_ak(
+                ctx,
+                ek,
+                HashingAlgorithm::Sha256,
+                SignatureSchemeAlgorithm::EcDsa,
+                None,
+                None,
+            )?;
+            let ak_public = created.out_public.marshall()?;
+            let ak = ak::load_ak(ctx, ek, None, created.out_private, created.out_public)?;
+            Ok((ak, ak_public))
+        };
+        let (ak, ak_public) = match with_ek(ctx) {
+            Ok(v) => v,
+            Err(e) => {
+                // Never leave the EK loaded: a TPM has few object slots.
+                let _ = ctx.flush_context(ek.into());
+                return Err(e);
+            }
+        };
         Ok(Attestation {
             key: self.clone(),
             ek,
@@ -327,51 +344,20 @@ impl Attestation {
         let key = g.key;
         let ctx = &mut g.ctx;
 
-        // ActivateCredential: the AK needs a plain HMAC session, the EK a policy session
-        // satisfied by PolicySecret on the endorsement hierarchy (its default policy).
-        let (attrs, mask) = SessionAttributesBuilder::new().build();
-        let hmac = ctx
-            .start_auth_session(
-                None,
-                None,
-                None,
-                SessionType::Hmac,
-                SymmetricDefinition::AES_128_CFB,
-                HashingAlgorithm::Sha256,
-            )?
-            .ok_or_else(|| other("no session"))?;
-        ctx.tr_sess_set_attributes(hmac, attrs, mask)?;
-        let policy = ctx
-            .start_auth_session(
-                None,
-                None,
-                None,
-                SessionType::Policy,
-                SymmetricDefinition::AES_128_CFB,
-                HashingAlgorithm::Sha256,
-            )?
-            .ok_or_else(|| other("no session"))?;
-        ctx.tr_sess_set_attributes(policy, attrs, mask)?;
-        ctx.execute_with_session(Some(hmac), |c| {
-            c.policy_secret(
-                PolicySession::try_from(policy)?,
-                AuthHandle::Endorsement,
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                None,
-            )
-        })?;
-        ctx.set_sessions((Some(hmac), Some(policy), None));
-        let secret = ctx.activate_credential(
+        // Sessions are always flushed, whatever fails: a TPM has few session slots.
+        let mut sessions = Vec::new();
+        let secret = activate(
+            ctx,
+            &mut sessions,
             self.ak,
             self.ek,
-            IdObject::try_from(id_object.to_vec())?,
-            EncryptedSecret::try_from(encrypted_secret.to_vec())?,
+            id_object,
+            encrypted_secret,
         );
         ctx.clear_sessions();
-        ctx.flush_context(SessionHandle::from(hmac).into())?;
-        ctx.flush_context(SessionHandle::from(policy).into())?;
+        for sess in sessions {
+            let _ = ctx.flush_context(SessionHandle::from(sess).into());
+        }
         let secret = secret?;
 
         let ak = self.ak;
@@ -396,6 +382,54 @@ impl Attestation {
             certify_signature: sig.marshall()?,
         })
     }
+}
+
+/// TPM2_ActivateCredential: the AK needs a plain HMAC session, the EK a policy session satisfied
+/// by PolicySecret on the endorsement hierarchy (its default policy). Started sessions are pushed
+/// to `sessions` for the caller to flush.
+fn activate(
+    ctx: &mut Context,
+    sessions: &mut Vec<tss_esapi::interface_types::session_handles::AuthSession>,
+    ak: KeyHandle,
+    ek: KeyHandle,
+    id_object: &[u8],
+    encrypted_secret: &[u8],
+) -> Result<Digest, TpmError> {
+    let (attrs, mask) = SessionAttributesBuilder::new().build();
+    let mut start = |ctx: &mut Context, kind| -> Result<_, TpmError> {
+        let sess = ctx
+            .start_auth_session(
+                None,
+                None,
+                None,
+                kind,
+                SymmetricDefinition::AES_128_CFB,
+                HashingAlgorithm::Sha256,
+            )?
+            .ok_or_else(|| other("no session"))?;
+        sessions.push(sess);
+        ctx.tr_sess_set_attributes(sess, attrs, mask)?;
+        Ok(sess)
+    };
+    let hmac = start(ctx, SessionType::Hmac)?;
+    let policy = start(ctx, SessionType::Policy)?;
+    ctx.execute_with_session(Some(hmac), |c| {
+        c.policy_secret(
+            PolicySession::try_from(policy)?,
+            AuthHandle::Endorsement,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            None,
+        )
+    })?;
+    ctx.set_sessions((Some(hmac), Some(policy), None));
+    Ok(ctx.activate_credential(
+        ak,
+        ek,
+        IdObject::try_from(id_object.to_vec())?,
+        EncryptedSecret::try_from(encrypted_secret.to_vec())?,
+    )?)
 }
 
 impl Drop for Attestation {

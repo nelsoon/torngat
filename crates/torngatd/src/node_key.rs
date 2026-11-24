@@ -92,11 +92,16 @@ pub fn create_or_resume(ident: &Path, cfg: &KeyConfig) -> Res<(NodeKey, bool)> {
         KeyConfig::Tpm { tcti } => {
             use torngat_agent::tpm::TpmKey;
             let path = ident.join("node.tpmkey");
-            if let Some(k) = std::fs::read(&path)
-                .ok()
-                .and_then(|b| TpmKey::load(tcti, &b).ok())
-            {
-                return Ok((NodeKey::Tpm(k), true));
+            // Only a missing or damaged blob means "no key yet"; a TPM error is reported, so a
+            // transient failure never replaces a key that may already be enrolled.
+            match std::fs::read(&path) {
+                Ok(b) => match TpmKey::load(tcti, &b) {
+                    Ok(k) => return Ok((NodeKey::Tpm(k), true)),
+                    Err(torngat_agent::tpm::TpmError::BadBlob) => {}
+                    Err(e) => return Err(format!("{}: {e}", path.display()).into()),
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("{}: {e}", path.display()).into()),
             }
             let (k, blob) = TpmKey::create(tcti)?;
             replace_private(&path, &blob)?;

@@ -248,7 +248,8 @@ pub async fn join(
             .await
         {
             Ok(r) => return done(r.into_inner().cert_chain_pem),
-            Err(s) if s.code() == tonic::Code::NotFound => {}
+            // Nothing to resume (or a controller without ResumeJoin): enroll normally.
+            Err(s) if matches!(s.code(), tonic::Code::NotFound | tonic::Code::Unimplemented) => {}
             Err(s) => return Err(refused(s)),
         }
     }
@@ -297,9 +298,14 @@ async fn tpm_join(
             ak_public: att.ak_public.clone(),
             node_key_public,
         })
-        .await
-        .map_err(refused)?
-        .into_inner();
+        .await;
+    let ch = match ch {
+        Ok(c) => c.into_inner(),
+        Err(s) => {
+            blocking(|| drop(att)); // flushing the EK and AK talks to the TPM
+            return Err(refused(s));
+        }
+    };
     let ans = blocking(|| {
         let ans = att.answer(&ch.id_object, &ch.encrypted_secret, &ch.nonce);
         drop(att); // flushes the EK and AK from the TPM
