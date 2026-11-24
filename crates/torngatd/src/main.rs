@@ -146,7 +146,7 @@ fn node_name(arg: Option<String>) -> Res<Name> {
 
 /// Refuses to set up over an existing state directory.
 fn fresh(data: &Path) -> Res<()> {
-    if data.join("node.json").exists() || data.join("identity").exists() {
+    if data.join("node.json").exists() {
         return Err(format!(
             "{} already holds a node; remove it to start over",
             data.display()
@@ -156,12 +156,34 @@ fn fresh(data: &Path) -> Res<()> {
     Ok(())
 }
 
-fn host_port(host: &str, port: u16) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}") // IPv6 literal
-    } else {
-        format!("{host}:{port}")
+/// `host` is a name, an IPv4 address or an IPv6 address (bare or in brackets), without a port.
+fn host_port(host: &str, port: u16) -> Res<String> {
+    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'));
+    if let Some(v6) = bare {
+        v6.parse::<std::net::Ipv6Addr>()
+            .map_err(|_| format!("invalid IPv6 address {host:?}"))?;
+        return Ok(format!("{host}:{port}"));
     }
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        return Ok(format!("[{host}]:{port}"));
+    }
+    if host.is_empty() || host.contains(':') || host.contains('/') {
+        return Err(format!(
+            "--controller takes a host name or address without a port (got {host:?}); \
+             use --join-port / --control-port for ports"
+        )
+        .into());
+    }
+    Ok(format!("{host}:{port}"))
+}
+
+/// Writes a 0600 file, replacing any previous one atomically (temp file + rename).
+fn replace_private(path: &Path, data: &[u8]) -> Res<()> {
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    write_private(&tmp, data)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 async fn open_store(data: &Path) -> Res<torngat_store::Store> {
@@ -188,7 +210,7 @@ async fn open_store(data: &Path) -> Res<torngat_store::Store> {
 async fn init(data: PathBuf, name: Option<String>) -> Res<()> {
     let name = node_name(name)?;
     fresh(&data)?;
-    if data.join("pki").exists() || data.join("store").exists() {
+    if data.join("pki").exists() || data.join("store").exists() || data.join("identity").exists() {
         return Err(format!(
             "{} holds a partial setup; remove it to start over",
             data.display()
@@ -283,18 +305,28 @@ async fn join(
     let name = node_name(name)?;
     fresh(&data)?;
     let token = std::fs::read_to_string(&token_file)?;
-    let enrolled =
-        torngat_agent::join::join(&host_port(&controller, join_port), token.trim(), &name).await?;
+    let join_addr = host_port(&controller, join_port)?;
+    let control_addr = host_port(&controller, control_port)?;
     private_dir(&data)?;
     let ident = data.join("identity");
     private_dir(&ident)?;
-    write_private(&ident.join("ca.pem"), enrolled.ca_pem.as_bytes())?;
-    write_private(&ident.join("node.pem"), enrolled.cert_chain_pem.as_bytes())?;
-    write_private(&ident.join("node.key"), enrolled.key_pem.as_bytes())?;
+    // The key is saved before joining, so a join whose answer was lost can simply be re-run.
+    let key_path = ident.join("node.key");
+    let key_pem = if key_path.exists() {
+        println!("Resuming with the existing key in {}.", key_path.display());
+        std::fs::read_to_string(&key_path)?
+    } else {
+        let pem = torngat_pki::ca::node_key()?.serialize_pem();
+        write_private(&key_path, pem.as_bytes())?;
+        pem
+    };
+    let enrolled = torngat_agent::join::join(&join_addr, token.trim(), &name, &key_pem).await?;
+    replace_private(&ident.join("ca.pem"), enrolled.ca_pem.as_bytes())?;
+    replace_private(&ident.join("node.pem"), enrolled.cert_chain_pem.as_bytes())?;
     let cfg = NodeConfig {
         role: Role::Agent,
         name: name.clone(),
-        controller: Some(host_port(&controller, control_port)),
+        controller: Some(control_addr),
     };
     write_private(&data.join("node.json"), &serde_json::to_vec_pretty(&cfg)?)?;
     println!(
@@ -328,7 +360,16 @@ async fn run(
         ..Default::default()
     })?;
     let controller_url = match (&cfg.role, &cfg.controller) {
-        (Role::Controller, _) => format!("https://127.0.0.1:{}", control.port()),
+        // The local agent dials the control endpoint where it listens (loopback if on all).
+        (Role::Controller, _) if control.ip().is_unspecified() => {
+            let lo = if control.is_ipv6() {
+                "[::1]"
+            } else {
+                "127.0.0.1"
+            };
+            format!("https://{lo}:{}", control.port())
+        }
+        (Role::Controller, _) => format!("https://{control}"),
         (Role::Agent, Some(c)) => format!("https://{c}"),
         (Role::Agent, None) => return Err("node.json: missing controller address".into()),
     };
