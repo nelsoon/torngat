@@ -485,3 +485,37 @@ async fn join_tokens_show_the_secret_once() {
     assert_eq!(s, StatusCode::NOT_FOUND);
     e.store.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tpm_policy_can_be_read_and_changed() {
+    let e = env().await;
+    const T: &str = "/v1/platform/settings/tpm";
+    let (s, _) = call(&e.app, "GET", T, None, false).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    let (s, _) = call(&e.app, "PUT", T, Some(json!({"required": false})), false).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    let (s, v) = call(&e.app, "GET", T, None, true).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v, json!({"required": true}));
+
+    let (s, v) = call(&e.app, "PUT", T, Some(json!({"required": false})), true).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v, json!({"required": false}));
+    let (s, v) = call(&e.app, "GET", T, None, true).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v, json!({"required": false}));
+
+    let (s, _) = call(
+        &e.app,
+        "PUT",
+        T,
+        Some(json!({"required": true, "extra": 1})),
+        true,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (_, v) = call(&e.app, "GET", T, None, true).await;
+    assert_eq!(v, json!({"required": false}));
+    e.store.shutdown().await.unwrap();
+}
