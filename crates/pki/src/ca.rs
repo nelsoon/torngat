@@ -224,28 +224,42 @@ impl Ca {
     /// Signs a node's CSR (DER). Only the CSR's public key is used: names, subject and
     /// extensions all come from here. The CSR's signature (proof of key possession) is checked.
     pub fn sign_node_csr(&self, csr_der: &[u8], node: &Name) -> Result<Issued, PkiError> {
-        if csr_der.len() > MAX_CSR {
-            return Err(PkiError::BadCsr);
-        }
-        let csr = CertificateSigningRequestParams::from_der(&csr_der.into())
-            .map_err(|_| PkiError::BadCsr)?;
-        if csr.public_key.algorithm() != &PKCS_ECDSA_P256_SHA256 {
-            return Err(PkiError::UnsupportedKey);
-        }
-        // The algorithm above is derived from the *signature* algorithm. Make sure the key itself
-        // is a P-256 key encoded exactly as we would encode it, so the certificate is coherent.
-        let (_, parsed) =
-            x509_parser::certification_request::X509CertificationRequest::from_der(csr_der)
-                .map_err(|_| PkiError::BadCsr)?;
-        if parsed.certification_request_info.subject_pki.raw
-            != csr.public_key.subject_public_key_info().as_slice()
-        {
-            return Err(PkiError::UnsupportedKey);
-        }
+        let csr = parse_csr(csr_der)?;
         let mut p = node_params(node)?;
         let na = validity(&mut p, LEAF_LIFETIME);
         self.sign(&p, &csr.public_key, None, na)
     }
+}
+
+/// Parses and checks a node CSR: size, signature (proof of key possession), P-256 key encoded
+/// canonically.
+fn parse_csr(csr_der: &[u8]) -> Result<CertificateSigningRequestParams, PkiError> {
+    if csr_der.len() > MAX_CSR {
+        return Err(PkiError::BadCsr);
+    }
+    let csr =
+        CertificateSigningRequestParams::from_der(&csr_der.into()).map_err(|_| PkiError::BadCsr)?;
+    if csr.public_key.algorithm() != &PKCS_ECDSA_P256_SHA256 {
+        return Err(PkiError::UnsupportedKey);
+    }
+    // The algorithm above is derived from the *signature* algorithm. Make sure the key itself
+    // is a P-256 key encoded exactly as we would encode it, so the certificate is coherent.
+    let (_, parsed) =
+        x509_parser::certification_request::X509CertificationRequest::from_der(csr_der)
+            .map_err(|_| PkiError::BadCsr)?;
+    if parsed.certification_request_info.subject_pki.raw
+        != csr.public_key.subject_public_key_info().as_slice()
+    {
+        return Err(PkiError::UnsupportedKey);
+    }
+    Ok(csr)
+}
+
+/// Checks a node CSR without signing anything; returns the SHA-256 (hex) of its public key, as
+/// recorded in [`NodeIdentity::spki_sha256`] for a certificate issued from it.
+pub fn csr_spki_sha256(csr_der: &[u8]) -> Result<String, PkiError> {
+    let csr = parse_csr(csr_der)?;
+    Ok(crate::hex_sha256(&csr.public_key.subject_public_key_info()))
 }
 
 use x509_parser::prelude::FromDer;
@@ -261,6 +275,15 @@ fn node_params(node: &Name) -> Result<CertificateParams, PkiError> {
 pub fn node_csr(key: &KeyPair) -> Result<Vec<u8>, PkiError> {
     let p = CertificateParams::new(Vec::<String>::new())?;
     Ok(p.serialize_request(key)?.der().to_vec())
+}
+
+/// Parses a node key (PEM), requiring P-256.
+pub fn parse_node_key(pem: &str) -> Result<KeyPair, PkiError> {
+    let k = KeyPair::from_pem(pem)?;
+    if k.algorithm() != &PKCS_ECDSA_P256_SHA256 {
+        return Err(PkiError::UnsupportedKey);
+    }
+    Ok(k)
 }
 
 /// Generates a node key (P-256).
@@ -379,6 +402,19 @@ mod tests {
         // A key that does not match the certificate is refused.
         let other = Ca::generate().unwrap();
         assert!(Ca::from_pem(ca.cert_pem(), &other.key_pem).is_err());
+    }
+
+    #[test]
+    fn csr_spki_matches_the_issued_certificate() {
+        let ca = Ca::generate().unwrap();
+        let key = node_key().unwrap();
+        let csr = node_csr(&key).unwrap();
+        let issued = ca.sign_node_csr(&csr, &Name::new("n1").unwrap()).unwrap();
+        assert_eq!(
+            csr_spki_sha256(&csr).unwrap(),
+            spki_sha256(&issued.cert_der).unwrap()
+        );
+        assert!(csr_spki_sha256(b"junk").is_err());
     }
 
     #[test]
