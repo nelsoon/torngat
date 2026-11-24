@@ -561,7 +561,12 @@ async fn run_seed(seed: u64) -> Report {
     net.clear_faults();
     sim.wait_leader().await;
     let mut barrier = Client::new(99, seed ^ 0xB0B, sim.clone());
+    let barrier_deadline = Instant::now() + Duration::from_secs(120);
     let barrier_rev = loop {
+        assert!(
+            Instant::now() < barrier_deadline,
+            "sim seed {seed}: final write was never acknowledged"
+        );
         match barrier
             .write("barrier", Some(b"end".to_vec()), Precondition::None)
             .await
@@ -815,6 +820,26 @@ fn check(
         })
         .collect();
     for r in &hist.reads {
+        // A value read at a revision was written by an acked write at that revision, or by an
+        // unknown write (whose revision we never learned) with that value.
+        if let Some((seen, value)) = &r.seen {
+            let written = by_key.get(r.key.as_str()).is_some_and(|ws| {
+                ws.iter().any(|w| {
+                    w.value.as_ref() == Some(value)
+                        && match w.outcome {
+                            Outcome::Acked(rev) => rev == *seen,
+                            Outcome::Unknown => true,
+                            Outcome::Failed => false,
+                        }
+                })
+            });
+            ensure!(
+                seed,
+                written,
+                "read of {} returned {value:?} at revision {seen}, which no write explains",
+                r.key
+            );
+        }
         let Some((rev, del)) = per_key.get(r.key.as_str()).and_then(|c| c.before(r.invoke)) else {
             continue;
         };
@@ -961,7 +986,7 @@ fn simulation() {
         .map(|n| n as usize)
         .or_else(|| std::thread::available_parallelism().ok().map(Into::into))
         .unwrap_or(1)
-        .clamp(1, seeds.len());
+        .clamp(1, seeds.len().max(1));
     let next = AtomicUsize::new(0);
     let failed = Mutex::new(Vec::new());
     std::thread::scope(|scope| {
@@ -994,7 +1019,7 @@ fn simulation() {
         "failed seeds: {failed:?} (rerun with TORNGAT_SIM_SEED=<seed>)"
     );
 
-    if std::env::var_os("TORNGAT_SIM_DETERMINISM").is_some() {
+    if std::env::var_os("TORNGAT_SIM_DETERMINISM").is_some() && !seeds.is_empty() {
         let seed = seeds[0];
         let (a, b) = (run_in_runtime(seed), run_in_runtime(seed));
         let common = a
