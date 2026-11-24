@@ -73,6 +73,31 @@ extension is put back. Do not copy files into `/var/lib/extensions` by hand: `sy
 refuses the whole merge when any one image there is bad, which would leave the node without the
 platform until the file is removed.
 
+## Power-loss test
+
+`image/test/power-loss.sh IMAGE [CYCLES]` (default 10) checks that an acknowledged write survives a
+power cut. It boots the image in QEMU, creates a node, and then repeats: write join-token records
+through the API (1 to 4 parallel writers, each id logged as "attempted" before the request and as
+"acked" only after a 2xx), `kill -9` QEMU after 3 to 20 s, reboot the same disk, and check that
+`torngatd` came back by itself, every acked record exists, nothing unknown exists, the node is
+`active`, `systemctl --failed` is empty and the kernel log has no filesystem errors. Any lost acked
+write exits 1 and keeps the work directory.
+
+```sh
+SSH_KEY=~/.ssh/tgimg image/test/power-loss.sh image/out/torngat_<version>.raw 10
+```
+
+It needs a Debian host with KVM, qemu, swtpm, jq, and an image built with `--authorized-keys
+KEY.pub --dev`. `SEED` replays the kill delays, `KEEP=1` keeps the work directory on success.
+
+Killing QEMU loses the guest's memory (page cache, `torngatd`) and keeps what the guest already
+flushed to the virtual disk. It does not cover loss of the host's cache, torn sector writes or a
+TPM that loses power; see the header of the script.
+
+A TPM counts every unclean shutdown as a failed authorization for keys without the noDA attribute
+and locks them out after a few in a row, so `torngatd` could no longer load its key. The node keys
+are created noDA; a lockout fails the test.
+
 ## Not done yet
 
 - Secure Boot key enrollment and a signed UKI carrying the `/usr` root hash.

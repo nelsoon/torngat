@@ -5,8 +5,10 @@
 //! TPM). It is fixed-TPM and fixed-parent: the TPM never lets it out. On disk there is only the
 //! key blob, wrapped by the TPM and useless anywhere else.
 //!
-//! No authorization values are used, so a wrong value can never trip the TPM's dictionary-attack
-//! lockout. Access is controlled by who may open the TPM device.
+//! No authorization values are used: access is controlled by who may open the TPM device. The
+//! storage root key and the node key are also created noDA, because a TPM counts an unclean
+//! shutdown after a key was used as a failed authorization, and a few power cuts would otherwise
+//! lock the node out of its key.
 //!
 //! The same TPM proves all this to the controller at join (see `torngat-attest`): an attestation
 //! key under the endorsement key certifies the node key.
@@ -69,11 +71,13 @@ pub fn ek_certificate(tcti: &str) -> Result<Vec<u8>, TpmError> {
 }
 
 fn srk(ctx: &mut Context) -> Result<KeyHandle, TpmError> {
+    // noDA: see node_key_template.
     let attrs = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
         .with_sensitive_data_origin(true)
         .with_user_with_auth(true)
+        .with_no_da(true)
         .with_restricted(true)
         .with_decrypt(true)
         .build()?;
@@ -98,11 +102,16 @@ fn srk(ctx: &mut Context) -> Result<KeyHandle, TpmError> {
 }
 
 fn node_key_template() -> Result<Public, TpmError> {
+    // noDA: the key has no auth value, so dictionary-attack protection guards nothing. Without
+    // it, every power loss after the key was used counts as a failed authorization, and a few
+    // power cuts in a row put the TPM in lockout: the node can no longer use its key until
+    // the lockout times out or is cleared with the lockout auth.
     let attrs = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
         .with_sensitive_data_origin(true)
         .with_user_with_auth(true)
+        .with_no_da(true)
         .with_sign_encrypt(true)
         .build()?;
     Ok(PublicBuilder::new()
