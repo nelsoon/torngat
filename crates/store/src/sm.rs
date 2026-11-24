@@ -142,6 +142,32 @@ impl StateMachine {
         Ok(out)
     }
 
+    /// Every key with its value, in key order, read from local state without any Raft round
+    /// trip. For simulation checkers comparing replicas.
+    #[cfg(feature = "test-util")]
+    pub fn dump(&self) -> io::Result<Vec<(Key, Versioned)>> {
+        let view = self.db.snapshot();
+        let mut out = Vec::new();
+        for item in view.iter(&self.data) {
+            let (k, v) = item.into_inner().map_err(io::Error::other)?;
+            let key = std::str::from_utf8(&k)
+                .ok()
+                .and_then(|s| Key::try_from(s.to_owned()).ok())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid stored key"))?;
+            out.push((key, deserialize(&v)?));
+        }
+        Ok(out)
+    }
+
+    /// Index of the last applied log entry, from local state.
+    #[cfg(feature = "test-util")]
+    pub fn applied_index(&self) -> io::Result<Option<u64>> {
+        Ok(self
+            .read_applied(&self.db.snapshot())?
+            .last_log_id
+            .map(|id| id.index()))
+    }
+
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<Signal> {
         self.events.subscribe()
     }
