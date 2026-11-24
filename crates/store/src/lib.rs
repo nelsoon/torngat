@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod key;
+pub mod nonet;
 pub mod sm;
 #[cfg(feature = "test-util")]
 pub mod testnet;
