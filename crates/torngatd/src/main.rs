@@ -6,7 +6,8 @@
 //! - `run`: run whatever this node was set up as (controller node: store, API server, controller,
 //!   join endpoint and agent; other nodes: agent only).
 //!
-//! State directory layout (all 0700/0600):
+//! State directory layout. The root is 0711 (others may traverse, not list: the unprivileged QEMU
+//! user must reach `instances/`); everything secret is in 0700 directories as 0600 files:
 //! ```text
 //! node.json           role, node name, controller address (written last: marks setup done)
 //! identity/           ca.pem, node.pem (chain), node.key — this node's agent credentials
@@ -114,6 +115,17 @@ fn private_dir(p: &Path) -> Res<()> {
     Ok(())
 }
 
+/// The state root: traversable by the QEMU user, not listable.
+fn data_root(p: &Path) -> Res<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o711)
+        .create(p)?;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o711))?;
+    Ok(())
+}
+
 /// Writes a new 0600 file; never overwrites.
 fn write_private(path: &Path, data: &[u8]) -> Res<()> {
     use std::io::Write;
@@ -187,6 +199,7 @@ fn replace_private(path: &Path, data: &[u8]) -> Res<()> {
 }
 
 async fn open_store(data: &Path) -> Res<torngat_store::Store> {
+    private_dir(&data.join("store"))?;
     let store = torngat_store::Store::open(
         data.join("store"),
         1,
@@ -217,7 +230,7 @@ async fn init(data: PathBuf, name: Option<String>) -> Res<()> {
         )
         .into());
     }
-    private_dir(&data)?;
+    data_root(&data)?;
     let pki = data.join("pki");
     let ident = data.join("identity");
     private_dir(&pki)?;
@@ -307,7 +320,7 @@ async fn join(
     let token = std::fs::read_to_string(&token_file)?;
     let join_addr = host_port(&controller, join_port)?;
     let control_addr = host_port(&controller, control_port)?;
-    private_dir(&data)?;
+    data_root(&data)?;
     let ident = data.join("identity");
     private_dir(&ident)?;
     // The key is saved before joining, so a join whose answer was lost can simply be re-run.
@@ -359,6 +372,9 @@ async fn run(
             .map_err(|e| format!("{}: {e} (run init or join first)", data.display()))?,
     )?;
     let ident = data.join("identity");
+    // Re-assert permissions in case an older version or an operator loosened/tightened them.
+    data_root(&data)?;
+    private_dir(&ident)?;
     let read = |p: PathBuf| std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()));
 
     let runtime = torngat_agent::qemu::QemuRuntime::new(torngat_agent::qemu::QemuConfig {
@@ -400,6 +416,7 @@ async fn run(
     }
 
     let pki = data.join("pki");
+    private_dir(&pki)?;
     let ca = Arc::new(Ca::load(&pki)?);
     let token = std::fs::read_to_string(data.join("admin-token"))?;
     let token = torngat_apiserver::AdminToken::new(token.trim())?;

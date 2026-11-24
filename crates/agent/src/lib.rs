@@ -164,11 +164,17 @@ pub async fn reconcile<R: Runtime>(
             PowerState::Running if running.contains(&uid) => ("running", String::new()),
             PowerState::Running => match runtime.start(inst).await {
                 Ok(()) => ("running", String::new()),
-                Err(e) => ("failed", e),
+                Err(e) => {
+                    tracing::warn!(%uid, error = %e, "instance failed to start");
+                    ("failed", e)
+                }
             },
             PowerState::Stopped => match runtime.stop(uid).await {
                 Ok(()) => ("stopped", String::new()),
-                Err(e) => ("failed", e),
+                Err(e) => {
+                    tracing::warn!(%uid, error = %e, "instance failed to stop");
+                    ("failed", e)
+                }
             },
         };
         if reported.get(&uid) == Some(&(phase.to_owned(), gen_)) {
