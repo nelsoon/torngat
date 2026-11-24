@@ -3,3 +3,7 @@
 *.qcow2
 /out
 mkosi.key
+/image/out
+/image/keys
+/image/mkosi.output
+/image/mkosi.cache

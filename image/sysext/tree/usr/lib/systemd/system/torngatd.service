@@ -1,0 +1,31 @@
+[Unit]
+Description=Torngat node daemon
+Documentation=https://github.com/nelsoon/torngat
+# Set up by `torngatd init` or `torngatd join` (node.json is written last).
+ConditionPathExists=/var/lib/torngat/node.json
+Wants=network-online.target
+After=network-online.target systemd-sysext.service
+
+[Service]
+# "+": runs outside the sandbox below (writes /etc/passwd).
+ExecStartPre=+/usr/bin/systemd-sysusers torngat.conf
+ExecStart=/usr/bin/torngatd run --qemu-user torngat-qemu
+Restart=on-failure
+RestartSec=2s
+# Instances are QEMU processes in their own session: stopping or restarting the daemon (an update,
+# a crash) must not kill them. The agent finds them again on start.
+KillMode=process
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

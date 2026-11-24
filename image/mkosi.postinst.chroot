@@ -1,0 +1,7 @@
+#!/bin/sh
+# Runs inside the image tree at build time.
+set -eu
+systemctl enable systemd-networkd.service systemd-resolved.service torngat-ssh-keygen.service
+# Host keys are per machine: never bake them into the image (torngat-ssh-keygen makes them on
+# first boot).
+rm -f /etc/ssh/ssh_host_*
