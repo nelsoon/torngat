@@ -94,9 +94,9 @@ Killing QEMU loses the guest's memory (page cache, `torngatd`) and keeps what th
 flushed to the virtual disk. It does not cover loss of the host's cache, torn sector writes or a
 TPM that loses power; see the header of the script.
 
-Known finding: every unclean shutdown counts as a failed authorization for the (software) TPM, which
-locks out after 3 within 1000 s and then `torngatd` cannot load its key. The test reports this and
-clears the lockout (`TPM_DA_CLEAR=0` makes it a failure).
+A TPM counts every unclean shutdown as a failed authorization for keys without the noDA attribute
+and locks them out after a few in a row, so `torngatd` could no longer load its key. The node keys
+are created noDA; a lockout fails the test.
 
 ## Not done yet
 

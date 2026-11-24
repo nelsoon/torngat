@@ -129,19 +129,14 @@ connect_api() {
   [ -n "$fwd_pid" ] && kill "$fwd_pid" 2>/dev/null || true
   ssh "${ssh_opts[@]}" -N -L "127.0.0.1:$api_port:127.0.0.1:8080" -o ExitOnForwardFailure=yes root@127.0.0.1 2>>"$work/forward.log" &
   fwd_pid=$!
-  local t0 i out da_cleared=
+  local t0 i out
   t0=$(now)
   for i in $(seq 120); do
-    # After a few power cuts in a row the TPM may be in dictionary-attack lockout: it counts every
-    # unclean shutdown as a failed authorization (max 3 on swtpm, forgiven one per 1000 s), and
-    # torngatd then cannot load its key. That is a real power-loss finding, not a storage one: it is
-    # reported, and cleared (TPM_DA_CLEAR=0 makes it a failure instead) so the cycles can go on.
-    if [ "$i" -ge 10 ] && [ -z "$da_cleared" ] && guest "journalctl -u torngatd -b --no-pager -n 40 | grep -q 'DA lockout'" 2>/dev/null; then
-      [ "${TPM_DA_CLEAR:-1}" = 1 ] || fail "torngatd cannot start: the TPM is in dictionary-attack lockout after the power cut"
-      echo "  NOTE: TPM in DA lockout, torngatd cannot start; clearing it (tpm2_dictionarylockout)" >&2
-      guest tpm2_dictionarylockout --clear-lockout >/dev/null 2>&1 || fail "could not clear the TPM lockout"
-      da_lockouts=$((da_lockouts + 1))
-      da_cleared=1
+    # A TPM counts every unclean shutdown as a failed authorization for keys without noDA, and
+    # after a few power cuts in a row it locks them out: torngatd then cannot load its key. The
+    # node keys are created noDA so this must not happen; name it if it does.
+    if [ "$i" -ge 10 ] && guest "journalctl -u torngatd -b --no-pager -n 40 | grep -q 'DA lockout'" 2>/dev/null; then
+      fail "torngatd cannot start: the TPM is in dictionary-attack lockout after the power cut"
     fi
     token=$(guest cat /var/lib/torngat/admin-token 2>/dev/null) || token=
     if [ -n "$token" ]; then
@@ -243,7 +238,7 @@ check_guest() {
 }
 
 # ---- fresh boot, cluster init ----
-t_ssh=0 t_api=0 da_lockouts=0
+t_ssh=0 t_api=0
 echo "== first boot"
 boot_vm ""
 guest torngatd init --name n1 >"$work/init.log" 2>&1 || { tail -n 10 "$work/init.log" >&2; fail "torngatd init failed"; }
@@ -280,4 +275,4 @@ for c in $(seq "$cycles"); do
 done
 
 ok=1
-echo "PASS: $cycles power cuts ($da_lockouts TPM DA lockouts cleared), $total_acked acknowledged writes in total, none lost (seed=$seed)"
+echo "PASS: $cycles power cuts, $total_acked acknowledged writes in total, none lost (seed=$seed)"
