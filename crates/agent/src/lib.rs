@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod inventory;
+pub mod join;
 pub mod qemu;
 pub mod runtime;
 

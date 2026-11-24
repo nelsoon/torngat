@@ -1,0 +1,27 @@
+[package]
+name = "torngat-pki"
+description = "Torngat internal PKI: cluster CA, node and controller certificates, join tokens."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+getrandom = "0.4"
+rcgen = { version = "0.14", features = ["x509-parser"] }
+serde.workspace = true
+sha2 = "0.10"
+subtle = "2.6"
+thiserror.workspace = true
+time.workspace = true
+x509-parser = "0.18"
+torngat-api = { path = "../../api" }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3.4"
+
+[lints]
+workspace = true

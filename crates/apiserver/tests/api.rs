@@ -45,6 +45,7 @@ async fn env() -> Env {
     let app = router(AppState {
         store: store.clone(),
         token: AdminToken::new(TOKEN).unwrap(),
+        ca_hash: torngat_pki::CaHash([7; 32]),
     });
     Env {
         app,
@@ -425,5 +426,62 @@ async fn concurrent_duplicate_creates_share_one_operation() {
     )
     .await;
     assert_eq!(s, StatusCode::OK);
+    e.store.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn join_tokens_show_the_secret_once() {
+    let e = env().await;
+    const T: &str = "/v1/platform/joinTokens";
+    let (s, _) = call(&e.app, "POST", T, Some(json!({})), false).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    let (s, t) = call(
+        &e.app,
+        "POST",
+        T,
+        Some(json!({"node": "n2", "ttl_seconds": 3600, "description": "rack 4"})),
+        true,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{t}");
+    let text = t["token"].as_str().unwrap();
+    let (tok, ca) = torngat_pki::JoinToken::parse(text).unwrap();
+    assert_eq!(ca, torngat_pki::CaHash([7; 32]));
+    assert_eq!(tok.id(), t["name"].as_str().unwrap());
+    assert_eq!(t["node"], "n2");
+
+    // Never shown again.
+    let (s, l) = call(&e.app, "GET", T, None, true).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(l["items"].as_array().unwrap().len(), 1);
+    assert!(l["items"][0].get("token").is_none());
+    assert!(!l.to_string().contains(text.split('.').nth(2).unwrap()));
+    let one = format!("{T}/{}", tok.id());
+    let (s, g) = call(&e.app, "GET", &one, None, true).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(g.get("token").is_none());
+
+    // Validation.
+    for bad in [
+        json!({"ttl_seconds": 1}),
+        json!({"ttl_seconds": 99_999_999}),
+        json!({"node": "Bad_Name"}),
+        json!({"description": "a\nb"}),
+        json!({"secret_sha256": "00"}),
+    ] {
+        let (s, v) = call(&e.app, "POST", T, Some(bad.clone()), true).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad} -> {v}");
+    }
+    let (s, _) = call(&e.app, "GET", &format!("{T}/not-an-id"), None, true).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // Revoke.
+    let (s, _) = call(&e.app, "DELETE", &one, None, true).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = call(&e.app, "GET", &one, None, true).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _) = call(&e.app, "DELETE", &one, None, true).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
     e.store.shutdown().await.unwrap();
 }

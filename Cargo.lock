@@ -2237,12 +2237,17 @@ dependencies = [
 name = "torngat-agent"
 version = "0.0.1"
 dependencies = [
+ "pem",
+ "rcgen",
+ "rustls",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tonic",
  "torngat-api",
+ "torngat-pki",
  "torngat-proto",
  "tracing",
  "uuid",
@@ -2274,6 +2279,7 @@ dependencies = [
  "time",
  "tokio",
  "torngat-api",
+ "torngat-pki",
  "torngat-store",
  "tower",
  "tracing",
@@ -2297,11 +2303,29 @@ dependencies = [
  "torngat-agent",
  "torngat-api",
  "torngat-apiserver",
+ "torngat-pki",
  "torngat-proto",
  "torngat-store",
  "tower",
  "tracing",
  "uuid",
+ "x509-parser",
+]
+
+[[package]]
+name = "torngat-pki"
+version = "0.0.1"
+dependencies = [
+ "getrandom 0.4.3",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "torngat-api",
  "x509-parser",
 ]
 
@@ -2338,12 +2362,14 @@ name = "torngatd"
 version = "0.0.1"
 dependencies = [
  "clap",
- "rcgen",
+ "serde",
+ "serde_json",
  "tokio",
  "torngat-agent",
  "torngat-api",
  "torngat-apiserver",
  "torngat-controller",
+ "torngat-pki",
  "torngat-store",
  "tracing",
  "tracing-subscriber",

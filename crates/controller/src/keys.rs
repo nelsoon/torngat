@@ -26,3 +26,17 @@ pub fn nodes() -> Result<Prefix, KeyError> {
 pub fn operation(id: Uuid) -> Result<Key, KeyError> {
     Key::new("ops", ["operations", &id.hyphenated().to_string()])
 }
+
+/// Credential record of an enrolled node ([`torngat_pki::NodeIdentity`]).
+pub fn node_identity(name: &Name) -> Result<Key, KeyError> {
+    Key::new("platform", ["nodeidentities", name.as_str()])
+}
+
+/// A join token record ([`torngat_pki::JoinTokenRecord`]), by token id.
+pub fn join_token(id: &str) -> Result<Key, KeyError> {
+    Key::new("platform", ["jointokens", id])
+}
+
+pub fn join_tokens() -> Result<Prefix, KeyError> {
+    Prefix::new("platform", ["jointokens"])
+}

@@ -24,12 +24,12 @@ fn name(kind: &str, s: &str) -> Result<Name, ApiError> {
     Name::new(s).map_err(|e| ApiError::InvalidArgument(format!("invalid {kind} name: {e}")))
 }
 
-fn body<T>(b: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
+pub(crate) fn body<T>(b: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
     b.map(|Json(t)| t)
         .map_err(|e| ApiError::InvalidArgument(format!("invalid request body: {}", e.body_text())))
 }
 
-fn query<T>(q: Result<Query<T>, QueryRejection>) -> Result<T, ApiError> {
+pub(crate) fn query<T>(q: Result<Query<T>, QueryRejection>) -> Result<T, ApiError> {
     q.map(|Query(t)| t)
         .map_err(|e| ApiError::InvalidArgument(format!("invalid query: {}", e.body_text())))
 }
@@ -283,15 +283,15 @@ pub async fn get_instance(
 
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
-    page_size: Option<usize>,
-    page_token: Option<String>,
+    pub(crate) page_size: Option<usize>,
+    pub(crate) page_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ListResponse<T> {
-    items: Vec<T>,
+    pub(crate) items: Vec<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    next_page_token: Option<String>,
+    pub(crate) next_page_token: Option<String>,
 }
 
 pub async fn list_instances(

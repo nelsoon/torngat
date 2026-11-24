@@ -19,6 +19,7 @@ tracing = "0.1"
 uuid.workspace = true
 x509-parser = "0.18"
 torngat-api = { path = "../../api" }
+torngat-pki = { path = "../pki" }
 torngat-proto = { path = "../proto" }
 torngat-store = { path = "../store" }
 
