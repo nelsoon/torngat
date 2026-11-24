@@ -20,7 +20,6 @@ pub mod wire;
 
 use rsa::PublicKey;
 use rsa::pkcs8::DecodePublicKey;
-use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use wire::{CertifyInfo, EccPublic, attr};
 
@@ -38,10 +37,6 @@ pub enum AttestError {
     Random,
 }
 
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && bool::from(a.ct_eq(b))
 }
@@ -56,9 +51,7 @@ pub struct Endorsement {
 
 /// SHA-256 (hex) of an EK certificate's public key, the value an operator pins on a join token.
 pub fn ek_pin(ek_cert_der: &[u8]) -> Result<String, AttestError> {
-    let (_, cert) =
-        x509_parser::parse_x509_certificate(ek_cert_der).map_err(|_| AttestError::Malformed)?;
-    Ok(hex(&Sha256::digest(cert.tbs_certificate.subject_pki.raw)))
+    torngat_pki::spki_sha256(ek_cert_der).map_err(|_| AttestError::Malformed)
 }
 
 /// Checks an RSA 2048 EK certificate. With `pin`, the key must match it (the certificate's
@@ -75,7 +68,7 @@ pub fn verify_endorsement(
         return Err(AttestError::Malformed);
     }
     let spki = cert.tbs_certificate.subject_pki.raw;
-    let spki_sha256 = hex(&Sha256::digest(spki));
+    let spki_sha256 = torngat_pki::hex_sha256(spki);
     let key = PublicKey::from_public_key_der(spki)
         .map_err(|_| AttestError::Unsupported("endorsement key type (RSA 2048 required)"))?;
     if rsa::traits::PublicKeyParts::size(&key) != 256 {
@@ -84,7 +77,7 @@ pub fn verify_endorsement(
         ));
     }
     let trusted = match pin {
-        Some(p) => ct_eq(p.as_bytes(), spki_sha256.as_bytes()),
+        Some(p) => torngat_pki::digest_eq(p, &spki_sha256),
         None => {
             cert.validity().is_valid()
                 && anchors.iter().any(|a| {
@@ -116,21 +109,16 @@ pub struct Pending {
     nonce: [u8; 32],
     ak: EccPublic,
     node_key_name: Vec<u8>,
-    pub ek_spki_sha256: String,
 }
 
 impl std::fmt::Debug for Pending {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Pending")
-            .field("ek_spki_sha256", &self.ek_spki_sha256)
-            .finish_non_exhaustive()
+        f.write_str("Pending(<redacted>)")
     }
 }
 
 fn random32() -> Result<[u8; 32], AttestError> {
-    let mut b = [0u8; 32];
-    getrandom::fill(&mut b).map_err(|_| AttestError::Random)?;
-    Ok(b)
+    torngat_pki::random::<32>().map_err(|_| AttestError::Random)
 }
 
 /// Checks the AK and node key descriptions and builds the challenge.
@@ -142,30 +130,26 @@ pub fn begin(
     node_public: &[u8],
     csr_spki_sha256: &str,
 ) -> Result<(Pending, Challenge), AttestError> {
+    // Both keys: signing only, generated in this TPM and unable to leave it, ECDSA-SHA256 at most.
+    const BOUND: u32 =
+        attr::SIGN | attr::FIXED_TPM | attr::FIXED_PARENT | attr::SENSITIVE_DATA_ORIGIN;
+    let ok = |k: &EccPublic, restricted: bool| {
+        k.has(BOUND)
+            && k.has(attr::RESTRICTED) == restricted
+            && !k.has(attr::DECRYPT)
+            && !k.has_symmetric
+            && k.ecdsa_hash.is_none_or(|h| h == wire::TPM_ALG_SHA256)
+    };
     let ak = EccPublic::parse(ak_public)?;
-    if !ak.has(
-        attr::RESTRICTED
-            | attr::SIGN
-            | attr::FIXED_TPM
-            | attr::FIXED_PARENT
-            | attr::SENSITIVE_DATA_ORIGIN,
-    ) || ak.has(attr::DECRYPT)
-        || ak.has_symmetric
-        || ak.ecdsa_hash != Some(wire::TPM_ALG_SHA256)
-    {
+    // The AK must be restricted (it only signs TPM-generated structures) with an explicit scheme.
+    if !ok(&ak, true) || ak.ecdsa_hash.is_none() {
         return Err(AttestError::Failed("attestation key attributes"));
     }
     let node = EccPublic::parse(node_public)?;
-    if !node.has(attr::SIGN | attr::FIXED_TPM | attr::FIXED_PARENT | attr::SENSITIVE_DATA_ORIGIN)
-        || node.has(attr::DECRYPT)
-        || node.has(attr::RESTRICTED)
-        || node.has_symmetric
-        || node.ecdsa_hash.is_some_and(|h| h != wire::TPM_ALG_SHA256)
-    {
+    if !ok(&node, false) {
         return Err(AttestError::Failed("node key attributes"));
     }
-    let node_spki = hex(&Sha256::digest(node.spki_der()));
-    if !ct_eq(node_spki.as_bytes(), csr_spki_sha256.as_bytes()) {
+    if !torngat_pki::digest_eq(&torngat_pki::hex_sha256(&node.spki_der()), csr_spki_sha256) {
         return Err(AttestError::Failed("the CSR is not for the TPM key"));
     }
     let secret = random32()?;
@@ -177,7 +161,6 @@ pub fn begin(
             nonce,
             ak,
             node_key_name: node.name,
-            ek_spki_sha256: ek.spki_sha256.clone(),
         },
         Challenge {
             id_object: blob.id_object,
@@ -225,6 +208,7 @@ mod tests {
     use hmac::{KeyInit, Mac};
     use p256::ecdsa::SigningKey;
     use rsa::PrivateKey;
+    use sha2::Sha256;
 
     /// Software `TPM2_ActivateCredential`, to check `make_credential` end to end.
     fn activate(ek: &PrivateKey, name: &[u8], c: &Challenge) -> Option<Vec<u8>> {
@@ -335,7 +319,7 @@ mod tests {
     fn csr_spki(k: &SigningKey) -> String {
         let (x, y) = point(k);
         let p = EccPublic::parse(&ecc_public(0, false, &x, &y)).unwrap();
-        hex(&Sha256::digest(p.spki_der()))
+        torngat_pki::hex_sha256(&p.spki_der())
     }
 
     fn answer(t: &Tpm, c: &Challenge) -> (Vec<u8>, Vec<u8>, Vec<u8>) {

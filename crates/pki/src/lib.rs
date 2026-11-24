@@ -122,10 +122,21 @@ pub(crate) fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
     Some(out)
 }
 
-pub(crate) fn random<const N: usize>() -> Result<[u8; N], PkiError> {
+/// `N` bytes from the operating system's CSPRNG.
+pub fn random<const N: usize>() -> Result<[u8; N], PkiError> {
     let mut b = [0u8; N];
     getrandom::fill(&mut b).map_err(|_| PkiError::Random)?;
     Ok(b)
+}
+
+/// Every certificate (DER) in a PEM bundle; anything else in it, or no certificate at all, is
+/// an error.
+pub fn pem_certs(pem: &[u8]) -> Result<Vec<Vec<u8>>, PkiError> {
+    let blocks = pem::parse_many(pem).map_err(|_| PkiError::BadCertificate)?;
+    if blocks.is_empty() || blocks.iter().any(|b| b.tag() != "CERTIFICATE") {
+        return Err(PkiError::BadCertificate);
+    }
+    Ok(blocks.into_iter().map(pem::Pem::into_contents).collect())
 }
 
 /// A fresh random secret: 32 bytes, lowercase hex (e.g. a bootstrap admin token).

@@ -28,6 +28,24 @@ pub use runtime::{FakeRuntime, Runtime};
 
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(2);
 
+/// Runs slow synchronous work (TPM operations) so the runtime can move other tasks, such as
+/// heartbeats, to other workers meanwhile. Inline on a single-threaded runtime.
+pub fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    if multi_thread() {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
+fn multi_thread() -> bool {
+    tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+}
+
+/// Default TPM: the kernel's resource manager.
+pub const DEFAULT_TPM_TCTI: &str = "device:/dev/tpmrm0";
+
 /// The node's private key.
 #[derive(Clone)]
 pub enum NodeKey {
@@ -44,6 +62,46 @@ impl std::fmt::Debug for NodeKey {
             NodeKey::File(_) => f.write_str("NodeKey::File(<redacted>)"),
             #[cfg(feature = "tpm")]
             NodeKey::Tpm(k) => write!(f, "NodeKey::Tpm({k:?})"),
+        }
+    }
+}
+
+impl NodeKey {
+    /// How the key is held, as recorded at enrollment.
+    pub fn storage(&self) -> torngat_pki::KeyStorage {
+        match self {
+            NodeKey::File(_) => torngat_pki::KeyStorage::File,
+            #[cfg(feature = "tpm")]
+            NodeKey::Tpm(_) => torngat_pki::KeyStorage::Tpm,
+        }
+    }
+
+    /// A CSR (DER) for this key. Slow for TPM keys: call off the async runtime.
+    pub fn csr(&self) -> Result<Vec<u8>, String> {
+        match self {
+            NodeKey::File(pem) => {
+                let pem = std::str::from_utf8(pem).map_err(|e| e.to_string())?;
+                let key = torngat_pki::ca::parse_node_key(pem).map_err(|e| e.to_string())?;
+                torngat_pki::ca::node_csr(&key).map_err(|e| e.to_string())
+            }
+            #[cfg(feature = "tpm")]
+            NodeKey::Tpm(k) => k.csr().map_err(|e| e.to_string()),
+        }
+    }
+
+    fn tls_key(
+        &self,
+        provider: &rustls::crypto::CryptoProvider,
+    ) -> Result<std::sync::Arc<dyn rustls::sign::SigningKey>, AgentError> {
+        match self {
+            NodeKey::File(pem) => {
+                use rustls::pki_types::PrivateKeyDer;
+                use rustls::pki_types::pem::PemObject;
+                let der = PrivateKeyDer::from_pem_slice(pem).map_err(tls_err)?;
+                provider.key_provider.load_private_key(der).map_err(tls_err)
+            }
+            #[cfg(feature = "tpm")]
+            NodeKey::Tpm(k) => Ok(std::sync::Arc::new(tpm::TlsKey(k.clone()))),
         }
     }
 }
@@ -85,94 +143,109 @@ fn tls_err(e: impl std::fmt::Display) -> AgentError {
     AgentError::Tls(e.to_string())
 }
 
-/// Always presents the one node certificate.
-#[cfg(feature = "tpm")]
-#[derive(Debug)]
-struct NodeCert(std::sync::Arc<rustls::sign::CertifiedKey>);
+/// Dials the controller over mTLS. Built once per agent so TLS sessions can be resumed across
+/// reconnects (a resumed handshake needs no signature: no TPM operation).
+#[derive(Clone)]
+pub struct Connector {
+    tls: tokio_rustls::TlsConnector,
+    name: rustls::pki_types::ServerName<'static>,
+    addr: String,
+    /// The key signs synchronously and slowly (TPM).
+    slow_key: bool,
+}
 
-#[cfg(feature = "tpm")]
-impl rustls::client::ResolvesClientCert for NodeCert {
-    fn resolve(
-        &self,
-        _hints: &[&[u8]],
-        _schemes: &[rustls::SignatureScheme],
-    ) -> Option<std::sync::Arc<rustls::sign::CertifiedKey>> {
-        Some(self.0.clone())
-    }
-
-    fn has_certs(&self) -> bool {
-        true
+impl std::fmt::Debug for Connector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connector")
+            .field("addr", &self.addr)
+            .finish_non_exhaustive()
     }
 }
 
-/// mTLS client configuration: trust only the cluster CA, authenticate with the node key.
-fn client_tls(cfg: &AgentConfig) -> Result<rustls::ClientConfig, AgentError> {
-    use rustls::pki_types::pem::PemObject;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    use std::sync::Arc;
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut roots = rustls::RootCertStore::empty();
-    for c in CertificateDer::pem_slice_iter(&cfg.ca_pem) {
-        roots.add(c.map_err(tls_err)?).map_err(tls_err)?;
+impl Connector {
+    /// Trusts only the cluster CA and authenticates with the node key.
+    pub fn new(cfg: &AgentConfig) -> Result<Self, AgentError> {
+        use rustls::pki_types::CertificateDer;
+        use rustls::pki_types::pem::PemObject;
+        use std::sync::Arc;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        for c in CertificateDer::pem_slice_iter(&cfg.ca_pem) {
+            roots.add(c.map_err(tls_err)?).map_err(tls_err)?;
+        }
+        let chain = CertificateDer::pem_slice_iter(&cfg.cert_pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(tls_err)?;
+        let certified = rustls::sign::CertifiedKey::new(chain, cfg.key.tls_key(&provider)?);
+        let mut config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(tls_err)?
+            .with_root_certificates(roots)
+            .with_client_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(certified)));
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let addr = cfg
+            .controller_url
+            .strip_prefix("https://")
+            .ok_or_else(|| tls_err("controller_url must start with https://"))?
+            .trim_end_matches('/')
+            .to_owned();
+        Ok(Self {
+            tls: tokio_rustls::TlsConnector::from(Arc::new(config)),
+            name: rustls::pki_types::ServerName::try_from(cfg.controller_name.clone())
+                .map_err(tls_err)?,
+            addr,
+            slow_key: cfg.key.storage() == torngat_pki::KeyStorage::Tpm,
+        })
     }
-    let chain = CertificateDer::pem_slice_iter(&cfg.cert_pem)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(tls_err)?;
-    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .map_err(tls_err)?
-        .with_root_certificates(roots);
-    let mut config = match &cfg.key {
-        NodeKey::File(pem) => {
-            let key = PrivateKeyDer::from_pem_slice(pem).map_err(tls_err)?;
-            builder.with_client_auth_cert(chain, key).map_err(tls_err)?
-        }
-        #[cfg(feature = "tpm")]
-        NodeKey::Tpm(k) => {
-            let signing = Arc::new(tpm::TlsKey(k.clone()));
-            builder.with_client_cert_resolver(Arc::new(NodeCert(Arc::new(
-                rustls::sign::CertifiedKey::new(chain, signing),
-            ))))
-        }
-    };
-    config.alpn_protocols = vec![b"h2".to_vec()];
-    Ok(config)
+
+    /// Opens the mTLS control channel. TLS is done here (tonic's own TLS cannot use a TPM-held
+    /// key), so tonic sees plain HTTP/2.
+    pub async fn connect(&self) -> Result<ControlClient<Channel>, AgentError> {
+        let this = self.clone();
+        let connector = tower::service_fn(move |_: tonic::codegen::http::Uri| {
+            let this = this.clone();
+            async move {
+                let tcp = tokio::net::TcpStream::connect(&this.addr).await?;
+                let handshake = this.tls.connect(this.name, tcp);
+                let stream = if this.slow_key && multi_thread() {
+                    // A TPM signs synchronously (~100 ms) inside the handshake: tell the runtime,
+                    // so other tasks (heartbeats) move to other workers meanwhile.
+                    let rt = tokio::runtime::Handle::current();
+                    tokio::task::block_in_place(|| rt.block_on(handshake))?
+                } else {
+                    handshake.await?
+                };
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+            }
+        });
+        let channel = tonic::transport::Endpoint::from_static("http://controller.invalid")
+            .connect_timeout(Duration::from_secs(5))
+            .connect_with_connector(connector)
+            .await?;
+        Ok(ControlClient::new(channel))
+    }
 }
 
-/// Opens the mTLS control channel to the controller.
+/// Opens the mTLS control channel to the controller (one-off; [`run`] keeps a [`Connector`]).
 pub async fn connect(cfg: &AgentConfig) -> Result<ControlClient<Channel>, AgentError> {
-    let addr = cfg
-        .controller_url
-        .strip_prefix("https://")
-        .ok_or_else(|| tls_err("controller_url must start with https://"))?
-        .trim_end_matches('/')
-        .to_owned();
-    let name =
-        rustls::pki_types::ServerName::try_from(cfg.controller_name.clone()).map_err(tls_err)?;
-    let tls = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_tls(cfg)?));
-    // TLS is done here (tonic's own TLS cannot use a TPM-held key), so tonic sees plain h2.
-    let connector = tower::service_fn(move |_: tonic::codegen::http::Uri| {
-        let (tls, name, addr) = (tls.clone(), name.clone(), addr.clone());
-        async move {
-            let tcp = tokio::net::TcpStream::connect(&addr).await?;
-            let stream = tls.connect(name, tcp).await?;
-            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
-        }
-    });
-    let channel = tonic::transport::Endpoint::from_static("http://controller.invalid")
-        .connect_timeout(Duration::from_secs(5))
-        .connect_with_connector(connector)
-        .await?;
-    Ok(ControlClient::new(channel))
+    Connector::new(cfg)?.connect().await
 }
 
 /// Runs the agent forever, reconnecting on errors.
 pub async fn run<R: Runtime>(cfg: AgentConfig, runtime: R) {
+    let connector = match Connector::new(&cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            // Bad local credentials: retrying cannot help.
+            tracing::error!(error = %e, "cannot set up the controller connection");
+            return;
+        }
+    };
     const MIN: Duration = Duration::from_millis(200);
     let mut backoff = MIN;
     loop {
         let started = std::time::Instant::now();
-        if let Err(e) = session(&cfg, &runtime).await {
+        if let Err(e) = session(&connector, &runtime).await {
             tracing::warn!(error = %e, "controller session ended");
         }
         // A session that ran for a while was healthy: start backing off from scratch.
@@ -188,8 +261,8 @@ pub async fn run<R: Runtime>(cfg: AgentConfig, runtime: R) {
 type Reported = BTreeMap<Uuid, (String, u64)>;
 
 /// One connected session: register, heartbeat, follow assignments.
-pub async fn session<R: Runtime>(cfg: &AgentConfig, runtime: &R) -> Result<(), AgentError> {
-    let mut client = connect(cfg).await?;
+pub async fn session<R: Runtime>(connector: &Connector, runtime: &R) -> Result<(), AgentError> {
+    let mut client = connector.connect().await?;
     let status = inventory::collect(env!("CARGO_PKG_VERSION"));
     client
         .register(RegisterRequest {

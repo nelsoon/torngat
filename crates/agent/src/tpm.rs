@@ -35,9 +35,6 @@ use tss_esapi::tcti_ldr::TctiNameConf;
 use tss_esapi::traits::{Marshall, UnMarshall};
 use tss_esapi::tss2_esys::TPMT_TK_HASHCHECK;
 
-/// Default TPM: the kernel's resource manager.
-pub const DEFAULT_TCTI: &str = "device:/dev/tpmrm0";
-
 #[derive(Debug, thiserror::Error)]
 pub enum TpmError {
     #[error("tpm: {0}")]
@@ -154,13 +151,12 @@ impl std::fmt::Debug for TpmKey {
     }
 }
 
+/// Uncompressed SEC1 point of an ECC P-256 key, via the same parser the controller uses.
 fn point_of(public: &Public) -> Result<Vec<u8>, TpmError> {
-    let Public::Ecc { unique, .. } = public else {
-        return Err(other("not an ECC key"));
-    };
+    let k = torngat_attest::wire::EccPublic::parse(&public.marshall()?).map_err(other)?;
     let mut p = vec![0x04];
-    p.extend_from_slice(&pad32(unique.x().value())?);
-    p.extend_from_slice(&pad32(unique.y().value())?);
+    p.extend_from_slice(&k.x);
+    p.extend_from_slice(&k.y);
     Ok(p)
 }
 

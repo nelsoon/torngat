@@ -15,8 +15,8 @@
 //! 2. the identity record is created only if absent (a name is enrolled at most once). If another
 //!    join took the name in between, the token is put back.
 //!
-//! Retries: a node whose join committed but whose response was lost retries `Join` with the same
-//! key. Within [`RETRY_WINDOW`] of enrollment, a CSR for exactly the enrolled key gets a fresh
+//! Retries: a node whose join committed but whose response was lost calls `ResumeJoin` with the
+//! same key. Within [`RETRY_WINDOW`] of enrollment, a CSR for exactly the enrolled key gets a fresh
 //! certificate without a token. That is safe: the certificate is useless without the private key,
 //! and the CSR signature proves the caller holds it.
 
@@ -30,7 +30,9 @@ use torngat_api::Name;
 use torngat_pki::{Ca, Issued, JoinTokenRecord, KeyStorage, NodeIdentity, TpmPolicy};
 use torngat_proto::API_VERSION;
 use torngat_proto::v1::join_server::Join;
-use torngat_proto::v1::{JoinRequest, JoinResponse, TpmChallenge, TpmJoinAnswer, TpmJoinRequest};
+use torngat_proto::v1::{
+    JoinRequest, JoinResponse, ResumeJoinRequest, TpmChallenge, TpmJoinAnswer, TpmJoinRequest,
+};
 use torngat_store::{Key, Precondition, Store, StoreError, Versioned};
 
 use crate::identity::{self, EnrollError};
@@ -55,6 +57,7 @@ struct PendingJoin {
     token_key: Key,
     token: Versioned,
     token_id: String,
+    ek_sha256: String,
     expires: Instant,
 }
 
@@ -182,6 +185,11 @@ fn node_name(s: String) -> Result<Name, Status> {
     Name::new(s).map_err(|_| Status::invalid_argument("invalid node name"))
 }
 
+/// Checks a CSR (signature, key type) without signing anything; its key's SHA-256 (hex).
+fn csr_spki(csr_der: &[u8]) -> Result<String, Status> {
+    torngat_pki::ca::csr_spki_sha256(csr_der).map_err(|e| Status::invalid_argument(e.to_string()))
+}
+
 fn response(issued: Issued) -> Response<JoinResponse> {
     Response::new(JoinResponse {
         cert_chain_pem: issued.chain_pem,
@@ -195,33 +203,7 @@ impl Join for JoinService {
         let r = req.into_inner();
         check_version(&r.api_version)?;
         let node = node_name(r.node_name)?;
-        let tpm = match r.key_storage.as_str() {
-            "file" => false,
-            "tpm" => true,
-            _ => return Err(Status::invalid_argument("invalid key_storage")),
-        };
-        // Pure checks first: the CSR (signature, key type). Nothing is signed before the caller is
-        // authorized.
-        let spki = torngat_pki::ca::csr_spki_sha256(&r.csr_der)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-
-        // A retry of a join that committed moments ago, with the same key. Bounded in time, so it
-        // is not a token-less renewal path.
-        let ikey = keys::node_identity(&node).map_err(internal)?;
-        if let Some(v) = self.store.get(&ikey).await.map_err(store_err)? {
-            let cur: NodeIdentity = serde_json::from_slice(&v.value).map_err(internal)?;
-            let recent = OffsetDateTime::now_utc() - cur.issue_time < RETRY_WINDOW;
-            if recent && torngat_pki::digest_eq(&cur.spki_sha256, &spki) {
-                tracing::info!(%node, ?peer, "node certificate re-issued for its enrolled key");
-                return Ok(response(self.issue(&r.csr_der, &node)?));
-            }
-        }
-
-        if tpm {
-            return Err(Status::failed_precondition(
-                "TPM keys enroll with BeginTpmJoin",
-            ));
-        }
+        csr_spki(&r.csr_der)?;
         if self.policy().await?.required {
             return Err(Status::failed_precondition(
                 "this cluster requires TPM-held node keys",
@@ -238,6 +220,31 @@ impl Join for JoinService {
         Ok(response(issued))
     }
 
+    async fn resume_join(
+        &self,
+        req: Request<ResumeJoinRequest>,
+    ) -> Result<Response<JoinResponse>, Status> {
+        let peer = req.remote_addr();
+        let r = req.into_inner();
+        check_version(&r.api_version)?;
+        let node = node_name(r.node_name)?;
+        // The CSR signature proves the caller holds the key; the certificate is useless without
+        // it. Bounded in time, so this is not a token-less renewal path.
+        let spki = csr_spki(&r.csr_der)?;
+        let not_found = || Status::not_found("no recent enrollment for this key");
+        let ikey = keys::node_identity(&node).map_err(internal)?;
+        let Some(v) = self.store.get(&ikey).await.map_err(store_err)? else {
+            return Err(not_found());
+        };
+        let cur: NodeIdentity = serde_json::from_slice(&v.value).map_err(internal)?;
+        let recent = OffsetDateTime::now_utc() - cur.issue_time < RETRY_WINDOW;
+        if !recent || !torngat_pki::digest_eq(&cur.spki_sha256, &spki) {
+            return Err(not_found());
+        }
+        tracing::info!(%node, ?peer, "node certificate re-issued for its enrolled key");
+        Ok(response(self.issue(&r.csr_der, &node)?))
+    }
+
     async fn begin_tpm_join(
         &self,
         req: Request<TpmJoinRequest>,
@@ -245,8 +252,7 @@ impl Join for JoinService {
         let r = req.into_inner();
         check_version(&r.api_version)?;
         let node = node_name(r.node_name)?;
-        let spki = torngat_pki::ca::csr_spki_sha256(&r.csr_der)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let spki = csr_spki(&r.csr_der)?;
         let (tkey, tv, rec) = self
             .check_token(&r.token_id, &r.token_secret, &node)
             .await?;
@@ -281,6 +287,7 @@ impl Join for JoinService {
                     token_key: tkey,
                     token: tv,
                     token_id: rec.id,
+                    ek_sha256: ek.spki_sha256,
                     expires: now + CHALLENGE_TTL,
                 },
             );
@@ -313,7 +320,7 @@ impl Join for JoinService {
             .map_err(|e| Status::permission_denied(format!("TPM attestation refused: {e}")))?;
         let issued = self.issue(&pending.csr_der, &pending.node)?;
         let mut ident = issued.identity(KeyStorage::Tpm).map_err(internal)?;
-        ident.ek_sha256 = Some(pending.attest.ek_spki_sha256.clone());
+        ident.ek_sha256 = Some(pending.ek_sha256.clone());
         self.consume_and_enroll(
             pending.token_key,
             pending.token,
@@ -323,7 +330,7 @@ impl Join for JoinService {
         )
         .await?;
         tracing::info!(node = %pending.node, token = %pending.token_id, ?peer, key = "tpm",
-            ek = %pending.attest.ek_spki_sha256, "node enrolled");
+            ek = %pending.ek_sha256, "node enrolled");
         Ok(response(issued))
     }
 }

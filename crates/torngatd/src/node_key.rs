@@ -4,8 +4,11 @@ use std::path::Path;
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
+use torngat_agent::NodeKey;
 
 use crate::{Res, replace_private};
+
+pub use torngat_agent::DEFAULT_TPM_TCTI as DEFAULT_TCTI;
 
 /// Recorded in `node.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,7 +21,16 @@ pub enum KeyConfig {
     Tpm { tcti: String },
 }
 
-/// `--tpm` for join.
+impl std::fmt::Display for KeyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyConfig::File => f.write_str("file"),
+            KeyConfig::Tpm { tcti } => write!(f, "TPM ({tcti})"),
+        }
+    }
+}
+
+/// Where to keep the node key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum TpmMode {
     /// Use the TPM if there is one.
@@ -28,8 +40,6 @@ pub enum TpmMode {
     /// Keep the key in a file.
     Off,
 }
-
-pub const DEFAULT_TCTI: &str = "device:/dev/tpmrm0";
 
 #[cfg(feature = "tpm")]
 fn tpm_available(tcti: &str) -> bool {
@@ -59,36 +69,9 @@ pub fn choose(mode: TpmMode, tcti: &str) -> Res<KeyConfig> {
     }
 }
 
-/// A key ready to sign a CSR.
-pub enum LocalKey {
-    File(String),
-    #[cfg(feature = "tpm")]
-    Tpm(torngat_agent::tpm::TpmKey),
-}
-
-impl LocalKey {
-    pub fn csr(&self) -> Res<Vec<u8>> {
-        match self {
-            LocalKey::File(pem) => Ok(torngat_pki::ca::node_csr(
-                &torngat_pki::ca::parse_node_key(pem)?,
-            )?),
-            #[cfg(feature = "tpm")]
-            LocalKey::Tpm(k) => Ok(k.csr()?),
-        }
-    }
-
-    pub fn storage(&self) -> torngat_pki::KeyStorage {
-        match self {
-            LocalKey::File(_) => torngat_pki::KeyStorage::File,
-            #[cfg(feature = "tpm")]
-            LocalKey::Tpm(_) => torngat_pki::KeyStorage::Tpm,
-        }
-    }
-}
-
-/// Loads the key in `ident`, or creates and saves it first. Saving before joining lets a join
-/// whose answer was lost simply be re-run with the same key.
-pub fn create_or_resume(ident: &Path, cfg: &KeyConfig) -> Res<LocalKey> {
+/// Loads the key in `ident`, or creates and saves it first; says whether it already existed.
+/// Saving before joining lets a join whose answer was lost simply be re-run with the same key.
+pub fn create_or_resume(ident: &Path, cfg: &KeyConfig) -> Res<(NodeKey, bool)> {
     match cfg {
         KeyConfig::File => {
             let path = ident.join("node.key");
@@ -96,17 +79,14 @@ pub fn create_or_resume(ident: &Path, cfg: &KeyConfig) -> Res<LocalKey> {
             let existing = std::fs::read_to_string(&path)
                 .ok()
                 .filter(|pem| torngat_pki::ca::parse_node_key(pem).is_ok());
-            Ok(LocalKey::File(match existing {
-                Some(pem) => {
-                    println!("Resuming with the existing key in {}.", path.display());
-                    pem
-                }
+            Ok(match existing {
+                Some(pem) => (NodeKey::File(pem.into_bytes()), true),
                 None => {
                     let pem = torngat_pki::ca::node_key()?.serialize_pem();
                     replace_private(&path, pem.as_bytes())?;
-                    pem
+                    (NodeKey::File(pem.into_bytes()), false)
                 }
-            }))
+            })
         }
         #[cfg(feature = "tpm")]
         KeyConfig::Tpm { tcti } => {
@@ -116,12 +96,11 @@ pub fn create_or_resume(ident: &Path, cfg: &KeyConfig) -> Res<LocalKey> {
                 .ok()
                 .and_then(|b| TpmKey::load(tcti, &b).ok())
             {
-                println!("Resuming with the existing TPM key in {}.", path.display());
-                return Ok(LocalKey::Tpm(k));
+                return Ok((NodeKey::Tpm(k), true));
             }
             let (k, blob) = TpmKey::create(tcti)?;
             replace_private(&path, &blob)?;
-            Ok(LocalKey::Tpm(k))
+            Ok((NodeKey::Tpm(k), false))
         }
         #[cfg(not(feature = "tpm"))]
         KeyConfig::Tpm { .. } => Err("this torngatd was built without TPM support".into()),
@@ -129,28 +108,29 @@ pub fn create_or_resume(ident: &Path, cfg: &KeyConfig) -> Res<LocalKey> {
 }
 
 /// Loads the key for `run`.
-pub fn load(ident: &Path, cfg: &KeyConfig) -> Res<torngat_agent::NodeKey> {
+pub fn load(ident: &Path, cfg: &KeyConfig) -> Res<NodeKey> {
     let read = |p: &Path| std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
     match cfg {
-        KeyConfig::File => Ok(torngat_agent::NodeKey::File(read(&ident.join("node.key"))?)),
+        KeyConfig::File => Ok(NodeKey::File(read(&ident.join("node.key"))?)),
         #[cfg(feature = "tpm")]
-        KeyConfig::Tpm { tcti } => Ok(torngat_agent::NodeKey::Tpm(
-            torngat_agent::tpm::TpmKey::load(tcti, &read(&ident.join("node.tpmkey"))?)?,
-        )),
+        KeyConfig::Tpm { tcti } => Ok(NodeKey::Tpm(torngat_agent::tpm::TpmKey::load(
+            tcti,
+            &read(&ident.join("node.tpmkey"))?,
+        )?)),
         #[cfg(not(feature = "tpm"))]
         KeyConfig::Tpm { .. } => Err("this torngatd was built without TPM support".into()),
     }
 }
 
 /// SHA-256 of the TPM's endorsement key, to pin on a join token.
-#[cfg(feature = "tpm")]
 pub fn ek_pin(tcti: &str) -> Res<String> {
-    Ok(torngat_attest::ek_pin(
+    #[cfg(feature = "tpm")]
+    return Ok(torngat_attest::ek_pin(
         &torngat_agent::tpm::ek_certificate(tcti)?,
-    )?)
-}
-
-#[cfg(not(feature = "tpm"))]
-pub fn ek_pin(_tcti: &str) -> Res<String> {
-    Err("this torngatd was built without TPM support".into())
+    )?);
+    #[cfg(not(feature = "tpm"))]
+    {
+        let _ = tcti;
+        Err("this torngatd was built without TPM support".into())
+    }
 }

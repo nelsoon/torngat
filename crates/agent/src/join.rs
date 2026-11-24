@@ -18,8 +18,10 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig};
 use torngat_api::Name;
 use torngat_pki::{CONTROLLER_NAME, CaHash, JoinToken};
 use torngat_proto::API_VERSION;
-use torngat_proto::v1::JoinRequest;
 use torngat_proto::v1::join_client::JoinClient;
+use torngat_proto::v1::{JoinRequest, ResumeJoinRequest};
+
+use crate::blocking;
 #[cfg(feature = "tpm")]
 use torngat_proto::v1::{TpmJoinAnswer, TpmJoinRequest};
 
@@ -38,7 +40,7 @@ pub enum JoinError {
     #[error("controller returned an unusable certificate")]
     BadCertificate,
     #[error("key: {0}")]
-    Key(#[from] torngat_pki::PkiError),
+    Key(String),
     #[error("{0}")]
     Tpm(String),
 }
@@ -203,7 +205,7 @@ fn check_chain(chain_pem: &str, csr: &[u8]) -> Result<(), JoinError> {
         .and_then(|v| v.into_iter().next())
         .ok_or(JoinError::BadCertificate)?;
     let spki = torngat_pki::spki_sha256(leaf.contents()).map_err(|_| JoinError::BadCertificate)?;
-    let ours = torngat_pki::ca::csr_spki_sha256(csr)?;
+    let ours = torngat_pki::ca::csr_spki_sha256(csr).map_err(|e| JoinError::Key(e.to_string()))?;
     if torngat_pki::digest_eq(&spki, &ours) {
         Ok(())
     } else {
@@ -211,93 +213,100 @@ fn check_chain(chain_pem: &str, csr: &[u8]) -> Result<(), JoinError> {
     }
 }
 
-fn join_request(token: &JoinToken, node: &Name, csr: Vec<u8>, storage: &str) -> JoinRequest {
-    JoinRequest {
-        api_version: API_VERSION.into(),
-        token_id: token.id().into(),
-        token_secret: token.secret().to_vec(),
-        node_name: node.to_string(),
-        csr_der: csr,
-        key_storage: storage.into(),
-    }
-}
-
-/// Joins the cluster whose join endpoint is `addr` (`host:port`), as `node`, with the node key
-/// `key_pem` (P-256, PEM). Persist the key before calling: if the response is lost, calling again
-/// with the same key returns a certificate even though the token is used up.
+/// Joins the cluster whose join endpoint is `addr` (`host:port`), as `node`, with `key`.
+///
+/// Persist the key before calling. If an earlier call may have gone through but its answer was
+/// lost, pass `resume: true`: the node first asks for a fresh certificate for its enrolled key
+/// (no token needed shortly after enrolling), and only enrolls if there is none.
+///
+/// File keys enroll with `Join`; TPM keys prove themselves with `BeginTpmJoin`/`FinishTpmJoin`.
 pub async fn join(
     addr: &str,
     token: &str,
     node: &Name,
-    key_pem: &str,
+    key: &crate::NodeKey,
+    resume: bool,
 ) -> Result<Enrolled, JoinError> {
     let (token, pin) = JoinToken::parse(token).map_err(|_| JoinError::BadToken)?;
     let (mut client, ca_pem) = join_channel(addr, pin).await?;
-    let key = torngat_pki::ca::parse_node_key(key_pem)?;
-    let csr = torngat_pki::ca::node_csr(&key)?;
-    let resp = client
-        .join(join_request(&token, node, csr.clone(), "file"))
-        .await
-        .map_err(refused)?
-        .into_inner();
-    check_chain(&resp.cert_chain_pem, &csr)?;
-    Ok(Enrolled {
-        ca_pem,
-        cert_chain_pem: resp.cert_chain_pem,
-    })
-}
+    let csr = blocking(|| key.csr()).map_err(JoinError::Key)?;
+    let done = |chain: String| -> Result<Enrolled, JoinError> {
+        check_chain(&chain, &csr)?;
+        Ok(Enrolled {
+            ca_pem: ca_pem.clone(),
+            cert_chain_pem: chain,
+        })
+    };
 
-/// Joins with a TPM-held key, proving it by attestation. Persist the key blob before calling: a
-/// join whose answer was lost is retried by calling again with the same key.
-#[cfg(feature = "tpm")]
-pub async fn join_tpm(
-    addr: &str,
-    token: &str,
-    node: &Name,
-    key: &crate::tpm::TpmKey,
-) -> Result<Enrolled, JoinError> {
-    let tpm = |e: crate::tpm::TpmError| JoinError::Tpm(e.to_string());
-    let (token, pin) = JoinToken::parse(token).map_err(|_| JoinError::BadToken)?;
-    let (mut client, ca_pem) = join_channel(addr, pin).await?;
-    let csr = key.csr().map_err(tpm)?;
-
-    // A retry of a join that already went through: same key, fresh certificate.
-    match client
-        .join(join_request(&token, node, csr.clone(), "tpm"))
-        .await
-    {
-        Ok(r) => {
-            let r = r.into_inner();
-            check_chain(&r.cert_chain_pem, &csr)?;
-            return Ok(Enrolled {
-                ca_pem,
-                cert_chain_pem: r.cert_chain_pem,
-            });
+    if resume {
+        match client
+            .resume_join(ResumeJoinRequest {
+                api_version: API_VERSION.into(),
+                node_name: node.to_string(),
+                csr_der: csr.clone(),
+            })
+            .await
+        {
+            Ok(r) => return done(r.into_inner().cert_chain_pem),
+            Err(s) if s.code() == tonic::Code::NotFound => {}
+            Err(s) => return Err(refused(s)),
         }
-        Err(s) if s.code() == tonic::Code::FailedPrecondition => {}
-        Err(s) => return Err(refused(s)),
     }
 
-    let att = key.attest().map_err(tpm)?;
+    let chain = match key {
+        crate::NodeKey::File(_) => {
+            client
+                .join(JoinRequest {
+                    api_version: API_VERSION.into(),
+                    token_id: token.id().into(),
+                    token_secret: token.secret().to_vec(),
+                    node_name: node.to_string(),
+                    csr_der: csr.clone(),
+                })
+                .await
+                .map_err(refused)?
+                .into_inner()
+                .cert_chain_pem
+        }
+        #[cfg(feature = "tpm")]
+        crate::NodeKey::Tpm(k) => tpm_join(&mut client, &token, node, k, &csr).await?,
+    };
+    done(chain)
+}
+
+#[cfg(feature = "tpm")]
+async fn tpm_join(
+    client: &mut JoinClient<Channel>,
+    token: &JoinToken,
+    node: &Name,
+    key: &crate::tpm::TpmKey,
+    csr: &[u8],
+) -> Result<String, JoinError> {
+    let tpm = |e: crate::tpm::TpmError| JoinError::Tpm(e.to_string());
+    let (att, node_key_public) =
+        blocking(|| Ok::<_, crate::tpm::TpmError>((key.attest()?, key.public_marshalled()?)))
+            .map_err(tpm)?;
     let ch = client
         .begin_tpm_join(TpmJoinRequest {
             api_version: API_VERSION.into(),
             token_id: token.id().into(),
             token_secret: token.secret().to_vec(),
             node_name: node.to_string(),
-            csr_der: csr.clone(),
+            csr_der: csr.to_vec(),
             ek_cert_der: att.ek_cert.clone(),
             ak_public: att.ak_public.clone(),
-            node_key_public: key.public_marshalled().map_err(tpm)?,
+            node_key_public,
         })
         .await
         .map_err(refused)?
         .into_inner();
-    let ans = att
-        .answer(&ch.id_object, &ch.encrypted_secret, &ch.nonce)
-        .map_err(tpm)?;
-    drop(att);
-    let resp = client
+    let ans = blocking(|| {
+        let ans = att.answer(&ch.id_object, &ch.encrypted_secret, &ch.nonce);
+        drop(att); // flushes the EK and AK from the TPM
+        ans
+    })
+    .map_err(tpm)?;
+    Ok(client
         .finish_tpm_join(TpmJoinAnswer {
             challenge_id: ch.challenge_id,
             activated_secret: ans.activated_secret,
@@ -306,10 +315,6 @@ pub async fn join_tpm(
         })
         .await
         .map_err(refused)?
-        .into_inner();
-    check_chain(&resp.cert_chain_pem, &csr)?;
-    Ok(Enrolled {
-        ca_pem,
-        cert_chain_pem: resp.cert_chain_pem,
-    })
+        .into_inner()
+        .cert_chain_pem)
 }
