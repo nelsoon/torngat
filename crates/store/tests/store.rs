@@ -171,6 +171,24 @@ async fn shutdown_releases_directory() {
     }
 }
 
+/// Concurrent and repeated shutdowns all wait for the release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_shutdowns_all_wait() {
+    let dir = TempDir::new().unwrap();
+    let net = TestNet::default();
+    let s = open(&net, dir.path(), 1).await;
+    s.initialize(members(&[1])).await.unwrap();
+    wait_leader(&[&s], None).await;
+    let (a, b) = tokio::join!(s.shutdown(), s.shutdown());
+    a.unwrap();
+    b.unwrap();
+    // Either caller's return means the directory is free.
+    net.unregister(1);
+    let again = open(&net, dir.path(), 1).await;
+    again.shutdown().await.unwrap();
+    s.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn grow_to_three_and_fail_over() {
     let net = TestNet::default();

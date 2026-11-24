@@ -18,7 +18,7 @@ pub mod types;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::{Config, RaftNetworkFactory, ReadPolicy};
@@ -72,19 +72,20 @@ pub fn default_config() -> Config {
 /// How long [`Store::shutdown`] waits for the log and the database to be released.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Handles a replica keeps for local reads, dropped by [`Store::shutdown`] so that the log and
-/// the database can be reopened as soon as it returns.
-struct Local {
-    sm: sm::StateMachine,
-    sm_released: oneshot::Receiver<()>,
-    log_released: oneshot::Receiver<()>,
+/// Signals that the log and the database of a stopped replica are released.
+struct Released {
+    sm: Option<oneshot::Receiver<()>>,
+    log: Option<oneshot::Receiver<()>>,
 }
 
 /// A store replica.
 #[derive(Clone)]
 pub struct Store {
     raft: Raft,
-    local: Arc<Mutex<Option<Local>>>,
+    /// For local reads; dropped by [`Store::shutdown`] so the database can be reopened.
+    sm: Arc<Mutex<Option<sm::StateMachine>>>,
+    /// Held by `shutdown` for its whole duration, so concurrent and repeated calls all wait.
+    released: Arc<tokio::sync::Mutex<Option<Released>>>,
     id: NodeId,
 }
 
@@ -126,28 +127,28 @@ impl Store {
         })?;
         let log = WalLogStore::<TypeConfig>::open(log_dir)?;
         let sm = sm::StateMachine::open(dir.join("sm"))?;
-        let local = Local {
-            sm_released: sm.released(),
-            log_released: log.released(),
-            sm: sm.clone(),
+        let released = Released {
+            sm: Some(sm.released()),
+            log: Some(log.released()),
         };
+        let local = sm.clone();
         let raft = openraft::Raft::new(id, config, network, log, sm)
             .await
             .map_err(|e| StoreError::Raft(e.to_string()))?;
         Ok(Self {
             raft,
-            local: Arc::new(Mutex::new(Some(local))),
+            sm: Arc::new(Mutex::new(Some(local))),
+            released: Arc::new(tokio::sync::Mutex::new(Some(released))),
             id,
         })
     }
 
     /// The state machine for local reads, or [`StoreError::Closed`] after [`Store::shutdown`].
     fn sm(&self) -> Result<sm::StateMachine, StoreError> {
-        self.local
+        self.sm
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .map(|l| l.sm.clone())
+            .clone()
             .ok_or(StoreError::Closed)
     }
 
@@ -274,37 +275,52 @@ impl Store {
     /// this `Store` has finished its calls (a read in flight keeps the database open until it
     /// returns). The store answers [`StoreError::Closed`] afterwards.
     pub async fn shutdown(&self) -> Result<(), StoreError> {
-        if let Ok(sm) = self.sm() {
-            sm.close();
-        }
+        let mut released = self.released.lock().await;
         let stopped = self
             .raft
             .shutdown()
             .await
             .map_err(|e| StoreError::Raft(e.to_string()));
-        let local = self
-            .local
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(Local {
-            sm,
-            sm_released,
-            log_released,
-        }) = local
-        {
-            drop(sm);
-            // The receivers complete with an error once the senders are dropped with the last
-            // handle, which is the signal. Raft's own copies are released as its tasks end.
-            let wait = async {
-                let _ = sm_released.await;
-                let _ = log_released.await;
-            };
-            if tokio::time::timeout(RELEASE_TIMEOUT, wait).await.is_err() {
-                return Err(StoreError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "log or database still in use after shutdown",
-                )));
+        // Only now: entries applied while Raft was stopping must reach watchers first.
+        if let Ok(sm) = self.sm() {
+            sm.close();
+        }
+        drop(
+            self.sm
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+        if let Some(r) = released.as_mut() {
+            // A receiver completes (with an error) once its sender is dropped with the last
+            // handle, which is the signal. The deadline is wall time: under a paused or
+            // accelerated test clock a tokio timeout would expire early.
+            let deadline = Instant::now() + RELEASE_TIMEOUT;
+            loop {
+                let wait = async {
+                    if let Some(rx) = r.sm.as_mut() {
+                        let _ = rx.await;
+                        r.sm = None;
+                    }
+                    if let Some(rx) = r.log.as_mut() {
+                        let _ = rx.await;
+                        r.log = None;
+                    }
+                };
+                if tokio::time::timeout(Duration::from_millis(100), wait)
+                    .await
+                    .is_ok()
+                {
+                    *released = None;
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    stopped?;
+                    return Err(StoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "log or database still in use after shutdown",
+                    )));
+                }
             }
         }
         stopped
