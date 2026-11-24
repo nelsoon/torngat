@@ -35,12 +35,13 @@ done
 
 key=$here/keys/signing.key
 cert=$here/keys/signing.crt
-if [ ! -e "$key" ]; then
+if [ ! -e "$key" ] && [ ! -e "$cert" ]; then
   echo "build.sh: creating a development signing key in $here/keys" >&2
   (umask 077 && mkdir -p "$here/keys" &&
     openssl req -new -x509 -newkey rsa:3072 -nodes -sha256 -days 3650 \
       -subj "/CN=Torngat development image signing" -keyout "$key" -out "$cert" 2>/dev/null)
 fi
+[ -e "$key" ] && [ -e "$cert" ] || { echo "build.sh: need both $key and $cert" >&2; exit 1; }
 
 out=$here/out
 sysext=$("$here/sysext/build.sh" --torngatd "$bin" --version "$version" --key "$key" \
@@ -48,10 +49,12 @@ sysext=$("$here/sysext/build.sh" --torngatd "$bin" --version "$version" --key "$
 
 extra=$(mktemp -d)
 trap 'rm -rf "$extra"' EXIT
+# The extra tree's own modes are copied onto the image: / must stay 0755, /root 0700.
+chmod 0755 "$extra"
 install -D -m 0644 "$cert" "$extra/usr/lib/verity.d/torngat.crt"
 install -D -m 0644 "$sysext" "$extra/var/lib/extensions/torngat-platform.raw"
 if [ -n "$keys_file" ]; then
-  install -d -m 0700 "$extra/root/.ssh"
+  install -d -m 0700 "$extra/root" "$extra/root/.ssh"
   install -m 0600 "$keys_file" "$extra/root/.ssh/authorized_keys"
 fi
 
