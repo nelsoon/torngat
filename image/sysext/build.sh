@@ -28,7 +28,7 @@ esac
 tree=$(mktemp -d)
 trap 'rm -rf "$tree"' EXIT
 cp -a "$here/tree/." "$tree/"
-install -D -m 0755 "$bin" "$tree/usr/bin/torngatd"
+install -D -s -m 0755 "$bin" "$tree/usr/bin/torngatd"
 mkdir -p "$tree/usr/lib/extension-release.d"
 # Built against Debian 13's libraries: only merge on a Debian 13 host.
 cat > "$tree/usr/lib/extension-release.d/extension-release.torngat-platform" <<EOR

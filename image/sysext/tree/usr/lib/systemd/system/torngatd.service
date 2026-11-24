@@ -1,4 +1,6 @@
 [Unit]
+# Enabled by the multi-user.target.wants symlink shipped next to it (nothing runs
+# `systemctl enable` on an extension).
 Description=Torngat node daemon
 Documentation=https://github.com/nelsoon/torngat
 # Set up by `torngatd init` or `torngatd join` (node.json is written last).
@@ -7,7 +9,8 @@ Wants=network-online.target
 After=network-online.target systemd-sysext.service
 
 [Service]
-# "+": runs outside the sandbox below (writes /etc/passwd).
+# systemd-sysusers.service ran before the extension was merged (and only after an OS update),
+# so create the QEMU account here. "+": outside the sandbox below (writes /etc/passwd).
 ExecStartPre=+/usr/bin/systemd-sysusers torngat.conf
 ExecStart=/usr/bin/torngatd run --qemu-user torngat-qemu
 Restart=on-failure
@@ -27,5 +30,3 @@ RestrictRealtime=yes
 LockPersonality=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
-[Install]
-WantedBy=multi-user.target

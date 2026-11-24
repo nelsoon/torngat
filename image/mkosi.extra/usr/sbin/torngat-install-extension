@@ -11,24 +11,37 @@ dir=/var/lib/extensions
 cur=$dir/torngat-platform.raw
 prev=$dir/torngat-platform.prev
 tmp=$dir/torngat-platform.incoming
+
+# Re-merges the extensions. Earlier restarts may have tripped the unit's start rate limit: clear it
+# so the merge really runs.
+refresh() {
+  systemctl reset-failed systemd-sysext.service 2>/dev/null || true
+  systemctl restart systemd-sysext.service
+}
+
+policy=root=signed+absent:usr=signed+absent
+
 mkdir -p "$dir"
 cp -- "$1" "$tmp"
 sync "$tmp"
+# Refuse what is plainly wrong (unsigned, unknown key, damaged) before touching the live
+# extension; the rollback below covers what only the merge itself finds.
+if ! systemd-dissect --validate --image-policy="$policy" "$tmp" >/dev/null; then
+  rm -f "$tmp"
+  echo "torngat-install-extension: $1 is not a valid signed extension" >&2
+  exit 1
+fi
 rm -f "$prev"
 [ -e "$cur" ] && ln "$cur" "$prev"
 mv -f "$tmp" "$cur"
-# Earlier restarts may have tripped the unit's start rate limit; clear it so the merge (and, below,
-# the rollback) really runs.
-systemctl reset-failed systemd-sysext.service 2>/dev/null || true
-if systemctl restart systemd-sysext.service; then
-  rm -f "$prev"
-  systemctl try-restart torngatd.service
-  echo "torngat-install-extension: installed $1"
-  exit 0
+status=0
+if ! refresh; then
+  echo "torngat-install-extension: $1 does not merge; restoring the previous extension" >&2
+  if [ -e "$prev" ]; then mv -f "$prev" "$cur"; else rm -f "$cur"; fi
+  refresh || true
+  status=1
 fi
-echo "torngat-install-extension: $1 does not merge; restoring the previous extension" >&2
-if [ -e "$prev" ]; then mv -f "$prev" "$cur"; else rm -f "$cur"; fi
-systemctl reset-failed systemd-sysext.service 2>/dev/null || true
-systemctl restart systemd-sysext.service || true
+rm -f "$prev"
 systemctl try-restart torngatd.service || true
-exit 1
+[ $status -eq 0 ] && echo "torngat-install-extension: installed $1"
+exit $status
