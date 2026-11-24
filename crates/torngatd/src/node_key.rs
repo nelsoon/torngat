@@ -124,10 +124,20 @@ pub fn load(ident: &Path, cfg: &KeyConfig) -> Res<NodeKey> {
     match cfg {
         KeyConfig::File => Ok(NodeKey::File(read(&ident.join("node.key"))?)),
         #[cfg(feature = "tpm")]
-        KeyConfig::Tpm { tcti } => Ok(NodeKey::Tpm(torngat_agent::tpm::TpmKey::load(
-            tcti,
-            &read(&ident.join("node.tpmkey"))?,
-        )?)),
+        KeyConfig::Tpm { tcti } => {
+            let path = ident.join("node.tpmkey");
+            let key = torngat_agent::tpm::TpmKey::load(tcti, &read(&path)?).map_err(|e| {
+                // Keys made before the storage root key was created noDA were wrapped under a
+                // different root key and no longer load.
+                format!(
+                    "{}: the TPM refused the node key ({e}); if the key was created before TPM \
+                     keys were made noDA (development builds before 0.0.1's power-loss fix) or \
+                     the TPM was cleared, delete this file and join again with a new token",
+                    path.display()
+                )
+            })?;
+            Ok(NodeKey::Tpm(key))
+        }
         #[cfg(not(feature = "tpm"))]
         KeyConfig::Tpm { .. } => Err("this torngatd was built without TPM support".into()),
     }

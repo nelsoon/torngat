@@ -20,8 +20,10 @@
 #
 # NOT covered: loss of the HOST's cache (the data sits in the host page cache and survives a QEMU
 # kill; a host crash or real disk with a volatile write cache is another test), torn or reordered
-# sector writes (the virtual disk never does a half write), a TPM that sees the power cut (swtpm
-# is shut down cleanly after the kill), and firmware or boot loader behaviour mid-update.
+# sector writes (the virtual disk never does a half write), power loss inside the TPM itself (swtpm
+# is shut down cleanly after the kill and keeps its state; the TPM still sees each boot as an
+# unorderly startup, since the guest never shut it down), and firmware or boot loader behaviour
+# mid-update.
 #
 # The writes are POST /v1/platform/joinTokens with a unique description: a small durable record
 # without side effects. The response holds the token secret; only the id field is read from it, and
@@ -83,6 +85,12 @@ power_cut() {
   [ -n "$boot_pid" ] && wait "$boot_pid" 2>/dev/null || true
   boot_pid=
   rm -f "$work/qemu.pid"
+  # The shutdown request returns before swtpm has exited: wait, so the next boot's swtpm does not
+  # race it for the state directory.
+  local tpm i
+  tpm=$(cat "$work/swtpm.pid" 2>/dev/null) || return 0
+  for i in $(seq 50); do kill -0 "$tpm" 2>/dev/null || return 0; sleep 0.1; done
+  fail "swtpm did not exit after the power cut"
 }
 
 cleanup() {
@@ -126,13 +134,14 @@ api() { # METHOD PATH [JSON]; prints the body, then the status code on its own l
 
 # (Re)opens the API forward and reads the admin token; waits until the API answers.
 connect_api() {
-  [ -n "$fwd_pid" ] && kill "$fwd_pid" 2>/dev/null || true
+  [ -n "$fwd_pid" ] && { kill "$fwd_pid" 2>/dev/null; wait "$fwd_pid" 2>/dev/null; } || true
   ssh "${ssh_opts[@]}" -N -L "127.0.0.1:$api_port:127.0.0.1:8080" -o ExitOnForwardFailure=yes root@127.0.0.1 2>>"$work/forward.log" &
   fwd_pid=$!
   local t0 out
   t0=$(now)
   token=
   for _ in $(seq 120); do
+    kill -0 "$fwd_pid" 2>/dev/null || fail "the SSH forward to the API exited (is 127.0.0.1:$api_port free? see $work/forward.log)"
     [ -n "$token" ] || token=$(guest cat /var/lib/torngat/admin-token 2>/dev/null) || token=
     if [ -n "$token" ]; then
       out=$(api GET /v1/platform/nodes 2>/dev/null) || out=
@@ -143,7 +152,7 @@ connect_api() {
   guest journalctl -u torngatd --no-pager -n 20 >&2 || true
   # A key without noDA is locked out by the TPM after a few power cuts in a row (each counts as a
   # failed authorization); the node keys are created noDA, so name it if it happens anyway.
-  if guest "journalctl -u torngatd -b --no-pager -n 40 | grep -q 'DA lockout'" 2>/dev/null; then
+  if guest "journalctl -u torngatd -b --no-pager | grep -qi lockout" 2>/dev/null; then
     fail "torngatd cannot start: the TPM is in dictionary-attack lockout after the power cut"
   fi
   fail "API not up within 120 s (torngatd should start by itself)"
@@ -195,6 +204,9 @@ list_tokens() {
 verify() { # CYCLE
   local c=$1 seen=$work/seen.log bad
   list_tokens | sort >"$seen" || fail "cycle $c: listing join tokens failed"
+  # The list skips records it cannot decode (and logs them): a damaged record would not show below.
+  ! guest "journalctl -u torngatd -b --no-pager | grep -q 'undecodable'" ||
+    fail "cycle $c: the store holds records that cannot be decoded (corruption)"
   sort "$acked" >"$work/acked.sorted"
   sort -u "$attempted" >"$work/attempted.sorted"
   # Every acked write must exist, under the id the server returned.
