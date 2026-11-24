@@ -1,0 +1,34 @@
+#!/bin/sh
+# torngat-install-extension FILE
+#
+# Installs FILE as the torngat-platform system extension and restarts the platform. If the new
+# image does not merge (bad signature, wrong OS version, damaged), the previous one is put back:
+# systemd-sysext refuses the whole refresh when any image fails, so a bad file left in
+# /var/lib/extensions would leave the host without the platform, even after a reboot.
+set -eu
+[ $# -eq 1 ] || { echo "usage: torngat-install-extension FILE" >&2; exit 2; }
+dir=/var/lib/extensions
+cur=$dir/torngat-platform.raw
+prev=$dir/torngat-platform.prev
+tmp=$dir/torngat-platform.incoming
+mkdir -p "$dir"
+cp -- "$1" "$tmp"
+sync "$tmp"
+rm -f "$prev"
+[ -e "$cur" ] && ln "$cur" "$prev"
+mv -f "$tmp" "$cur"
+# Earlier restarts may have tripped the unit's start rate limit; clear it so the merge (and, below,
+# the rollback) really runs.
+systemctl reset-failed systemd-sysext.service 2>/dev/null || true
+if systemctl restart systemd-sysext.service; then
+  rm -f "$prev"
+  systemctl try-restart torngatd.service
+  echo "torngat-install-extension: installed $1"
+  exit 0
+fi
+echo "torngat-install-extension: $1 does not merge; restoring the previous extension" >&2
+if [ -e "$prev" ]; then mv -f "$prev" "$cur"; else rm -f "$cur"; fi
+systemctl reset-failed systemd-sysext.service 2>/dev/null || true
+systemctl restart systemd-sysext.service || true
+systemctl try-restart torngatd.service || true
+exit 1

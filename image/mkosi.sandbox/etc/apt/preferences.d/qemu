@@ -1,0 +1,5 @@
+# QEMU and the firmware package it needs (seabios) from trixie-backports; everything else from
+# trixie.
+Package: qemu-* src:qemu seabios
+Pin: release n=trixie-backports
+Pin-Priority: 990
