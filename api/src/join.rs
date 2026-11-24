@@ -54,7 +54,7 @@ impl CreateJoinTokenRequest {
 /// the response to the create call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinTokenInfo {
-    /// Token id (`platform/joinTokens/{name}`).
+    /// Token id (16 hex digits); the resource is `platform/joinTokens/{name}`.
     pub name: String,
     pub node: Option<Name>,
     pub description: String,

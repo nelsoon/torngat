@@ -90,19 +90,34 @@ pub async fn check_enrolled(
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum EnrollError {
+    #[error("node is already enrolled")]
+    AlreadyEnrolled,
+    #[error(transparent)]
+    Store(#[from] torngat_store::StoreError),
+    #[error("encoding: {0}")]
+    Encoding(String),
+}
+
 /// Records `identity` for `name`, failing if the node is already enrolled.
 pub async fn enroll(
     store: &Store,
     name: &Name,
     identity: &NodeIdentity,
-) -> Result<u64, torngat_store::StoreError> {
-    let key = crate::keys::node_identity(name)
-        .map_err(|e| torngat_store::StoreError::Raft(e.to_string()))?;
-    let value =
-        serde_json::to_vec(identity).map_err(|e| torngat_store::StoreError::Raft(e.to_string()))?;
-    store
+) -> Result<u64, EnrollError> {
+    let key = crate::keys::node_identity(name).map_err(|e| EnrollError::Encoding(e.to_string()))?;
+    let value = serde_json::to_vec(identity).map_err(|e| EnrollError::Encoding(e.to_string()))?;
+    match store
         .put(key, value, torngat_store::Precondition::Absent)
         .await
+    {
+        Ok(rev) => Ok(rev),
+        Err(torngat_store::StoreError::PreconditionFailed { .. }) => {
+            Err(EnrollError::AlreadyEnrolled)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(test)]

@@ -170,13 +170,20 @@ pub async fn discover_ca(addr: &str, pin: CaHash) -> Result<CertificateDer<'stat
     }
 }
 
-/// Joins the cluster whose join endpoint is `addr` (`host:port`), as `node`.
-pub async fn join(addr: &str, token: &str, node: &Name) -> Result<Enrolled, JoinError> {
+/// Joins the cluster whose join endpoint is `addr` (`host:port`), as `node`, with the node key
+/// `key_pem` (P-256, PEM). Persist the key before calling: if the response is lost, calling again
+/// with the same key returns a certificate even though the token is used up.
+pub async fn join(
+    addr: &str,
+    token: &str,
+    node: &Name,
+    key_pem: &str,
+) -> Result<Enrolled, JoinError> {
     let (token, pin) = JoinToken::parse(token).map_err(|_| JoinError::BadToken)?;
     let ca_der = discover_ca(addr, pin).await?;
     let ca_pem = pem::encode(&pem::Pem::new("CERTIFICATE", ca_der.to_vec()));
 
-    let key = torngat_pki::ca::node_key()?;
+    let key = rcgen::KeyPair::from_pem(key_pem).map_err(torngat_pki::PkiError::from)?;
     let csr = torngat_pki::ca::node_csr(&key)?;
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(&ca_pem))

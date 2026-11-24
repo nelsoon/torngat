@@ -69,6 +69,9 @@ impl Controller {
 
     /// Runs the reconcile loops (scheduling, operation completion) forever.
     pub async fn run_scheduler(self, every: Duration) {
+        // Expired tokens are already refused; cleaning them up is housekeeping.
+        const TOKEN_EXPIRY_EVERY: Duration = Duration::from_secs(60);
+        let mut last_expiry: Option<Instant> = None;
         loop {
             if let Err(e) = schedule_once(&self).await {
                 tracing::warn!(error = %e, "scheduling pass failed");
@@ -76,8 +79,11 @@ impl Controller {
             if let Err(e) = complete_operations_once(&self).await {
                 tracing::warn!(error = %e, "operation pass failed");
             }
-            if let Err(e) = expire_join_tokens_once(&self.store).await {
-                tracing::warn!(error = %e, "join token expiry pass failed");
+            if last_expiry.is_none_or(|t| t.elapsed() >= TOKEN_EXPIRY_EVERY) {
+                last_expiry = Some(Instant::now());
+                if let Err(e) = expire_join_tokens_once(&self.store).await {
+                    tracing::warn!(error = %e, "join token expiry pass failed");
+                }
             }
             tokio::time::sleep(every).await;
         }

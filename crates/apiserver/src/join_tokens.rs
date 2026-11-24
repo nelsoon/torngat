@@ -71,11 +71,25 @@ pub async fn list_join_tokens(
         Prefix::new("platform", ["jointokens"]).map_err(|e| ApiError::Internal(e.to_string()))?;
     let rows = st.store.list(&prefix, after.as_ref(), size).await?;
     let full = rows.len() == size;
+    let next_page_token = full
+        .then(|| {
+            rows.last()
+                .map(|(k, _)| k.as_str().rsplit('/').next().unwrap_or_default().to_owned())
+        })
+        .flatten();
     let items = rows
         .into_iter()
-        .map(|(_, v)| serde_json::from_slice::<JoinTokenRecord>(&v.value).map(|r| info(r, None)))
-        .collect::<Result<Vec<_>, _>>()?;
-    let next_page_token = full.then(|| items.last().map(|i| i.name.clone())).flatten();
+        .filter_map(
+            |(k, v)| match serde_json::from_slice::<JoinTokenRecord>(&v.value) {
+                Ok(r) => Some(info(r, None)),
+                // Possibly written by a newer version: skip it rather than fail the whole list.
+                Err(e) => {
+                    tracing::warn!(key = %k, error = %e, "skipping undecodable join token record");
+                    None
+                }
+            },
+        )
+        .collect();
     Ok(Json(ListResponse {
         items,
         next_page_token,

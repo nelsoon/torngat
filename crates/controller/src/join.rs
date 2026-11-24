@@ -4,24 +4,33 @@
 //! is consumed: a malformed request never burns a token. Then:
 //! 1. the token is deleted with a compare-and-swap on the revision that was checked (single use,
 //!    even under concurrent joins);
-//! 2. the identity record is created only if absent (a name is enrolled at most once).
+//! 2. the identity record is created only if absent (a name is enrolled at most once). If another
+//!    join took the name in between, the token is put back.
+//!
+//! Retries: a node whose join committed but whose response was lost retries with the same key.
+//! A CSR for exactly the enrolled key gets a fresh certificate without a token. That is safe: the
+//! certificate is useless without the private key, and the CSR signature proves the caller holds
+//! it.
 
 use std::sync::Arc;
 
 use time::OffsetDateTime;
 use tonic::{Request, Response, Status};
 use torngat_api::Name;
-use torngat_pki::{Ca, JoinTokenRecord, KeyStorage};
+use torngat_pki::{Ca, JoinTokenRecord, KeyStorage, NodeIdentity};
 use torngat_proto::API_VERSION;
 use torngat_proto::v1::join_server::Join;
 use torngat_proto::v1::{JoinRequest, JoinResponse};
 use torngat_store::{Precondition, Store, StoreError};
 
+use crate::identity::{self, EnrollError};
+use crate::keys;
 use crate::service::{internal, store_err};
-use crate::{identity, keys};
 
 /// Largest join request accepted (a CSR is well under 1 KiB).
 pub const MAX_JOIN_REQUEST: usize = 16 * 1024;
+/// Join requests handled at once across all callers; more are shed.
+pub const MAX_CONCURRENT_JOINS: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct JoinService {
@@ -68,6 +77,25 @@ impl Join for JoinService {
             return Err(denied());
         }
 
+        // Pure checks first: the CSR (signature, key type) and what it would be issued as.
+        let issued = self
+            .ca
+            .sign_node_csr(&r.csr_der, &node)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let ident = issued.identity(KeyStorage::File).map_err(internal)?;
+
+        // A retry of a join that already committed, with the same key.
+        let ikey = keys::node_identity(&node).map_err(internal)?;
+        if let Some(v) = self.store.get(&ikey).await.map_err(store_err)? {
+            let cur: NodeIdentity = serde_json::from_slice(&v.value).map_err(internal)?;
+            if torngat_pki::digest_eq(&cur.spki_sha256, &ident.spki_sha256) {
+                tracing::info!(%node, ?peer, "node certificate re-issued for its enrolled key");
+                return Ok(Response::new(JoinResponse {
+                    cert_chain_pem: issued.chain_pem,
+                }));
+            }
+        }
+
         let tkey = keys::join_token(&r.token_id).map_err(|_| denied())?;
         let Some(tv) = self.store.get(&tkey).await.map_err(store_err)? else {
             return Err(denied());
@@ -78,22 +106,16 @@ impl Join for JoinService {
         }
 
         // Refuse a name in use before burning the token.
-        let ikey = keys::node_identity(&node).map_err(internal)?;
         let nkey = keys::node(&node).map_err(internal)?;
         if self.store.get(&ikey).await.map_err(store_err)?.is_some()
             || self.store.get(&nkey).await.map_err(store_err)?.is_some()
         {
             return Err(Status::already_exists("node name is already in use"));
         }
-        let issued = self
-            .ca
-            .sign_node_csr(&r.csr_der, &node)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let ident = issued.identity(KeyStorage::File).map_err(internal)?;
 
         match self
             .store
-            .delete(tkey, Precondition::Revision(tv.revision))
+            .delete(tkey.clone(), Precondition::Revision(tv.revision))
             .await
         {
             Ok(_) => {}
@@ -103,10 +125,15 @@ impl Join for JoinService {
         }
         match identity::enroll(&self.store, &node, &ident).await {
             Ok(_) => {}
-            Err(StoreError::PreconditionFailed { .. }) => {
+            Err(EnrollError::AlreadyEnrolled) => {
+                // Lost a race for the name: the token enrolled nothing, give it back.
+                if let Err(e) = self.store.put(tkey, tv.value, Precondition::Absent).await {
+                    tracing::warn!(error = %e, token = %rec.id, "could not restore join token");
+                }
                 return Err(Status::already_exists("node name is already in use"));
             }
-            Err(e) => return Err(store_err(e)),
+            Err(EnrollError::Store(e)) => return Err(store_err(e)),
+            Err(e) => return Err(internal(e)),
         }
         tracing::info!(%node, token = %rec.id, ?peer, "node enrolled");
         Ok(Response::new(JoinResponse {
@@ -125,9 +152,17 @@ pub async fn serve_join(
 ) -> Result<(), tonic::transport::Error> {
     use tonic::transport::{Identity, Server, ServerTlsConfig};
     let tls = ServerTlsConfig::new().identity(Identity::from_pem(cert_pem, key_pem));
+    // Unauthenticated endpoint: bound the work any caller can create.
     Server::builder()
         .tls_config(tls)?
         .timeout(std::time::Duration::from_secs(30))
+        .concurrency_limit_per_connection(2)
+        .max_concurrent_streams(2)
+        // Outermost first: shed what the concurrency limit cannot take right now.
+        .layer(tower::load_shed::LoadShedLayer::new())
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+            MAX_CONCURRENT_JOINS,
+        ))
         .add_service(
             torngat_proto::v1::join_server::JoinServer::new(svc)
                 .max_decoding_message_size(MAX_JOIN_REQUEST),

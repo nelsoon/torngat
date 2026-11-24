@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
-use torngat_agent::join::{JoinError, join};
+use torngat_agent::join::{Enrolled, JoinError};
 use torngat_agent::{AgentConfig, FakeRuntime};
 use torngat_api::Name;
 use torngat_controller::{Controller, JoinService, TlsConfig, keys};
@@ -96,6 +96,15 @@ impl Env {
             .unwrap()
             .is_some()
     }
+}
+
+fn fresh_key() -> String {
+    torngat_pki::ca::node_key().unwrap().serialize_pem()
+}
+
+/// Joins with a fresh key.
+async fn join(addr: &str, token: &str, node: &Name) -> Result<Enrolled, JoinError> {
+    torngat_agent::join::join(addr, token, node, &fresh_key()).await
 }
 
 fn n(s: &str) -> Name {
@@ -253,11 +262,66 @@ async fn expired_tokens_are_cleaned_up() {
     let e = env().await;
     let expired = e.token(None, time::Duration::seconds(-1)).await;
     let live = e.token(None, DAY).await;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while e.token_exists(&expired).await {
-        assert!(Instant::now() < deadline, "expired token not removed");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    // The controller runs this pass on a slow timer (its first run may already have caught the
+    // token); call it directly.
+    let removed = torngat_controller::expire_join_tokens_once(&e.store)
+        .await
+        .unwrap();
+    assert!(removed <= 1);
+    assert!(!e.token_exists(&expired).await);
     assert!(e.token_exists(&live).await);
+    e.store.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_answer_can_be_retried_with_the_same_key() {
+    let e = env().await;
+    let text = e.token(None, DAY).await;
+    let key = fresh_key();
+    let first = torngat_agent::join::join(&e.join, &text, &n("n2"), &key)
+        .await
+        .unwrap();
+    assert!(!e.token_exists(&text).await);
+    // Same key, used-up token: a new certificate for the same key.
+    let again = torngat_agent::join::join(&e.join, &text, &n("n2"), &key)
+        .await
+        .unwrap();
+    let spki = |c: &str| {
+        let der = pem::parse_many(c).unwrap().remove(0);
+        torngat_pki::spki_sha256(der.contents()).unwrap()
+    };
+    assert_eq!(spki(&first.cert_chain_pem), spki(&again.cert_chain_pem));
+    // Another key cannot use that path.
+    assert!(matches!(
+        join(&e.join, &text, &n("n2")).await.unwrap_err(),
+        JoinError::Refused(_)
+    ));
+    e.store.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_for_one_name_burns_only_the_winning_token() {
+    let e = env().await;
+    let mut texts = Vec::new();
+    for _ in 0..6 {
+        texts.push(e.token(None, DAY).await);
+    }
+    let mut tasks = Vec::new();
+    for t in &texts {
+        let (addr, t) = (e.join.clone(), t.clone());
+        tasks.push(tokio::spawn(async move {
+            join(&addr, &t, &n("same")).await.is_ok()
+        }));
+    }
+    let mut ok = 0;
+    for t in tasks {
+        ok += usize::from(t.await.unwrap());
+    }
+    assert_eq!(ok, 1);
+    let mut left = 0;
+    for t in &texts {
+        left += usize::from(e.token_exists(t).await);
+    }
+    assert_eq!(left, texts.len() - 1, "losing tokens must survive");
     e.store.shutdown().await.unwrap();
 }

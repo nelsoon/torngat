@@ -2292,6 +2292,7 @@ version = "0.0.1"
 dependencies = [
  "axum",
  "http-body-util",
+ "pem",
  "rcgen",
  "serde_json",
  "tempfile",

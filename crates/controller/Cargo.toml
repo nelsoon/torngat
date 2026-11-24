@@ -15,6 +15,7 @@ time.workspace = true
 tokio = { version = "1.35", features = ["sync", "time", "rt", "macros", "net"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", default-features = false, features = ["transport", "tls-ring", "server", "router"] }
+tower = { version = "0.5", features = ["limit", "load-shed"] }
 tracing = "0.1"
 uuid.workspace = true
 x509-parser = "0.18"
@@ -28,6 +29,7 @@ axum = { version = "0.8", default-features = false }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tonic = { version = "0.14", default-features = false, features = ["transport", "tls-ring", "channel"] }
+pem = "4"
 rcgen = "0.14"
 tempfile = "3.4"
 tokio = { version = "1.35", features = ["rt-multi-thread", "macros"] }
