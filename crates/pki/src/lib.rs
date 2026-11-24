@@ -76,6 +76,9 @@ pub struct NodeIdentity {
     pub ek_sha256: Option<String>,
 }
 
+/// Store location of the cluster [`TpmPolicy`]: keyspace and path segments.
+pub const TPM_POLICY_KEY: (&str, [&str; 2]) = ("platform", ["settings", "tpm"]);
+
 /// Cluster policy on node keys. Server-written only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

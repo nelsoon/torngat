@@ -1,6 +1,7 @@
 //! Storage key layout shared with the API server (must stay identical).
 
 use torngat_api::{Name, Scope};
+use torngat_pki::TPM_POLICY_KEY;
 use torngat_store::{Key, KeyError, Prefix};
 use uuid::Uuid;
 
@@ -43,5 +44,5 @@ pub fn join_tokens() -> Result<Prefix, KeyError> {
 
 /// The cluster's node key policy ([`torngat_pki::TpmPolicy`]).
 pub fn tpm_policy() -> Result<Key, KeyError> {
-    Key::new("platform", ["settings", "tpm"])
+    Key::new(TPM_POLICY_KEY.0, TPM_POLICY_KEY.1)
 }

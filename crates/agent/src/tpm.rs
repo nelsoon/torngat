@@ -199,16 +199,22 @@ impl TpmKey {
     pub fn create(tcti: &str) -> Result<(Self, Vec<u8>), TpmError> {
         let mut ctx = open(tcti)?;
         let parent = srk(&mut ctx)?;
-        let template = node_key_template()?;
-        let created = ctx.execute_with_nullauth_session(|c| {
-            c.create(parent, template, None, None, None, None)
-        })?;
-        let blob = encode_blob(&created.out_public, &created.out_private)?;
-        let key = ctx.execute_with_nullauth_session(|c| {
-            c.load(parent, created.out_private, created.out_public.clone())
-        })?;
-        ctx.flush_context(parent.into())?;
-        Ok((Self::wrap(ctx, key, tcti, created.out_public)?, blob))
+        // The SRK handle is flushed on every path, whether or not the inner calls succeed.
+        let inner = (|| {
+            let template = node_key_template()?;
+            let created = ctx.execute_with_nullauth_session(|c| {
+                c.create(parent, template, None, None, None, None)
+            })?;
+            let blob = encode_blob(&created.out_public, &created.out_private)?;
+            let key = ctx.execute_with_nullauth_session(|c| {
+                c.load(parent, created.out_private, created.out_public.clone())
+            })?;
+            Ok::<_, TpmError>((key, blob, created.out_public))
+        })();
+        let flushed = ctx.flush_context(parent.into());
+        let (key, blob, public) = inner?;
+        flushed?;
+        Ok((Self::wrap(ctx, key, tcti, public)?, blob))
     }
 
     /// Loads a key blob made by [`TpmKey::create`] on this TPM.
@@ -216,8 +222,10 @@ impl TpmKey {
         let (public, private) = decode_blob(blob)?;
         let mut ctx = open(tcti)?;
         let parent = srk(&mut ctx)?;
-        let key = ctx.execute_with_nullauth_session(|c| c.load(parent, private, public.clone()))?;
-        ctx.flush_context(parent.into())?;
+        let key = ctx.execute_with_nullauth_session(|c| c.load(parent, private, public.clone()));
+        let flushed = ctx.flush_context(parent.into());
+        let key = key?;
+        flushed?;
         Self::wrap(ctx, key, tcti, public)
     }
 
