@@ -69,11 +69,13 @@ pub fn ek_certificate(tcti: &str) -> Result<Vec<u8>, TpmError> {
 }
 
 fn srk(ctx: &mut Context) -> Result<KeyHandle, TpmError> {
+    // noDA: see node_key_template.
     let attrs = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
         .with_sensitive_data_origin(true)
         .with_user_with_auth(true)
+        .with_no_da(true)
         .with_restricted(true)
         .with_decrypt(true)
         .build()?;
@@ -98,11 +100,16 @@ fn srk(ctx: &mut Context) -> Result<KeyHandle, TpmError> {
 }
 
 fn node_key_template() -> Result<Public, TpmError> {
+    // noDA: the key has no auth value, so dictionary-attack protection guards nothing. Without
+    // it, every power loss after the key was used counts as a failed authorization, and a few
+    // power cuts in a row put the TPM in lockout: the node can no longer use its key until
+    // the lockout times out or is cleared with the lockout auth.
     let attrs = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
         .with_sensitive_data_origin(true)
         .with_user_with_auth(true)
+        .with_no_da(true)
         .with_sign_encrypt(true)
         .build()?;
     Ok(PublicBuilder::new()
