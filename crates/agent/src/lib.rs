@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod inventory;
+pub mod qemu;
 pub mod runtime;
 
 use std::collections::{BTreeMap, BTreeSet};
