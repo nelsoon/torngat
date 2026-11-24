@@ -52,9 +52,11 @@ message ReportResponse {}
 // Enrollment of a new node. Served on its own port with server-only TLS: the caller has no
 // certificate yet. It has already checked the controller's CA against the pin in its token.
 service Join {
-  // Enrollment with a key held in a file (only where the cluster's TPM policy allows it). Also
-  // how a node retries a join whose answer was lost, whatever its key storage.
+  // Enrollment with a key held in a file (only where the cluster's TPM policy allows it).
   rpc Join(JoinRequest) returns (JoinResponse);
+  // A join whose answer was lost: shortly after enrollment, a CSR for exactly the enrolled key
+  // gets a fresh certificate without a token. NOT_FOUND otherwise.
+  rpc ResumeJoin(ResumeJoinRequest) returns (JoinResponse);
   // Enrollment with a TPM-held key, in two steps: the controller challenges the TPM, the node
   // answers with the activated credential and a certification of its key.
   rpc BeginTpmJoin(TpmJoinRequest) returns (TpmChallenge);
@@ -69,8 +71,14 @@ message JoinRequest {
   string node_name = 4;
   // PKCS#10 CSR (DER) for the node's key. Only its public key is used.
   bytes csr_der = 5;
-  // How the key is held: "file" or "tpm".
-  string key_storage = 6;
+  reserved 6;
+}
+
+message ResumeJoinRequest {
+  string api_version = 1;
+  string node_name = 2;
+  // CSR (DER) signed by the key the node enrolled with.
+  bytes csr_der = 3;
 }
 message TpmJoinRequest {
   string api_version = 1;

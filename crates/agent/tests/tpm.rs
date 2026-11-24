@@ -19,11 +19,7 @@ fn tcti() -> Option<String> {
 
 fn anchors() -> Vec<Vec<u8>> {
     let path = std::env::var("TORNGAT_TEST_EK_CA").expect("TORNGAT_TEST_EK_CA");
-    pem::parse_many(std::fs::read(path).unwrap())
-        .unwrap()
-        .into_iter()
-        .map(|p| p.into_contents())
-        .collect()
+    torngat_pki::pem_certs(&std::fs::read(path).unwrap()).unwrap()
 }
 
 #[test]

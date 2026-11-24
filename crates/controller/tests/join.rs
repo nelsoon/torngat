@@ -2,170 +2,70 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+mod common;
 
-use tempfile::TempDir;
+use common::{env, n, set_policy};
 use torngat_agent::join::{Enrolled, JoinError};
-use torngat_agent::{AgentConfig, FakeRuntime};
+use torngat_agent::{AgentConfig, FakeRuntime, NodeKey};
 use torngat_api::Name;
-use torngat_controller::{Controller, JoinService, TlsConfig, keys};
-use torngat_pki::{Ca, CaHash, JoinToken};
+use torngat_controller::keys;
+use torngat_pki::{CaHash, JoinToken};
 use torngat_proto::API_VERSION;
 use torngat_proto::v1::JoinRequest;
 use torngat_proto::v1::join_client::JoinClient;
-use torngat_store::testnet::TestNet;
-use torngat_store::{Node, Precondition, Store, default_config};
-
-struct Env {
-    store: Store,
-    ca: Arc<Ca>,
-    control: String,
-    join: String,
-    _dir: TempDir,
-}
-
-async fn env() -> Env {
-    let dir = TempDir::new().unwrap();
-    let net = TestNet::default();
-    let store = Store::open(dir.path(), 1, default_config(), net.factory(1))
-        .await
-        .unwrap();
-    net.register(1, store.raft().clone());
-    store
-        .initialize(BTreeMap::from([(1, Node::default())]))
-        .await
-        .unwrap();
-    store
-        .raft()
-        .wait(Some(Duration::from_secs(10)))
-        .current_leader(1, "leader")
-        .await
-        .unwrap();
-    let ca = Arc::new(Ca::generate().unwrap());
-    let ctl_cert = ca.issue_controller().unwrap();
-    let tls = TlsConfig {
-        cert_pem: ctl_cert.chain_pem.clone().into_bytes(),
-        key_pem: ctl_cert.key_pem.clone().unwrap().into_bytes(),
-        client_ca_pem: ca.cert_pem().as_bytes().to_vec(),
-    };
-    let ctl = Controller::new(store.clone());
-    let cl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let jl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let control = cl.local_addr().unwrap().to_string();
-    let join = jl.local_addr().unwrap().to_string();
-    tokio::spawn(torngat_controller::serve(ctl.clone(), cl, tls.clone()));
-    tokio::spawn(torngat_controller::serve_join(
-        JoinService::new(store.clone(), ca.clone(), Vec::new()),
-        jl,
-        tls.cert_pem,
-        tls.key_pem,
-    ));
-    tokio::spawn(ctl.run_scheduler(Duration::from_millis(100)));
-    // These tests enroll file keys, which a TPM-required cluster refuses.
-    set_policy(&store, false).await;
-    Env {
-        store,
-        ca,
-        control,
-        join,
-        _dir: dir,
-    }
-}
-
-async fn set_policy(store: &Store, required: bool) {
-    store
-        .put(
-            keys::tpm_policy().unwrap(),
-            serde_json::to_vec(&torngat_pki::TpmPolicy { required }).unwrap(),
-            Precondition::None,
-        )
-        .await
-        .unwrap();
-}
-
-impl Env {
-    /// Creates a token as the API would, returning its text.
-    async fn token(&self, node: Option<&str>, ttl: time::Duration) -> String {
-        let t = JoinToken::generate().unwrap();
-        let rec = t.record(node.map(|n| Name::new(n).unwrap()), ttl, String::new());
-        self.store
-            .put(
-                keys::join_token(t.id()).unwrap(),
-                serde_json::to_vec(&rec).unwrap(),
-                Precondition::Absent,
-            )
-            .await
-            .unwrap();
-        t.encode(&self.ca.hash())
-    }
-
-    async fn token_exists(&self, text: &str) -> bool {
-        let (t, _) = JoinToken::parse(text).unwrap();
-        self.store
-            .get(&keys::join_token(t.id()).unwrap())
-            .await
-            .unwrap()
-            .is_some()
-    }
-}
+use torngat_store::Precondition;
 
 fn fresh_key() -> String {
     torngat_pki::ca::node_key().unwrap().serialize_pem()
 }
 
-/// Joins with a fresh key.
-async fn join(addr: &str, token: &str, node: &Name) -> Result<Enrolled, JoinError> {
-    torngat_agent::join::join(addr, token, node, &fresh_key()).await
+async fn join_with(
+    addr: &str,
+    token: &str,
+    node: &Name,
+    key_pem: &str,
+    resume: bool,
+) -> Result<Enrolled, JoinError> {
+    let key = NodeKey::File(key_pem.as_bytes().to_vec());
+    torngat_agent::join::join(addr, token, node, &key, resume).await
 }
 
-fn n(s: &str) -> Name {
-    Name::new(s).unwrap()
+/// Joins with a fresh key.
+async fn join(addr: &str, token: &str, node: &Name) -> Result<Enrolled, JoinError> {
+    join_with(addr, token, node, &fresh_key(), false).await
 }
 
 const DAY: time::Duration = time::Duration::hours(24);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn join_then_run_as_an_enrolled_node() {
-    let e = env().await;
-    let text = e.token(None, DAY).await;
+    let e = env(Vec::new(), false).await;
+    let text = e.token(None, DAY, None).await;
     let key = fresh_key();
-    let creds = torngat_agent::join::join(&e.join, &text, &n("n2"), &key)
+    let creds = join_with(&e.join, &text, &n("n2"), &key, false)
         .await
         .unwrap();
     assert!(!e.token_exists(&text).await, "token must be consumed");
     assert!(creds.ca_pem.contains("BEGIN CERTIFICATE"));
 
     // The new credentials work on the control endpoint.
-    let store = e.store.clone();
     tokio::spawn(torngat_agent::run(
         AgentConfig {
             controller_url: format!("https://{}", e.control),
             controller_name: torngat_pki::CONTROLLER_NAME.into(),
             ca_pem: creds.ca_pem.into_bytes(),
             cert_pem: creds.cert_chain_pem.into_bytes(),
-            key: torngat_agent::NodeKey::File(key.into_bytes()),
+            key: NodeKey::File(key.into_bytes()),
         },
         FakeRuntime::default(),
     ));
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Some(v) = store.get(&keys::node(&n("n2")).unwrap()).await.unwrap() {
-            let node: torngat_api::node::Node = serde_json::from_slice(&v.value).unwrap();
-            if node.status.phase == torngat_api::node::NodePhase::Active {
-                break;
-            }
-        }
-        assert!(Instant::now() < deadline, "n2 never became active");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    e.wait_active("n2").await;
 
     // Single use.
     let err = join(&e.join, &text, &n("n3")).await.unwrap_err();
     assert!(matches!(err, JoinError::Refused(_)), "{err}");
     // A name is enrolled once: a fresh token cannot take over n2, and is not burned trying.
-    let other = e.token(None, DAY).await;
+    let other = e.token(None, DAY, None).await;
     let err = join(&e.join, &other, &n("n2")).await.unwrap_err();
     assert!(
         matches!(&err, JoinError::Refused(m) if m.contains("in use")),
@@ -177,8 +77,8 @@ async fn join_then_run_as_an_enrolled_node() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bad_tokens_are_refused_without_burning_good_ones() {
-    let e = env().await;
-    let text = e.token(Some("n2"), DAY).await;
+    let e = env(Vec::new(), false).await;
+    let text = e.token(Some("n2"), DAY, None).await;
 
     // Wrong secret.
     let (t, ca) = JoinToken::parse(&text).unwrap();
@@ -206,9 +106,9 @@ async fn bad_tokens_are_refused_without_burning_good_ones() {
         join(&e.join, &wrong_ca, &n("n2")).await.unwrap_err(),
         JoinError::CaMismatch
     ));
-    // A malformed CSR or unsupported key storage does not burn the token.
+    // A malformed CSR does not burn the token.
     let ca_pem = e.ca.cert_pem().to_owned();
-    let raw = |csr: Vec<u8>, storage: &str| {
+    let raw = |csr: Vec<u8>| {
         let ca_pem = ca_pem.clone();
         let addr = e.join.clone();
         let req = JoinRequest {
@@ -217,7 +117,6 @@ async fn bad_tokens_are_refused_without_burning_good_ones() {
             token_secret: t.secret().to_vec(),
             node_name: "n2".into(),
             csr_der: csr,
-            key_storage: storage.into(),
         };
         async move {
             let tls = tonic::transport::ClientTlsConfig::new()
@@ -233,20 +132,14 @@ async fn bad_tokens_are_refused_without_burning_good_ones() {
             JoinClient::new(ch).join(req).await.unwrap_err().code()
         }
     };
-    assert_eq!(
-        raw(b"junk".to_vec(), "file").await,
-        tonic::Code::InvalidArgument
-    );
-    let key = torngat_pki::ca::node_key().unwrap();
-    let csr = torngat_pki::ca::node_csr(&key).unwrap();
-    assert_eq!(raw(csr, "tpm").await, tonic::Code::FailedPrecondition);
+    assert_eq!(raw(b"junk".to_vec()).await, tonic::Code::InvalidArgument);
     assert!(e.token_exists(&text).await);
 
     // The real thing still works.
     join(&e.join, &text, &n("n2")).await.unwrap();
 
     // Expired.
-    let expired = e.token(None, time::Duration::seconds(-1)).await;
+    let expired = e.token(None, time::Duration::seconds(-1), None).await;
     assert!(matches!(
         join(&e.join, &expired, &n("n4")).await.unwrap_err(),
         JoinError::Refused(_)
@@ -256,8 +149,8 @@ async fn bad_tokens_are_refused_without_burning_good_ones() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_token_enrolls_exactly_one_node_under_concurrency() {
-    let e = env().await;
-    let text = e.token(None, DAY).await;
+    let e = env(Vec::new(), false).await;
+    let text = e.token(None, DAY, None).await;
     let mut tasks = Vec::new();
     for i in 0..8 {
         let (addr, text) = (e.join.clone(), text.clone());
@@ -275,9 +168,9 @@ async fn a_token_enrolls_exactly_one_node_under_concurrency() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expired_tokens_are_cleaned_up() {
-    let e = env().await;
-    let expired = e.token(None, time::Duration::seconds(-1)).await;
-    let live = e.token(None, DAY).await;
+    let e = env(Vec::new(), false).await;
+    let expired = e.token(None, time::Duration::seconds(-1), None).await;
+    let live = e.token(None, DAY, None).await;
     // The controller runs this pass on a slow timer (its first run may already have caught the
     // token); call it directly.
     let removed = torngat_controller::expire_join_tokens_once(&e.store)
@@ -291,15 +184,15 @@ async fn expired_tokens_are_cleaned_up() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lost_answer_can_be_retried_with_the_same_key() {
-    let e = env().await;
-    let text = e.token(None, DAY).await;
+    let e = env(Vec::new(), false).await;
+    let text = e.token(None, DAY, None).await;
     let key = fresh_key();
-    let first = torngat_agent::join::join(&e.join, &text, &n("n2"), &key)
+    let first = join_with(&e.join, &text, &n("n2"), &key, false)
         .await
         .unwrap();
     assert!(!e.token_exists(&text).await);
-    // Same key, used-up token: a new certificate for the same key.
-    let again = torngat_agent::join::join(&e.join, &text, &n("n2"), &key)
+    // Same key, used-up token, resuming: a new certificate for the same key.
+    let again = join_with(&e.join, &text, &n("n2"), &key, true)
         .await
         .unwrap();
     let spki = |c: &str| {
@@ -309,7 +202,9 @@ async fn a_lost_answer_can_be_retried_with_the_same_key() {
     assert_eq!(spki(&first.cert_chain_pem), spki(&again.cert_chain_pem));
     // Another key cannot use that path.
     assert!(matches!(
-        join(&e.join, &text, &n("n2")).await.unwrap_err(),
+        join_with(&e.join, &text, &n("n2"), &fresh_key(), true)
+            .await
+            .unwrap_err(),
         JoinError::Refused(_)
     ));
     // Only shortly after enrollment: it is a retry, not a token-less renewal.
@@ -326,7 +221,7 @@ async fn a_lost_answer_can_be_retried_with_the_same_key() {
         .await
         .unwrap();
     assert!(matches!(
-        torngat_agent::join::join(&e.join, &text, &n("n2"), &key)
+        join_with(&e.join, &text, &n("n2"), &key, true)
             .await
             .unwrap_err(),
         JoinError::Refused(_)
@@ -336,10 +231,10 @@ async fn a_lost_answer_can_be_retried_with_the_same_key() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn racing_for_one_name_burns_only_the_winning_token() {
-    let e = env().await;
+    let e = env(Vec::new(), false).await;
     let mut texts = Vec::new();
     for _ in 0..6 {
-        texts.push(e.token(None, DAY).await);
+        texts.push(e.token(None, DAY, None).await);
     }
     let mut tasks = Vec::new();
     for t in &texts {
@@ -363,9 +258,9 @@ async fn racing_for_one_name_burns_only_the_winning_token() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tpm_required_cluster_refuses_file_keys() {
-    let e = env().await;
+    let e = env(Vec::new(), false).await;
     set_policy(&e.store, true).await;
-    let text = e.token(None, DAY).await;
+    let text = e.token(None, DAY, None).await;
     let err = join(&e.join, &text, &n("n2")).await.unwrap_err();
     assert!(
         matches!(&err, JoinError::Refused(m) if m.contains("requires TPM")),

@@ -2824,6 +2824,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.21",
  "time",
+ "torngat-pki",
  "x509-parser",
 ]
 
@@ -2860,6 +2861,7 @@ name = "torngat-pki"
 version = "0.0.1"
 dependencies = [
  "getrandom 0.4.3",
+ "pem",
  "rcgen",
  "serde",
  "serde_json",
@@ -2905,7 +2907,6 @@ name = "torngatd"
 version = "0.0.1"
 dependencies = [
  "clap",
- "pem",
  "serde",
  "serde_json",
  "tokio",

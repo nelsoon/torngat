@@ -31,7 +31,7 @@ use torngat_api::Name;
 use torngat_pki::{Ca, JoinToken, TpmPolicy};
 
 mod node_key;
-use node_key::{DEFAULT_TCTI, KeyConfig, LocalKey, TpmMode};
+use node_key::{DEFAULT_TCTI, KeyConfig, TpmMode};
 
 /// Default ports: control (mTLS, agents) and join (server-only TLS, enrollment).
 const CONTROL_PORT: u16 = 7443;
@@ -287,10 +287,8 @@ async fn init(
     let mut roots = Vec::new();
     for f in &tpm_ca {
         let pem = std::fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
-        let certs = pem::parse_many(&pem).map_err(|e| format!("{}: {e}", f.display()))?;
-        if certs.is_empty() || certs.iter().any(|c| c.tag() != "CERTIFICATE") {
-            return Err(format!("{}: expected PEM certificates", f.display()).into());
-        }
+        torngat_pki::pem_certs(&pem)
+            .map_err(|_| format!("{}: expected PEM certificates", f.display()))?;
         roots.push(pem);
     }
 
@@ -315,7 +313,7 @@ async fn init(
     )?;
     // This node's own key: the operator running init is the trust root, so it is enrolled
     // directly, without attestation.
-    let key = node_key::create_or_resume(&ident, &key_cfg)?;
+    let (key, _) = node_key::create_or_resume(&ident, &key_cfg)?;
     let me = ca.sign_node_csr(&key.csr()?, &name)?;
     let mut my_identity = me.identity(key.storage())?;
     // Close our TPM session first: some TPM transports take one client at a time.
@@ -370,13 +368,7 @@ async fn init(
 
     println!("Cluster created; this node is {name}.");
     println!("  CA:          {}", ca.hash());
-    println!(
-        "  Node key:    {}",
-        match key_cfg {
-            KeyConfig::File => "file".to_owned(),
-            KeyConfig::Tpm { tcti } => format!("TPM ({tcti})"),
-        }
-    );
+    println!("  Node key:    {key_cfg}");
     println!(
         "  TPM policy:  {}",
         if required {
@@ -426,16 +418,14 @@ async fn join(
     data_root(&data)?;
     let ident = data.join("identity");
     private_dir(&ident)?;
-    let key = node_key::create_or_resume(&ident, &key_cfg)?;
-    let enrolled = match &key {
-        LocalKey::File(pem) => {
-            torngat_agent::join::join(&join_addr, token.trim(), &name, pem).await?
-        }
-        #[cfg(feature = "tpm")]
-        LocalKey::Tpm(k) => {
-            torngat_agent::join::join_tpm(&join_addr, token.trim(), &name, k).await?
-        }
-    };
+    let (key, resume) = node_key::create_or_resume(&ident, &key_cfg)?;
+    if resume {
+        println!(
+            "Resuming with the existing {key_cfg} key in {}.",
+            ident.display()
+        );
+    }
+    let enrolled = torngat_agent::join::join(&join_addr, token.trim(), &name, &key, resume).await?;
     replace_private(&ident.join("ca.pem"), enrolled.ca_pem.as_bytes())?;
     replace_private(&ident.join("node.pem"), enrolled.cert_chain_pem.as_bytes())?;
     let cfg = NodeConfig {
@@ -446,11 +436,7 @@ async fn join(
     };
     write_private(&data.join("node.json"), &serde_json::to_vec_pretty(&cfg)?)?;
     println!(
-        "Joined as {name} ({} key). The token is used up; you can delete {}.",
-        match key_cfg {
-            KeyConfig::File => "file",
-            KeyConfig::Tpm { .. } => "TPM",
-        },
+        "Joined as {name} ({key_cfg} key). The token is used up; you can delete {}.",
         token_file.display()
     );
     println!(
@@ -472,9 +458,7 @@ fn tpm_anchors(dir: &Path) -> Res<Vec<Vec<u8>>> {
         let p = entry?.path();
         if p.extension().is_some_and(|x| x == "pem") {
             let pem = std::fs::read(&p)?;
-            for c in pem::parse_many(&pem).map_err(|e| format!("{}: {e}", p.display()))? {
-                out.push(c.into_contents());
-            }
+            out.extend(torngat_pki::pem_certs(&pem).map_err(|e| format!("{}: {e}", p.display()))?);
         }
     }
     Ok(out)

@@ -6,16 +6,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 port=${SWTPM_PORT:-2321}
 dir=$(pwd)/target/swtpm-$port
+cfg=${XDG_CONFIG_HOME:-$HOME/.config}
 case "${1:-}" in
 start)
   "$0" stop >/dev/null 2>&1 || true
   rm -rf "$dir" && mkdir -p "$dir/state"
   # Per-user swtpm CA (creates ~/.config/swtpm* once; never touches system files).
-  [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/swtpm_setup.conf" ] ||
+  [ -f "$cfg/swtpm_setup.conf" ] ||
     swtpm_setup --create-config-files >/dev/null
   swtpm_setup --tpm2 --tpmstate "$dir/state" --create-ek-cert --overwrite \
-    --config "${XDG_CONFIG_HOME:-$HOME/.config}/swtpm_setup.conf" >"$dir/setup.log" 2>&1
-  ca=$(grep -h '^statedir' "${XDG_CONFIG_HOME:-$HOME/.config}/swtpm-localca.conf" | sed 's/.*= *//')
+    --config "$cfg/swtpm_setup.conf" >"$dir/setup.log" 2>&1
+  ca=$(grep -h '^statedir' "$cfg/swtpm-localca.conf" | sed 's/.*= *//')
   swtpm socket --tpm2 --tpmstate dir="$dir/state" --flags not-need-init,startup-clear \
     --server type=tcp,port="$port" --ctrl type=tcp,port=$((port + 1)) \
     --pid file="$dir/pid" --daemon
