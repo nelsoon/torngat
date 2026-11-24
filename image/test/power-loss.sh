@@ -129,16 +129,11 @@ connect_api() {
   [ -n "$fwd_pid" ] && kill "$fwd_pid" 2>/dev/null || true
   ssh "${ssh_opts[@]}" -N -L "127.0.0.1:$api_port:127.0.0.1:8080" -o ExitOnForwardFailure=yes root@127.0.0.1 2>>"$work/forward.log" &
   fwd_pid=$!
-  local t0 i out
+  local t0 out
   t0=$(now)
-  for i in $(seq 120); do
-    # A TPM counts every unclean shutdown as a failed authorization for keys without noDA, and
-    # after a few power cuts in a row it locks them out: torngatd then cannot load its key. The
-    # node keys are created noDA so this must not happen; name it if it does.
-    if [ "$i" -ge 10 ] && guest "journalctl -u torngatd -b --no-pager -n 40 | grep -q 'DA lockout'" 2>/dev/null; then
-      fail "torngatd cannot start: the TPM is in dictionary-attack lockout after the power cut"
-    fi
-    token=$(guest cat /var/lib/torngat/admin-token 2>/dev/null) || token=
+  token=
+  for _ in $(seq 120); do
+    [ -n "$token" ] || token=$(guest cat /var/lib/torngat/admin-token 2>/dev/null) || token=
     if [ -n "$token" ]; then
       out=$(api GET /v1/platform/nodes 2>/dev/null) || out=
       [ "${out##*$'\n'}" = 200 ] && { t_api=$(elapsed "$t0"); return 0; }
@@ -146,6 +141,11 @@ connect_api() {
     sleep 1
   done
   guest journalctl -u torngatd --no-pager -n 20 >&2 || true
+  # A key without noDA is locked out by the TPM after a few power cuts in a row (each counts as a
+  # failed authorization); the node keys are created noDA, so name it if it happens anyway.
+  if guest "journalctl -u torngatd -b --no-pager -n 40 | grep -q 'DA lockout'" 2>/dev/null; then
+    fail "torngatd cannot start: the TPM is in dictionary-attack lockout after the power cut"
+  fi
   fail "API not up within 120 s (torngatd should start by itself)"
 }
 
@@ -248,7 +248,6 @@ wait_node_active
 list_tokens | sort >"$work/baseline.sorted" || fail "listing join tokens failed"
 echo "first boot: $(wc -l <"$work/baseline.sorted") records from init; ssh ${t_ssh}s, api ${t_api}s"
 
-total_acked=0
 printf '%-5s %-7s %-6s %-8s %-15s %-17s %-6s %s\n' cycle writers delay acked unacked-present unacked-missing boot-s "recovery-lines/fs-lines"
 for c in $(seq "$cycles"); do
   # Writers: 1 sequential, then 2-4 parallel, rotating.
@@ -269,10 +268,9 @@ for c in $(seq "$cycles"); do
   t_boot=$(elapsed "$t0")
   check_guest
   verify "$c"
-  total_acked=$(wc -l <"$acked")
   printf '%-5s %-7s %-6s %-8s %-15s %-17s %-6s %s\n' "$c" "$nw" "${delay}s" "$n_ack" "$n_unacked_present" \
     "$n_unacked_missing" "$t_boot" "$recov/$fsl (ssh ${t_ssh}s, api ${t_api}s, attempted $n_att)"
 done
 
 ok=1
-echo "PASS: $cycles power cuts, $total_acked acknowledged writes in total, none lost (seed=$seed)"
+echo "PASS: $cycles power cuts, $(wc -l <"$acked") acknowledged writes in total, none lost (seed=$seed)"

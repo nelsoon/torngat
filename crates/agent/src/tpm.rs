@@ -5,8 +5,10 @@
 //! TPM). It is fixed-TPM and fixed-parent: the TPM never lets it out. On disk there is only the
 //! key blob, wrapped by the TPM and useless anywhere else.
 //!
-//! No authorization values are used, so a wrong value can never trip the TPM's dictionary-attack
-//! lockout. Access is controlled by who may open the TPM device.
+//! No authorization values are used: access is controlled by who may open the TPM device. The
+//! storage root key and the node key are also created noDA, because a TPM counts an unclean
+//! shutdown after a key was used as a failed authorization, and a few power cuts would otherwise
+//! lock the node out of its key.
 //!
 //! The same TPM proves all this to the controller at join (see `torngat-attest`): an attestation
 //! key under the endorsement key certifies the node key.
