@@ -56,8 +56,10 @@ pub fn ek_pin(ek_cert_der: &[u8]) -> Result<String, AttestError> {
 
 /// Checks an RSA 2048 EK certificate. With `pin`, the key must match it (the certificate's
 /// issuer then does not matter). Otherwise the certificate must be valid now and signed directly
-/// by one of `anchors` (DER CA certificates, valid now and allowed to sign certificates: vendor
-/// roots or their intermediates).
+/// by one of `anchors` (DER CA certificates allowed to sign certificates: vendor roots or their
+/// intermediates). The anchors' own validity periods are not checked: vendor intermediates often
+/// expire while the EK certificates they issued stay valid, and the EK certificate's validity is
+/// still enforced.
 pub fn verify_endorsement(
     ek_cert_der: &[u8],
     anchors: &[Vec<u8>],
@@ -85,7 +87,6 @@ pub fn verify_endorsement(
                     x509_parser::parse_x509_certificate(a).is_ok_and(|(rest, ca)| {
                         rest.is_empty()
                             && ca.is_ca()
-                            && ca.validity().is_valid()
                             // If key usage is stated, it must allow signing certificates.
                             && match ca.key_usage() {
                                 Ok(None) => true,

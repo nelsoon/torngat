@@ -98,7 +98,13 @@ pub fn create_or_resume(ident: &Path, cfg: &KeyConfig) -> Res<(NodeKey, bool)> {
                 Ok(b) => match TpmKey::load(tcti, &b) {
                     Ok(k) => return Ok((NodeKey::Tpm(k), true)),
                     Err(torngat_agent::tpm::TpmError::BadBlob) => {}
-                    Err(e) => return Err(format!("{}: {e}", path.display()).into()),
+                    Err(e) => {
+                        return Err(format!(
+                            "{}: the TPM refused the saved key ({e}); if this TPM was cleared or replaced, delete this file and join again with a new token",
+                            path.display()
+                        )
+                        .into());
+                    }
                 },
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(format!("{}: {e}", path.display()).into()),
