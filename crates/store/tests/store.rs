@@ -2,53 +2,24 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 use torngat_store::testnet::TestNet;
+mod common;
+
+use common::{members, open, wait_leader};
 use torngat_store::{Key, Node, NodeId, Precondition, Prefix, Store, StoreError, default_config};
 
 fn key(name: &str) -> Key {
     Key::new("compute", ["orgs", "acme", "instances", name]).unwrap()
 }
 
-async fn open(net: &TestNet, dir: &TempDir, id: NodeId) -> Store {
-    let s = Store::open(dir.path(), id, default_config(), net.factory(id))
-        .await
-        .unwrap();
-    net.register(id, s.raft().clone());
-    s
-}
-
-async fn wait_leader(stores: &[&Store], exclude: Option<NodeId>) -> NodeId {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        for s in stores {
-            if Some(s.id()) == exclude {
-                continue;
-            }
-            if let Some(l) = s.raft().current_leader().await
-                && Some(l) != exclude
-                && s.raft().is_leader() == (l == s.id())
-            {
-                return l;
-            }
-        }
-        assert!(Instant::now() < deadline, "no leader elected");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-fn members(ids: &[NodeId]) -> BTreeMap<NodeId, Node> {
-    ids.iter().map(|i| (*i, Node::default())).collect()
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn single_node_crud_cas_list_watch() {
     let net = TestNet::default();
     let dir = TempDir::new().unwrap();
-    let s = open(&net, &dir, 1).await;
+    let s = open(&net, dir.path(), 1).await;
     s.initialize(members(&[1])).await.unwrap();
     wait_leader(&[&s], None).await;
 
@@ -150,7 +121,7 @@ async fn data_survives_restart() {
     let dir = TempDir::new().unwrap();
     let rev = {
         let net = TestNet::default();
-        let s = open(&net, &dir, 1).await;
+        let s = open(&net, dir.path(), 1).await;
         s.initialize(members(&[1])).await.unwrap();
         wait_leader(&[&s], None).await;
         let r = s
@@ -160,34 +131,53 @@ async fn data_survives_restart() {
         s.shutdown().await.unwrap();
         r
     };
-    // The WAL lock is released by a background thread shortly after shutdown; a real restart
-    // is a new process, so retry briefly instead of failing on the stale lock.
+    // `shutdown` returns once the directory can be reopened, as a restarted process would.
     let net = TestNet::default();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let s = loop {
-        match Store::open(dir.path(), 1, default_config(), net.factory(1)).await {
-            Ok(s) => break s,
-            Err(e) if Instant::now() < deadline => {
-                let _ = e;
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(e) => panic!("reopen failed: {e}"),
-        }
-    };
-    net.register(1, s.raft().clone());
+    let s = open(&net, dir.path(), 1).await;
     wait_leader(&[&s], None).await;
     let v = s.get(&key("persist")).await.unwrap().unwrap();
     assert_eq!((v.revision, v.value.as_slice()), (rev, &b"yes"[..]));
     s.shutdown().await.unwrap();
 }
 
+/// `shutdown` releases the log and the database even while the caller still holds the `Store`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_releases_directory() {
+    let dir = TempDir::new().unwrap();
+    let net = TestNet::default();
+    let mut finished = Vec::new(); // shut-down handles stay alive
+    for round in 0..5 {
+        let s = open(&net, dir.path(), 1).await;
+        if round == 0 {
+            s.initialize(members(&[1])).await.unwrap();
+            // Opening twice is refused while the first replica runs.
+            assert!(
+                Store::open(dir.path(), 1, default_config(), net.factory(1))
+                    .await
+                    .is_err()
+            );
+        }
+        wait_leader(&[&s], None).await;
+        s.put(key("r"), vec![round], Precondition::None)
+            .await
+            .unwrap();
+        s.shutdown().await.unwrap();
+        assert!(matches!(
+            s.get(&key("r")).await,
+            Err(StoreError::Closed | StoreError::Raft(_))
+        ));
+        net.unregister(1);
+        finished.push(s);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn grow_to_three_and_fail_over() {
     let net = TestNet::default();
     let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
-    let s1 = open(&net, &dirs[0], 1).await;
-    let s2 = open(&net, &dirs[1], 2).await;
-    let s3 = open(&net, &dirs[2], 3).await;
+    let s1 = open(&net, dirs[0].path(), 1).await;
+    let s2 = open(&net, dirs[1].path(), 2).await;
+    let s3 = open(&net, dirs[2].path(), 3).await;
     let all = [&s1, &s2, &s3];
 
     // Start as a single node, as `init` will.
@@ -271,7 +261,7 @@ async fn write_budget_boot_storm() {
         .unwrap_or(20_000);
     let net = TestNet::default();
     let dir = TempDir::new().unwrap();
-    let s = open(&net, &dir, 1).await;
+    let s = open(&net, dir.path(), 1).await;
     s.initialize(members(&[1])).await.unwrap();
     wait_leader(&[&s], None).await;
 

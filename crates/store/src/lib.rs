@@ -17,12 +17,13 @@ pub mod types;
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::{Config, RaftNetworkFactory, ReadPolicy};
 use openraft_log_wal::WalLogStore;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 
 pub use key::{Key, KeyError, Prefix};
 pub use sm::Event;
@@ -68,12 +69,31 @@ pub fn default_config() -> Config {
     }
 }
 
+/// How long [`Store::shutdown`] waits for the log and the database to be released.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Handles a replica keeps for local reads, dropped by [`Store::shutdown`] so that the log and
+/// the database can be reopened as soon as it returns.
+struct Local {
+    sm: sm::StateMachine,
+    sm_released: oneshot::Receiver<()>,
+    log_released: oneshot::Receiver<()>,
+}
+
 /// A store replica.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Store {
     raft: Raft,
-    sm: sm::StateMachine,
+    local: Arc<Mutex<Option<Local>>>,
     id: NodeId,
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Store {
@@ -106,10 +126,29 @@ impl Store {
         })?;
         let log = WalLogStore::<TypeConfig>::open(log_dir)?;
         let sm = sm::StateMachine::open(dir.join("sm"))?;
-        let raft = openraft::Raft::new(id, config, network, log, sm.clone())
+        let local = Local {
+            sm_released: sm.released(),
+            log_released: log.released(),
+            sm: sm.clone(),
+        };
+        let raft = openraft::Raft::new(id, config, network, log, sm)
             .await
             .map_err(|e| StoreError::Raft(e.to_string()))?;
-        Ok(Self { raft, sm, id })
+        Ok(Self {
+            raft,
+            local: Arc::new(Mutex::new(Some(local))),
+            id,
+        })
+    }
+
+    /// The state machine for local reads, or [`StoreError::Closed`] after [`Store::shutdown`].
+    fn sm(&self) -> Result<sm::StateMachine, StoreError> {
+        self.local
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|l| l.sm.clone())
+            .ok_or(StoreError::Closed)
     }
 
     pub fn id(&self) -> NodeId {
@@ -192,7 +231,7 @@ impl Store {
     /// Linearizable read of one key.
     pub async fn get(&self, key: &Key) -> Result<Option<Versioned>, StoreError> {
         self.linearize().await?;
-        Ok(self.sm.get(key)?)
+        Ok(self.sm()?.get(key)?)
     }
 
     /// Linearizable list of up to `limit` (capped at [`MAX_LIST`]; 0 returns nothing) keys under
@@ -204,39 +243,71 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<(Key, Versioned)>, StoreError> {
         self.linearize().await?;
-        Ok(self.sm.list(prefix, start_after, limit.min(MAX_LIST))?)
+        Ok(self.sm()?.list(prefix, start_after, limit.min(MAX_LIST))?)
     }
 
     /// Subscribes to changes under `prefix`, as they are applied on *this* replica. To watch
     /// without missing events: subscribe, then list, then ignore events at or below the listed
     /// revisions.
     pub fn watch(&self, prefix: Prefix) -> Watch {
-        Watch {
-            rx: self.sm.subscribe(),
-            prefix,
-        }
+        // After shutdown there is nothing to watch: hand out a watch that reports `Closed`.
+        let (tx, rx) = broadcast::channel(1);
+        let rx = match self.sm() {
+            Ok(sm) => sm.subscribe(),
+            Err(_) => {
+                let _ = tx.send(sm::Signal::Closed);
+                rx
+            }
+        };
+        Watch { rx, prefix }
     }
 
     /// Every key in this replica's state machine, without a linearizable read: whatever this
     /// replica has applied so far. For simulation checkers; not part of the production API.
     #[cfg(feature = "test-util")]
     pub fn local_dump(&self) -> std::io::Result<Vec<(Key, Versioned)>> {
-        self.sm.dump()
+        self.sm().map_err(std::io::Error::other)?.dump()
     }
 
-    /// Index of the last log entry this replica's state machine applied (see
-    /// [`Store::local_dump`]).
-    #[cfg(feature = "test-util")]
-    pub fn local_applied_index(&self) -> std::io::Result<Option<u64>> {
-        self.sm.applied_index()
-    }
-
+    /// Stops the replica. Returns once Raft has stopped and the log and database locks are
+    /// released, so the directory can be reopened immediately, provided every other clone of
+    /// this `Store` has finished its calls (a read in flight keeps the database open until it
+    /// returns). The store answers [`StoreError::Closed`] afterwards.
     pub async fn shutdown(&self) -> Result<(), StoreError> {
-        self.sm.close();
-        self.raft
+        if let Ok(sm) = self.sm() {
+            sm.close();
+        }
+        let stopped = self
+            .raft
             .shutdown()
             .await
-            .map_err(|e| StoreError::Raft(e.to_string()))
+            .map_err(|e| StoreError::Raft(e.to_string()));
+        let local = self
+            .local
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(Local {
+            sm,
+            sm_released,
+            log_released,
+        }) = local
+        {
+            drop(sm);
+            // The receivers complete with an error once the senders are dropped with the last
+            // handle, which is the signal. Raft's own copies are released as its tasks end.
+            let wait = async {
+                let _ = sm_released.await;
+                let _ = log_released.await;
+            };
+            if tokio::time::timeout(RELEASE_TIMEOUT, wait).await.is_err() {
+                return Err(StoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "log or database still in use after shutdown",
+                )));
+            }
+        }
+        stopped
     }
 }
 

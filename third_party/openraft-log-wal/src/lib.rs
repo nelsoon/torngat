@@ -57,7 +57,30 @@ where
     C: RaftTypeConfig,
     EntryOf<C>: Clone,
 {
-    inner: Arc<RwLock<RaftLog<WalTypes<C>>>>,
+    inner: Arc<Shared<C>>,
+}
+
+/// State shared by every clone of a [`WalLogStore`].
+///
+/// `log` is declared before `released`, so the log (whose drop joins the flush worker and
+/// then releases the directory lock) is gone before the release signals fire.
+struct Shared<C>
+where
+    C: RaftTypeConfig,
+    EntryOf<C>: Clone,
+{
+    log: RwLock<RaftLog<WalTypes<C>>>,
+    released: std::sync::Mutex<Vec<oneshot::Sender<()>>>,
+}
+
+impl<C> Debug for Shared<C>
+where
+    C: RaftTypeConfig,
+    EntryOf<C>: Clone,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shared").finish_non_exhaustive()
+    }
 }
 
 impl<C> WalLogStore<C>
@@ -83,8 +106,25 @@ where
         let raft_log = RaftLog::open(Arc::new(config))?;
 
         Ok(Self {
-            inner: Arc::new(RwLock::new(raft_log)),
+            inner: Arc::new(Shared {
+                log: RwLock::new(raft_log),
+                released: std::sync::Mutex::default(),
+            }),
         })
+    }
+
+    /// A receiver that completes (with an error, as its sender is dropped) once the last clone
+    /// of this store is gone and the log has released its directory lock. Dropping a store
+    /// does not wait for this, so a caller that wants to reopen the directory at once waits on
+    /// the receiver after dropping every clone it controls.
+    pub fn released(&self) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(tx);
+        rx
     }
 }
 
@@ -99,7 +139,7 @@ where
     ) -> Result<Vec<EntryOf<C>>, io::Error> {
         let (start, end) = range_boundary(range);
 
-        let log = self.inner.read().await;
+        let log = self.inner.log.read().await;
 
         let entries = log
             .read(start, end)
@@ -110,7 +150,7 @@ where
     }
 
     async fn read_vote(&mut self) -> Result<Option<VoteOf<C>>, io::Error> {
-        let log = self.inner.read().await;
+        let log = self.inner.log.read().await;
         let vote = log.log_state().vote().map(|vote| vote.0.clone());
 
         Ok(vote)
@@ -125,7 +165,7 @@ where
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<C>, io::Error> {
-        let log = self.inner.read().await;
+        let log = self.inner.log.read().await;
         let state = log.log_state();
 
         // `raft_log` advances `last` to the purged log id when a purge removes
@@ -145,7 +185,7 @@ where
         let (tx, rx) = oneshot::channel();
 
         {
-            let mut log = self.inner.write().await;
+            let mut log = self.inner.log.write().await;
 
             log.save_vote(MsgPackVote(vote.clone()))?;
             log.flush(true, Some(Callback::Oneshot(tx)))?;
@@ -165,7 +205,7 @@ where
             return Ok(());
         };
 
-        let mut log = self.inner.write().await;
+        let mut log = self.inner.log.write().await;
         log.commit(MsgPack(committed))?;
 
         // No flush is requested here. openraft treats the committed log id as
@@ -177,7 +217,7 @@ where
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogIdOf<C>>, io::Error> {
-        let log = self.inner.read().await;
+        let log = self.inner.log.read().await;
         let committed = log.log_state().committed().map(|log_id| log_id.0.clone());
 
         Ok(committed)
@@ -192,7 +232,7 @@ where
             (MsgPack(log_id), MsgPack(entry))
         });
 
-        let mut log = self.inner.write().await;
+        let mut log = self.inner.log.write().await;
 
         log.append(entries)?;
         log.flush(true, Some(Callback::IOFlushed(callback)))?;
@@ -205,7 +245,7 @@ where
     async fn truncate_after(&mut self, last_log_id: Option<LogIdOf<C>>) -> Result<(), io::Error> {
         let truncate_at = last_log_id.next_index();
 
-        let mut log = self.inner.write().await;
+        let mut log = self.inner.log.write().await;
 
         let curr_last = log.log_state().last().map(|log_id| log_id.0.clone());
         if truncate_at >= curr_last.next_index() {
@@ -222,7 +262,7 @@ where
     }
 
     async fn purge(&mut self, log_id: LogIdOf<C>) -> Result<(), io::Error> {
-        let mut log = self.inner.write().await;
+        let mut log = self.inner.log.write().await;
 
         let curr_purged = log.log_state().purged().map(|log_id| log_id.0.clone());
         if log_id.index < curr_purged.next_index() {

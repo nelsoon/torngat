@@ -50,24 +50,12 @@ struct Faults {
     rng: SplitMix64,
 }
 
-/// What the network did to messages so far.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct FaultStats {
-    /// RPCs dropped by the seeded fault model (not counting cut links).
-    pub dropped: u64,
-    /// RPCs delayed by a non-zero duration.
-    pub delayed: u64,
-    /// RPCs refused because the link was cut or the node was down.
-    pub refused: u64,
-}
-
 #[derive(Default)]
 struct Inner {
     nodes: BTreeMap<NodeId, Raft>,
     /// Directed links that drop every message.
     cut: BTreeSet<(NodeId, NodeId)>,
     faults: Option<Faults>,
-    stats: FaultStats,
 }
 
 /// Shared routing table. Clone it into every node's network factory.
@@ -123,23 +111,23 @@ impl TestNet {
         self.lock().cut.clear();
     }
 
-    /// Makes every RPC fail as unreachable with probability `drop_per_mille` / 1000 and
-    /// otherwise delays it by a random duration in `[0, max_delay]`. The choices come from a
-    /// generator seeded with `seed`, so a seed replays the same sequence of decisions (which RPC
-    /// meets each decision still depends on task scheduling). `set_faults(0, Duration::ZERO, _)`
-    /// turns the faults off.
+    /// Makes every message, request and response alike, fail as unreachable with probability
+    /// `drop_per_mille` / 1000 and otherwise delays it by a random duration in `[0, max_delay]`.
+    /// A dropped response leaves the request applied but unacknowledged. The choices come from a
+    /// generator seeded with `seed`, so a seed replays the same sequence of decisions (which
+    /// message meets each decision still depends on task scheduling).
     pub fn set_faults(&self, drop_per_mille: u32, max_delay: Duration, seed: u64) {
         let mut g = self.lock();
-        g.faults = (drop_per_mille > 0 || !max_delay.is_zero()).then(|| Faults {
+        g.faults = Some(Faults {
             drop_per_mille,
             max_delay,
             rng: SplitMix64::new(seed),
         });
     }
 
-    /// Counters of injected faults since creation.
-    pub fn fault_stats(&self) -> FaultStats {
-        self.lock().stats
+    /// Turns message faults off.
+    pub fn clear_faults(&self) {
+        self.lock().faults = None;
     }
 
     /// A factory for node `from`.
@@ -150,43 +138,54 @@ impl TestNet {
         }
     }
 
-    /// Routes one RPC: applies faults (possibly sleeping), then returns the target node.
-    async fn target(&self, from: NodeId, to: NodeId) -> Result<Raft, Unreachable<TypeConfig>> {
-        let (delay, result) = {
-            let mut g = self.lock();
-            let mut delay = Duration::ZERO;
-            let mut dropped = false;
-            if let Some(f) = g.faults.as_mut() {
-                dropped = f.rng.below(1000) < u64::from(f.drop_per_mille);
-                let max = u64::try_from(f.max_delay.as_micros()).unwrap_or(u64::MAX);
-                if !dropped && max > 0 {
-                    delay = Duration::from_micros(f.rng.below(max.saturating_add(1)));
-                }
+    /// Decides the fate of one message from `from` to `to`: dropped or refused (an error), or
+    /// delivered after a delay. A request also looks up its target node.
+    fn hop(
+        &self,
+        from: NodeId,
+        to: NodeId,
+        request: bool,
+    ) -> Result<(Duration, Option<Raft>), Unreachable<TypeConfig>> {
+        let mut g = self.lock();
+        let mut delay = Duration::ZERO;
+        if let Some(f) = g.faults.as_mut() {
+            if f.rng.below(1000) < u64::from(f.drop_per_mille) {
+                return Err(Unreachable::new(&std::io::Error::other("dropped")));
             }
-            let result = if dropped {
-                g.stats.dropped += 1;
-                Err("dropped")
-            } else if g.cut.contains(&(from, to)) {
-                g.stats.refused += 1;
-                Err("partitioned")
-            } else if let Some(r) = g.nodes.get(&to).cloned() {
-                if !delay.is_zero() {
-                    g.stats.delayed += 1;
-                }
-                Ok(r)
-            } else {
-                g.stats.refused += 1;
-                Err("node down")
-            };
-            (delay, result)
+            let max = u64::try_from(f.max_delay.as_micros()).unwrap_or(u64::MAX);
+            if max > 0 {
+                delay = Duration::from_micros(f.rng.below(max.saturating_add(1)));
+            }
+        }
+        if g.cut.contains(&(from, to)) {
+            return Err(Unreachable::new(&std::io::Error::other("partitioned")));
+        }
+        let node = if request {
+            let raft = g.nodes.get(&to).cloned();
+            Some(raft.ok_or_else(|| Unreachable::new(&std::io::Error::other("node down")))?)
+        } else {
+            None
         };
-        let raft = result.map_err(|e| Unreachable::new(&std::io::Error::other(e)))?;
+        Ok((delay, node))
+    }
+
+    /// Sends a request: applies faults, then returns the target node. A message already on the
+    /// wire is still delivered to the node it was addressed to if a link is cut meanwhile.
+    async fn request(&self, from: NodeId, to: NodeId) -> Result<Raft, Unreachable<TypeConfig>> {
+        let (delay, node) = self.hop(from, to, true)?;
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        // Links may have been cut, or the node replaced, while the message was in flight; a
-        // message already on the wire is still delivered to the node it was addressed to.
-        Ok(raft)
+        node.ok_or_else(|| Unreachable::new(&std::io::Error::other("node down")))
+    }
+
+    /// Returns the response of a request that `from` sent to `to`, subject to the same faults.
+    async fn respond(&self, from: NodeId, to: NodeId) -> Result<(), Unreachable<TypeConfig>> {
+        let (delay, _) = self.hop(to, from, false)?;
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        Ok(())
     }
 }
 
@@ -227,8 +226,10 @@ impl RaftNetworkV2<TypeConfig> for Conn {
         rpc: AppendEntriesRequest<TypeConfig>,
         _o: RPCOption,
     ) -> Result<AppendResult<TypeConfig>, RpcError> {
-        let raft = self.net.target(self.from, self.to).await?;
-        raft.append_entries(rpc).await.map_err(unreachable)
+        let raft = self.net.request(self.from, self.to).await?;
+        let res = raft.append_entries(rpc).await.map_err(unreachable)?;
+        self.net.respond(self.from, self.to).await?;
+        Ok(res)
     }
 
     async fn vote(
@@ -236,8 +237,10 @@ impl RaftNetworkV2<TypeConfig> for Conn {
         rpc: VoteRequest<TypeConfig>,
         _o: RPCOption,
     ) -> Result<VoteResponse<TypeConfig>, RpcError> {
-        let raft = self.net.target(self.from, self.to).await?;
-        raft.vote(rpc).await.map_err(unreachable)
+        let raft = self.net.request(self.from, self.to).await?;
+        let res = raft.vote(rpc).await.map_err(unreachable)?;
+        self.net.respond(self.from, self.to).await?;
+        Ok(res)
     }
 
     async fn pre_vote(
@@ -245,8 +248,10 @@ impl RaftNetworkV2<TypeConfig> for Conn {
         rpc: VoteRequest<TypeConfig>,
         _o: RPCOption,
     ) -> Result<VoteResponse<TypeConfig>, RpcError> {
-        let raft = self.net.target(self.from, self.to).await?;
-        raft.pre_vote(rpc).await.map_err(unreachable)
+        let raft = self.net.request(self.from, self.to).await?;
+        let res = raft.pre_vote(rpc).await.map_err(unreachable)?;
+        self.net.respond(self.from, self.to).await?;
+        Ok(res)
     }
 
     async fn full_snapshot(
@@ -256,9 +261,12 @@ impl RaftNetworkV2<TypeConfig> for Conn {
         _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         _o: RPCOption,
     ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
-        let raft = self.net.target(self.from, self.to).await?;
-        raft.install_full_snapshot(vote, snapshot)
+        let raft = self.net.request(self.from, self.to).await?;
+        let res = raft
+            .install_full_snapshot(vote, snapshot)
             .await
-            .map_err(|e| StreamingError::from(Unreachable::new(&e)))
+            .map_err(|e| StreamingError::from(Unreachable::new(&e)))?;
+        self.net.respond(self.from, self.to).await?;
+        Ok(res)
     }
 }
