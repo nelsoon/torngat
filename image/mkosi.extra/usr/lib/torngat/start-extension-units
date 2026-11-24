@@ -1,0 +1,12 @@
+#!/bin/sh
+# Run after systemd-sysext merges at boot. The start-up transaction was computed before the
+# extension's units existed, so the daemon-reload after the merge does not start the units they
+# add to multi-user.target (torngatd). Start multi-user.target again so they are pulled in, but
+# only while booting towards it: not on a later refresh (an update must not start a torngatd an
+# operator stopped), and not when booting into rescue or emergency mode.
+case "$(systemctl is-system-running)" in
+  initializing | starting) ;;
+  *) exit 0 ;;
+esac
+systemctl list-jobs --no-legend multi-user.target | grep -q . || exit 0
+exec systemctl --no-block start multi-user.target
