@@ -2341,6 +2341,7 @@ dependencies = [
  "rcgen",
  "tokio",
  "torngat-agent",
+ "torngat-api",
  "torngat-apiserver",
  "torngat-controller",
  "torngat-store",

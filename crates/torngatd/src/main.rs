@@ -42,7 +42,7 @@ enum Cmd {
         /// File containing the bootstrap admin token (at least 32 characters).
         #[arg(long)]
         token_file: PathBuf,
-        /// Unprivileged user QEMU drops to when running as root.
+        /// Unprivileged user QEMU runs as. Required when running as root.
         #[arg(long)]
         qemu_user: Option<String>,
     },
@@ -59,13 +59,24 @@ fn write_private(path: &Path, data: &[u8]) -> Res<()> {
         .truncate(true)
         .mode(0o600)
         .open(path)?;
+    // `mode` only applies on creation: also fix permissions of a file that already existed.
+    use std::os::unix::fs::PermissionsExt;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     f.write_all(data)?;
     Ok(())
 }
 
 fn dev_certs(out: &Path, node: &str) -> Res<()> {
-    torngat_store::Key::new("x", [node]).map_err(|e| format!("invalid node name: {e}"))?;
-    std::fs::create_dir_all(out)?;
+    // Same rule the controller applies to the certificate's node name.
+    torngat_api::Name::new(node).map_err(|e| format!("invalid node name: {e}"))?;
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(out)?;
+        std::fs::set_permissions(out, std::fs::Permissions::from_mode(0o700))?;
+    }
     let mut p = CertificateParams::new(Vec::<String>::new())?;
     p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca = CertifiedIssuer::self_signed(p, KeyPair::generate()?)?;
@@ -126,8 +137,8 @@ async fn dev_single(
         key_pem: read("controller.key")?,
         client_ca_pem: read("ca.pem")?,
     };
-    tokio::spawn(torngat_controller::serve(ctl.clone(), listener, tls));
-    tokio::spawn(ctl.run_scheduler(Duration::from_millis(500)));
+    let controller = tokio::spawn(torngat_controller::serve(ctl.clone(), listener, tls));
+    let scheduler = tokio::spawn(ctl.run_scheduler(Duration::from_millis(500)));
 
     let runtime = torngat_agent::qemu::QemuRuntime::new(torngat_agent::qemu::QemuConfig {
         state_dir: data.join("instances"),
@@ -141,19 +152,29 @@ async fn dev_single(
         cert_pem: read("node.pem")?,
         key_pem: read("node.key")?,
     };
-    tokio::spawn(torngat_agent::run(agent, runtime));
+    let agent = tokio::spawn(torngat_agent::run(agent, runtime));
 
     let state = torngat_apiserver::AppState {
         store: store.clone(),
         token,
     };
     tracing::info!(%api, %control, "torngatd dev-single running");
-    tokio::select! {
-        r = torngat_apiserver::serve(api, state) => r?,
-        _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
+    // Any component stopping is fatal: never keep running half-alive.
+    let result: Res<()> = tokio::select! {
+        r = torngat_apiserver::serve(api, state) => r.map_err(Into::into),
+        r = controller => Err(format!("controller stopped: {r:?}").into()),
+        r = scheduler => Err(format!("scheduler stopped: {r:?}").into()),
+        r = agent => Err(format!("agent stopped: {r:?}").into()),
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("shutting down");
+            Ok(())
+        }
+    };
+    if let Err(e) = &result {
+        tracing::error!(error = %e, "torngatd stopping");
     }
     store.shutdown().await?;
-    Ok(())
+    result
 }
 
 #[tokio::main]

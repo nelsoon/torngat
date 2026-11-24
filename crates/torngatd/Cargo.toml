@@ -15,6 +15,7 @@ tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "net", "sig
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 torngat-agent = { path = "../agent" }
+torngat-api = { path = "../../api" }
 torngat-apiserver = { path = "../apiserver" }
 torngat-controller = { path = "../controller" }
 torngat-store = { path = "../store" }

@@ -3,16 +3,19 @@
 //! Each instance is a detached QEMU process (own session via `setsid -f`), so workloads survive
 //! agent restarts. QEMU's own `-daemonize` is not used: it is incompatible with the strict
 //! seccomp sandbox (`elevateprivileges=deny`) on current QEMU. Next step: one transient systemd
-//! unit per instance (cgroup limits, journald, supervision). State lives in
-//! `<state_dir>/<uid>/` (mode 0700): pidfile, QMP socket, serial console log. The agent finds its
-//! instances again by reading the pidfiles and checking `/proc/<pid>/cmdline`, which guards
+//! unit per instance (cgroup limits, journald, supervision, per-instance users).
+//!
+//! State lives in `<state_dir>/<uid>/` (mode 0700, owned by the QEMU user): pidfile, QMP socket,
+//! console and QEMU logs. `<state_dir>` itself is 0711 (traversable, not listable). The agent finds
+//! its instances again by reading the pidfiles and checking `/proc/<pid>/cmdline`, which guards
 //! against PID reuse.
 //!
 //! Security:
 //! - arguments are built only from validated, bounded fields (uid, vcpus, memory), never from
-//!   user strings;
-//! - QEMU runs with its seccomp sandbox (`-sandbox on,...`), no default devices, no user config,
-//!   and drops to an unprivileged user when started as root (`-run-with user=`).
+//!   tenant strings;
+//! - QEMU runs with its seccomp sandbox (`-sandbox on,...`), no default devices, no user config;
+//! - when the agent runs as root, QEMU is started through `setpriv` as an unprivileged user and
+//!   never runs as root; starting as root without such a user is refused.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -29,10 +32,14 @@ pub struct QemuConfig {
     pub qemu: PathBuf,
     /// `setsid` from util-linux, used to detach QEMU into its own session.
     pub setsid: PathBuf,
+    /// `setpriv` from util-linux, used to drop to `run_as` before QEMU starts.
+    pub setpriv: PathBuf,
+    /// `kill`, used as a last resort on a verified QEMU pid.
+    pub kill: PathBuf,
     pub state_dir: PathBuf,
-    /// Unprivileged user QEMU switches to when the agent runs as root.
+    /// Unprivileged user QEMU runs as. Required when the agent runs as root.
     pub run_as: Option<String>,
-    /// Time allowed for a guest to power off before it is killed.
+    /// Time allowed for a guest to power off before it is forced.
     pub stop_timeout: Duration,
 }
 
@@ -41,6 +48,8 @@ impl Default for QemuConfig {
         Self {
             qemu: PathBuf::from("/usr/bin/qemu-system-x86_64"),
             setsid: PathBuf::from("/usr/bin/setsid"),
+            setpriv: PathBuf::from("/usr/bin/setpriv"),
+            kill: PathBuf::from("/usr/bin/kill"),
             state_dir: PathBuf::from("/var/lib/torngat/instances"),
             run_as: None,
             stop_timeout: Duration::from_secs(10),
@@ -48,33 +57,99 @@ impl Default for QemuConfig {
     }
 }
 
+/// A resolved unprivileged account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Account {
+    uid: u32,
+    gid: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct QemuRuntime {
     cfg: QemuConfig,
+    account: Option<Account>,
 }
 
 /// Maximum length of a UNIX socket path, including the terminating NUL (Linux `sun_path`).
 const MAX_UNIX_PATH: usize = 108;
+/// Bound on every QMP exchange.
+const QMP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Time allowed for QEMU to come up and answer on QMP.
+const START_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Capabilities this runtime can provide today.
 const SUPPORTED: &[Capability] = &[Capability::LiveMigratable];
+
+fn invalid(msg: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)
+}
+
+/// Effective uid of this process, from /proc (no unsafe code).
+fn effective_uid() -> std::io::Result<u32> {
+    let s = std::fs::read_to_string("/proc/self/status")?;
+    s.lines()
+        .find_map(|l| l.strip_prefix("Uid:"))
+        .and_then(|v| v.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| invalid("cannot read effective uid".into()))
+}
+
+/// Looks up a user in /etc/passwd. Refuses root and malformed names.
+fn lookup_account(user: &str) -> std::io::Result<Account> {
+    if user.is_empty()
+        || !user
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(invalid(format!("invalid user name {user:?}")));
+    }
+    let passwd = std::fs::read_to_string("/etc/passwd")?;
+    for line in passwd.lines() {
+        let f: Vec<&str> = line.split(':').collect();
+        if f.len() >= 4 && f[0] == user {
+            let (uid, gid) = (f[2].parse(), f[3].parse());
+            if let (Ok(uid), Ok(gid)) = (uid, gid) {
+                if uid == 0 || gid == 0 {
+                    return Err(invalid(format!("user {user} is privileged")));
+                }
+                return Ok(Account { uid, gid });
+            }
+        }
+    }
+    Err(invalid(format!("user {user} not found")))
+}
 
 impl QemuRuntime {
     pub fn new(cfg: QemuConfig) -> std::io::Result<Self> {
         // `<state_dir>/<uuid>/qmp.sock` must fit in a UNIX socket path (108 bytes incl. NUL).
         let suffix = "/".len() + 36 + "/qmp.sock".len();
         if cfg.state_dir.as_os_str().len() + suffix >= MAX_UNIX_PATH {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "state dir {} is too long for QEMU control sockets (max {} bytes)",
-                    cfg.state_dir.display(),
-                    MAX_UNIX_PATH - 1 - suffix
-                ),
-            ));
+            return Err(invalid(format!(
+                "state dir {} is too long for QEMU control sockets (max {} bytes)",
+                cfg.state_dir.display(),
+                MAX_UNIX_PATH - 1 - suffix
+            )));
         }
-        create_private_dir(&cfg.state_dir)?;
-        Ok(Self { cfg })
+        // Paths end up inside QEMU option strings, where ',' is a separator.
+        let path = cfg
+            .state_dir
+            .to_str()
+            .ok_or_else(|| invalid("state dir is not UTF-8".into()))?;
+        if path.contains(',') {
+            return Err(invalid("state dir must not contain ','".into()));
+        }
+        let account = match (&cfg.run_as, effective_uid()?) {
+            (Some(u), 0) => Some(lookup_account(u)?),
+            (None, 0) => {
+                return Err(invalid(
+                    "refusing to run QEMU as root: configure an unprivileged QEMU user".into(),
+                ));
+            }
+            // Not root: QEMU simply runs as this (unprivileged) user.
+            (_, _) => None,
+        };
+        make_dir(&cfg.state_dir, 0o711, None)?;
+        Ok(Self { cfg, account })
     }
 
     fn dir(&self, uid: Uuid) -> PathBuf {
@@ -86,7 +161,7 @@ impl QemuRuntime {
         let uid = inst.metadata.uid;
         let dir = self.dir(uid);
         let p = |f: &str| dir.join(f).display().to_string();
-        let mut a = vec![
+        vec![
             "-name".into(),
             format!("guest={uid},debug-threads=on"),
             "-uuid".into(),
@@ -103,20 +178,17 @@ impl QemuRuntime {
             "-no-user-config".into(),
             "-display".into(),
             "none".into(),
+            "-chardev".into(),
+            format!("file,id=console,path={},append=on", p("console.log")),
             "-serial".into(),
-            format!("file:{}", p("console.log")),
+            "chardev:console".into(),
             "-qmp".into(),
             format!("unix:{},server=on,wait=off", p("qmp.sock")),
             "-pidfile".into(),
             p("qemu.pid"),
             "-sandbox".into(),
             "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny".into(),
-        ];
-        if let Some(user) = &self.cfg.run_as {
-            a.push("-run-with".into());
-            a.push(format!("user={user}"));
-        }
-        a
+        ]
     }
 
     fn pid(&self, uid: Uuid) -> Option<u32> {
@@ -134,18 +206,26 @@ impl QemuRuntime {
         ours.then_some(pid)
     }
 
-    async fn qmp(&self, uid: Uuid, command: &str) -> std::io::Result<()> {
-        let s = UnixStream::connect(self.dir(uid).join("qmp.sock")).await?;
-        let (r, mut w) = s.into_split();
-        let mut lines = BufReader::new(r).lines();
-        let _greeting = lines.next_line().await?;
-        w.write_all(b"{\"execute\":\"qmp_capabilities\"}\n").await?;
-        let _ = lines.next_line().await?;
-        // `command` is one of our constants, never user input.
-        w.write_all(format!("{{\"execute\":\"{command}\"}}\n").as_bytes())
-            .await?;
-        let _ = lines.next_line().await;
-        Ok(())
+    /// Runs one QMP command (one of our constants, never user input) with a timeout.
+    async fn qmp(&self, uid: Uuid, command: &'static str) -> std::io::Result<()> {
+        let sock = self.dir(uid).join("qmp.sock");
+        tokio::time::timeout(QMP_TIMEOUT, async move {
+            let s = UnixStream::connect(sock).await?;
+            let (r, mut w) = s.into_split();
+            let mut lines = BufReader::new(r).lines();
+            let _greeting = lines.next_line().await?;
+            w.write_all(b"{\"execute\":\"qmp_capabilities\"}\n").await?;
+            let _ = lines.next_line().await?;
+            w.write_all(format!("{{\"execute\":\"{command}\"}}\n").as_bytes())
+                .await?;
+            let reply = lines.next_line().await?.unwrap_or_default();
+            if reply.contains("\"error\"") {
+                return Err(std::io::Error::other(format!("qmp {command} failed")));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| std::io::Error::other("qmp timed out"))?
     }
 
     async fn wait_gone(&self, uid: Uuid, timeout: Duration) -> bool {
@@ -158,15 +238,36 @@ impl QemuRuntime {
         }
         self.pid(uid).is_none()
     }
+
+    /// Sends a signal to the verified QEMU pid of `uid`.
+    async fn signal(&self, uid: Uuid, sig: &'static str) {
+        if let Some(pid) = self.pid(uid) {
+            let _ = tokio::process::Command::new(&self.cfg.kill)
+                .args([sig, &pid.to_string()])
+                .status()
+                .await;
+        }
+    }
+
+    fn log_tail(&self, uid: Uuid) -> String {
+        let s = std::fs::read_to_string(self.dir(uid).join("qemu.log")).unwrap_or_default();
+        let mut lines: Vec<&str> = s.lines().rev().take(5).collect();
+        lines.reverse();
+        lines.join(" | ")
+    }
 }
 
-fn create_private_dir(p: &Path) -> std::io::Result<()> {
+/// Creates `p` with `mode` (and owner, if given), fixing them if it already exists.
+fn make_dir(p: &Path, mode: u32, owner: Option<Account>) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     std::fs::DirBuilder::new()
         .recursive(true)
-        .mode(0o700)
+        .mode(mode)
         .create(p)?;
-    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))
+    if let Some(a) = owner {
+        std::os::unix::fs::chown(p, Some(a.uid), Some(a.gid))?;
+    }
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))
 }
 
 impl Runtime for QemuRuntime {
@@ -191,12 +292,35 @@ impl Runtime for QemuRuntime {
             return Ok(());
         }
         let dir = self.dir(uid);
-        create_private_dir(&dir).map_err(|e| format!("state dir: {e}"))?;
+        make_dir(&dir, 0o700, self.account).map_err(|e| format!("state dir: {e}"))?;
         let _ = std::fs::remove_file(dir.join("qemu.pid"));
-        let log = std::fs::File::create(dir.join("qemu.log")).map_err(|e| format!("log: {e}"))?;
+        let _ = std::fs::remove_file(dir.join("qmp.sock"));
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("qemu.log"))
+            .map_err(|e| format!("log: {e}"))?;
+        if let Some(a) = self.account {
+            std::os::unix::fs::chown(dir.join("qemu.log"), Some(a.uid), Some(a.gid))
+                .map_err(|e| format!("log: {e}"))?;
+        }
         let log2 = log.try_clone().map_err(|e| format!("log: {e}"))?;
-        let status = tokio::process::Command::new(&self.cfg.setsid)
-            .arg("-f")
+
+        let mut cmd = tokio::process::Command::new(&self.cfg.setsid);
+        cmd.arg("-f");
+        if let Some(a) = self.account {
+            // Drop to the QEMU user before exec: QEMU never runs as root.
+            cmd.arg(&self.cfg.setpriv).args([
+                format!("--reuid={}", a.uid),
+                format!("--regid={}", a.gid),
+                "--clear-groups".into(),
+                "--inh-caps=-all".into(),
+                "--bounding-set=-all".into(),
+                "--no-new-privs".into(),
+                "--".into(),
+            ]);
+        }
+        let status = cmd
             .arg(&self.cfg.qemu)
             .args(self.args(inst))
             .stdin(std::process::Stdio::null())
@@ -208,32 +332,40 @@ impl Runtime for QemuRuntime {
         if !status.success() {
             return Err("cannot detach qemu".into());
         }
-        // QEMU writes its pidfile early in startup; give it a moment, then report its own error.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+        // Running = the process is ours and answers on QMP (it can still die after writing its
+        // pidfile, e.g. when memory or KVM initialisation fails).
+        let deadline = tokio::time::Instant::now() + START_TIMEOUT;
         while tokio::time::Instant::now() < deadline {
-            if self.pid(uid).is_some() {
+            if self.pid(uid).is_some() && self.qmp(uid, "query-status").await.is_ok() {
                 return Ok(());
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let err = std::fs::read_to_string(dir.join("qemu.log")).unwrap_or_default();
-        let tail: String = err.lines().rev().take(5).collect::<Vec<_>>().join(" | ");
-        Err(format!("qemu failed to start: {tail}"))
+        // Do not leave a half-started VM behind.
+        self.signal(uid, "-KILL").await;
+        Err(format!("qemu failed to start: {}", self.log_tail(uid)))
     }
 
     async fn stop(&self, uid: Uuid) -> Result<(), String> {
         if self.pid(uid).is_none() {
             return Ok(());
         }
-        // Ask the guest politely, then insist.
+        // Ask the guest, then QEMU, then the kernel.
         let _ = self.qmp(uid, "system_powerdown").await;
         if !self.wait_gone(uid, self.cfg.stop_timeout).await {
             let _ = self.qmp(uid, "quit").await;
             if !self.wait_gone(uid, Duration::from_secs(5)).await {
-                return Err("qemu did not stop".into());
+                self.signal(uid, "-TERM").await;
+                if !self.wait_gone(uid, Duration::from_secs(5)).await {
+                    self.signal(uid, "-KILL").await;
+                    if !self.wait_gone(uid, Duration::from_secs(5)).await {
+                        return Err("qemu did not stop".into());
+                    }
+                }
             }
         }
-        // Keep the console log for debugging; drop the rest.
+        // Keep the logs for debugging; drop the rest.
         let dir = self.dir(uid);
         let _ = std::fs::remove_file(dir.join("qmp.sock"));
         let _ = std::fs::remove_file(dir.join("qemu.pid"));
@@ -310,7 +442,7 @@ mod tests {
         assert!(!a.iter().any(|x| x.contains("vm-1")));
         let mode = std::fs::metadata(d.path()).unwrap();
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(mode.permissions().mode() & 0o777, 0o700);
+        assert_eq!(mode.permissions().mode() & 0o777, 0o711);
     }
 
     #[test]
@@ -323,6 +455,20 @@ mod tests {
         .unwrap_err();
         assert!(e.to_string().contains("too long"), "{e}");
         assert!(QemuConfig::default().state_dir.as_os_str().len() < 60);
+        let comma = QemuRuntime::new(QemuConfig {
+            state_dir: PathBuf::from("/tmp/a,b"),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(comma.to_string().contains("','"), "{comma}");
+    }
+
+    #[test]
+    fn account_lookup_refuses_root_and_bad_names() {
+        assert!(lookup_account("root").is_err());
+        assert!(lookup_account("a b").is_err());
+        assert!(lookup_account("x,user=root").is_err());
+        assert!(lookup_account("no-such-user-torngat").is_err());
     }
 
     #[tokio::test]
