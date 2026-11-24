@@ -12,7 +12,7 @@ publish = false
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 subtle = "2.6"
 thiserror.workspace = true
 time.workspace = true
