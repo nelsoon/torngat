@@ -296,6 +296,25 @@ async fn a_lost_answer_can_be_retried_with_the_same_key() {
         join(&e.join, &text, &n("n2")).await.unwrap_err(),
         JoinError::Refused(_)
     ));
+    // Only shortly after enrollment: it is a retry, not a token-less renewal.
+    let ikey = keys::node_identity(&n("n2")).unwrap();
+    let v = e.store.get(&ikey).await.unwrap().unwrap();
+    let mut rec: torngat_pki::NodeIdentity = serde_json::from_slice(&v.value).unwrap();
+    rec.issue_time -= torngat_controller::join::RETRY_WINDOW;
+    e.store
+        .put(
+            ikey,
+            serde_json::to_vec(&rec).unwrap(),
+            Precondition::Revision(v.revision),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        torngat_agent::join::join(&e.join, &text, &n("n2"), &key)
+            .await
+            .unwrap_err(),
+        JoinError::Refused(_)
+    ));
     e.store.shutdown().await.unwrap();
 }
 

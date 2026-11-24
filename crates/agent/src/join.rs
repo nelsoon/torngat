@@ -183,7 +183,7 @@ pub async fn join(
     let ca_der = discover_ca(addr, pin).await?;
     let ca_pem = pem::encode(&pem::Pem::new("CERTIFICATE", ca_der.to_vec()));
 
-    let key = rcgen::KeyPair::from_pem(key_pem).map_err(torngat_pki::PkiError::from)?;
+    let key = torngat_pki::ca::parse_node_key(key_pem)?;
     let csr = torngat_pki::ca::node_csr(&key)?;
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(&ca_pem))

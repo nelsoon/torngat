@@ -312,13 +312,20 @@ async fn join(
     private_dir(&ident)?;
     // The key is saved before joining, so a join whose answer was lost can simply be re-run.
     let key_path = ident.join("node.key");
-    let key_pem = if key_path.exists() {
-        println!("Resuming with the existing key in {}.", key_path.display());
-        std::fs::read_to_string(&key_path)?
-    } else {
-        let pem = torngat_pki::ca::node_key()?.serialize_pem();
-        write_private(&key_path, pem.as_bytes())?;
-        pem
+    // An unreadable key (e.g. a crash while writing it) cannot have joined: replace it.
+    let existing = std::fs::read_to_string(&key_path)
+        .ok()
+        .filter(|pem| torngat_pki::ca::parse_node_key(pem).is_ok());
+    let key_pem = match existing {
+        Some(pem) => {
+            println!("Resuming with the existing key in {}.", key_path.display());
+            pem
+        }
+        None => {
+            let pem = torngat_pki::ca::node_key()?.serialize_pem();
+            replace_private(&key_path, pem.as_bytes())?;
+            pem
+        }
     };
     let enrolled = torngat_agent::join::join(&join_addr, token.trim(), &name, &key_pem).await?;
     replace_private(&ident.join("ca.pem"), enrolled.ca_pem.as_bytes())?;

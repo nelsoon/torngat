@@ -8,7 +8,8 @@
 //!    join took the name in between, the token is put back.
 //!
 //! Retries: a node whose join committed but whose response was lost retries with the same key.
-//! A CSR for exactly the enrolled key gets a fresh certificate without a token. That is safe: the
+//! Within [`RETRY_WINDOW`] of enrollment, a CSR for exactly the enrolled key gets a fresh
+//! certificate without a token. That is safe: the
 //! certificate is useless without the private key, and the CSR signature proves the caller holds
 //! it.
 
@@ -29,6 +30,8 @@ use crate::service::{internal, store_err};
 
 /// Largest join request accepted (a CSR is well under 1 KiB).
 pub const MAX_JOIN_REQUEST: usize = 16 * 1024;
+/// How long after enrolling a node may fetch its certificate again without a token (lost answer).
+pub const RETRY_WINDOW: time::Duration = time::Duration::hours(1);
 /// Join requests handled at once across all callers; more are shed.
 pub const MAX_CONCURRENT_JOINS: usize = 16;
 
@@ -77,21 +80,26 @@ impl Join for JoinService {
             return Err(denied());
         }
 
-        // Pure checks first: the CSR (signature, key type) and what it would be issued as.
-        let issued = self
-            .ca
-            .sign_node_csr(&r.csr_der, &node)
+        // Pure checks first: the CSR (signature, key type). Nothing is signed before the caller is
+        // authorized.
+        let spki = torngat_pki::ca::csr_spki_sha256(&r.csr_der)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let ident = issued.identity(KeyStorage::File).map_err(internal)?;
+        let issue = || {
+            self.ca
+                .sign_node_csr(&r.csr_der, &node)
+                .map_err(|e| Status::invalid_argument(e.to_string()))
+        };
 
-        // A retry of a join that already committed, with the same key.
+        // A retry of a join that committed moments ago, with the same key. Bounded in time, so it
+        // is not a token-less renewal path.
         let ikey = keys::node_identity(&node).map_err(internal)?;
         if let Some(v) = self.store.get(&ikey).await.map_err(store_err)? {
             let cur: NodeIdentity = serde_json::from_slice(&v.value).map_err(internal)?;
-            if torngat_pki::digest_eq(&cur.spki_sha256, &ident.spki_sha256) {
+            let recent = OffsetDateTime::now_utc() - cur.issue_time < RETRY_WINDOW;
+            if recent && torngat_pki::digest_eq(&cur.spki_sha256, &spki) {
                 tracing::info!(%node, ?peer, "node certificate re-issued for its enrolled key");
                 return Ok(Response::new(JoinResponse {
-                    cert_chain_pem: issued.chain_pem,
+                    cert_chain_pem: issue()?.chain_pem,
                 }));
             }
         }
@@ -113,6 +121,8 @@ impl Join for JoinService {
             return Err(Status::already_exists("node name is already in use"));
         }
 
+        let issued = issue()?;
+        let ident = issued.identity(KeyStorage::File).map_err(internal)?;
         match self
             .store
             .delete(tkey.clone(), Precondition::Revision(tv.revision))
