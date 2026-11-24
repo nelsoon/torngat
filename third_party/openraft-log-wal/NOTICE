@@ -6,3 +6,5 @@ contributors. Local changes, if any, are listed below.
 Local changes:
 - Cargo.toml rewritten to use crates.io dependencies instead of workspace paths.
 - range_boundary: saturating_add instead of `+ 1` to avoid overflow at u64::MAX.
+- WalLogStore::released: a signal that fires once the last clone is dropped and the directory
+  lock is released, so a caller can reopen the directory without polling.

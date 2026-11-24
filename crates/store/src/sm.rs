@@ -21,7 +21,7 @@ use openraft::type_config::TypeConfigExt;
 use openraft::{EntryPayload, RaftSnapshotBuilder};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 
 use crate::key::{Key, Prefix};
 use crate::types::{Command, Precondition, Response, TypeConfig, Versioned};
@@ -54,6 +54,15 @@ pub(crate) enum Signal {
     Closed,
 }
 
+/// Senders dropped together with the last clone of a [`StateMachine`], after its database
+/// handles, to tell waiters the database lock is free.
+#[derive(Default)]
+struct Released(Mutex<Vec<oneshot::Sender<()>>>);
+
+/// The state machine. Cloning shares the database.
+///
+/// `released` is declared last: fields drop in declaration order, so by the time the last
+/// clone drops it, that clone's database handles are gone.
 #[derive(Clone)]
 pub struct StateMachine {
     db: Database,
@@ -62,6 +71,7 @@ pub struct StateMachine {
     snapshot: Keyspace,
     snapshot_lock: Arc<Mutex<()>>,
     events: broadcast::Sender<Signal>,
+    released: Arc<Released>,
 }
 
 impl std::fmt::Debug for StateMachine {
@@ -86,7 +96,20 @@ impl StateMachine {
             snapshot,
             snapshot_lock: Arc::default(),
             events,
+            released: Arc::default(),
         })
+    }
+
+    /// A receiver that completes once every clone of this state machine, and every snapshot
+    /// view taken from it, is dropped and the database lock is free again.
+    pub fn released(&self) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        self.released
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(tx);
+        rx
     }
 
     /// Reads a key from local state. Callers needing linearizability must first confirm
@@ -130,11 +153,7 @@ impl StateMachine {
             if !under {
                 continue;
             }
-            let key = std::str::from_utf8(&k)
-                .ok()
-                .and_then(|s| Key::try_from(s.to_owned()).ok())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid stored key"))?;
-            out.push((key, deserialize(&v)?));
+            out.push(decode_entry(&k, &v)?);
             if out.len() >= limit {
                 break;
             }
@@ -150,22 +169,9 @@ impl StateMachine {
         let mut out = Vec::new();
         for item in view.iter(&self.data) {
             let (k, v) = item.into_inner().map_err(io::Error::other)?;
-            let key = std::str::from_utf8(&k)
-                .ok()
-                .and_then(|s| Key::try_from(s.to_owned()).ok())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid stored key"))?;
-            out.push((key, deserialize(&v)?));
+            out.push(decode_entry(&k, &v)?);
         }
         Ok(out)
-    }
-
-    /// Index of the last applied log entry, from local state.
-    #[cfg(feature = "test-util")]
-    pub fn applied_index(&self) -> io::Result<Option<u64>> {
-        Ok(self
-            .read_applied(&self.db.snapshot())?
-            .last_log_id
-            .map(|id| id.index()))
     }
 
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<Signal> {
@@ -375,8 +381,8 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
 
     async fn get_snapshot_builder(&mut self) -> SnapshotBuilder {
         SnapshotBuilder {
-            sm: self.clone(),
             view: self.db.snapshot(),
+            sm: self.clone(),
         }
     }
 
@@ -411,8 +417,9 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
 }
 
 pub struct SnapshotBuilder {
-    sm: StateMachine,
+    // The view comes first so it is dropped before `sm` can signal that the database is free.
     view: fjall::Snapshot,
+    sm: StateMachine,
 }
 
 impl std::fmt::Debug for SnapshotBuilder {
@@ -428,9 +435,15 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
         let sm = self.sm.clone();
         let view = self.view.clone();
         TypeConfig::spawn_blocking(move || {
-            let meta = sm.read_applied(&view)?;
-            let data = sm.encode_data(&view)?;
-            sm.save_built_snapshot(&meta, &data)?;
+            let built = (|| {
+                let meta = sm.read_applied(&view)?;
+                let data = sm.encode_data(&view)?;
+                sm.save_built_snapshot(&meta, &data)?;
+                io::Result::Ok((meta, data))
+            })();
+            // Release the view before the state machine handle (see `StateMachine`).
+            drop(view);
+            let (meta, data) = built?;
             Ok(SnapshotOf::<TypeConfig, Self::SnapshotData> {
                 meta,
                 snapshot: Cursor::new(data),
@@ -438,6 +451,15 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
         })
         .await?
     }
+}
+
+/// Decodes one stored key and value, revalidating the key.
+fn decode_entry(k: &[u8], v: &[u8]) -> io::Result<(Key, Versioned)> {
+    let key = std::str::from_utf8(k)
+        .ok()
+        .and_then(|s| Key::try_from(s.to_owned()).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid stored key"))?;
+    Ok((key, deserialize(v)?))
 }
 
 fn read<T: DeserializeOwned, R: Readable>(
