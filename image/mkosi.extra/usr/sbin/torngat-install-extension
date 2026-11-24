@@ -24,11 +24,11 @@ policy=root=signed+absent:usr=signed+absent
 mkdir -p "$dir"
 cp -- "$1" "$tmp"
 sync "$tmp"
-# Refuse what is plainly wrong (unsigned, unknown key, damaged) before touching the live
-# extension; the rollback below covers what only the merge itself finds.
+# Refuse unsigned, unprotected or unreadable images before touching the live extension. This does
+# not check that the signing key is trusted: the merge does, and the rollback below covers it.
 if ! systemd-dissect --validate --image-policy="$policy" "$tmp" >/dev/null; then
   rm -f "$tmp"
-  echo "torngat-install-extension: $1 is not a valid signed extension" >&2
+  echo "torngat-install-extension: $1 is not a signed extension image" >&2
   exit 1
 fi
 rm -f "$prev"
