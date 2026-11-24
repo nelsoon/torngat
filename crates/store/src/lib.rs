@@ -217,6 +217,20 @@ impl Store {
         }
     }
 
+    /// Every key in this replica's state machine, without a linearizable read: whatever this
+    /// replica has applied so far. For simulation checkers; not part of the production API.
+    #[cfg(feature = "test-util")]
+    pub fn local_dump(&self) -> std::io::Result<Vec<(Key, Versioned)>> {
+        self.sm.dump()
+    }
+
+    /// Index of the last log entry this replica's state machine applied (see
+    /// [`Store::local_dump`]).
+    #[cfg(feature = "test-util")]
+    pub fn local_applied_index(&self) -> std::io::Result<Option<u64>> {
+        self.sm.applied_index()
+    }
+
     pub async fn shutdown(&self) -> Result<(), StoreError> {
         self.sm.close();
         self.raft
