@@ -94,11 +94,13 @@ mod tests {
 
     #[test]
     fn kdfa_lengths_and_determinism() {
-        let a = kdfa(b"k", "STORAGE", b"n", b"", 128);
+        #[allow(clippy::unwrap_used)]
+        let k = torngat_pki::random::<32>().unwrap();
+        let a = kdfa(&k, "STORAGE", b"n", b"", 128);
         assert_eq!(a.len(), 16);
-        assert_eq!(a, kdfa(b"k", "STORAGE", b"n", b"", 128));
-        assert_ne!(a, kdfa(b"k", "INTEGRITY", b"n", b"", 128));
-        assert_eq!(kdfa(b"k", "X", b"", b"", 256).len(), 32);
-        assert_eq!(kdfa(b"k", "X", b"", b"", 512).len(), 64);
+        assert_eq!(a, kdfa(&k, "STORAGE", b"n", b"", 128));
+        assert_ne!(a, kdfa(&k, "INTEGRITY", b"n", b"", 128));
+        assert_eq!(kdfa(&k, "X", b"", b"", 256).len(), 32);
+        assert_eq!(kdfa(&k, "X", b"", b"", 512).len(), 64);
     }
 }
