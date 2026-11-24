@@ -56,7 +56,7 @@ struct PendingJoin {
     csr_der: Vec<u8>,
     token_key: Key,
     token: Versioned,
-    token_id: String,
+    token_rec: JoinTokenRecord,
     ek_sha256: String,
     expires: Instant,
 }
@@ -212,6 +212,11 @@ impl Join for JoinService {
         let (tkey, tv, rec) = self
             .check_token(&r.token_id, &r.token_secret, &node)
             .await?;
+        if rec.ek_sha256.is_some() {
+            return Err(Status::failed_precondition(
+                "this token is for one specific TPM: join with that TPM",
+            ));
+        }
         let issued = self.issue(&r.csr_der, &node)?;
         let ident = issued.identity(KeyStorage::File).map_err(internal)?;
         self.consume_and_enroll(tkey, tv, &rec.id, &node, &ident)
@@ -272,7 +277,8 @@ impl Join for JoinService {
         {
             let mut p = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
             let now = Instant::now();
-            p.retain(|_, j| j.expires > now);
+            // At most one open challenge per token: a token holder cannot fill the table.
+            p.retain(|_, j| j.expires > now && j.token_rec.id != rec.id);
             if p.len() >= MAX_CHALLENGES {
                 return Err(Status::resource_exhausted(
                     "too many joins in progress, retry",
@@ -286,7 +292,7 @@ impl Join for JoinService {
                     csr_der: r.csr_der,
                     token_key: tkey,
                     token: tv,
-                    token_id: rec.id,
+                    token_rec: rec,
                     ek_sha256: ek.spki_sha256,
                     expires: now + CHALLENGE_TTL,
                 },
@@ -318,18 +324,22 @@ impl Join for JoinService {
             .attest
             .finish(&r.activated_secret, &r.certify_attest, &r.certify_signature)
             .map_err(|e| Status::permission_denied(format!("TPM attestation refused: {e}")))?;
+        // The token must still be valid now, not only when the challenge began.
+        if pending.token_rec.expired(OffsetDateTime::now_utc()) {
+            return Err(denied());
+        }
         let issued = self.issue(&pending.csr_der, &pending.node)?;
         let mut ident = issued.identity(KeyStorage::Tpm).map_err(internal)?;
         ident.ek_sha256 = Some(pending.ek_sha256.clone());
         self.consume_and_enroll(
             pending.token_key,
             pending.token,
-            &pending.token_id,
+            &pending.token_rec.id,
             &pending.node,
             &ident,
         )
         .await?;
-        tracing::info!(node = %pending.node, token = %pending.token_id, ?peer, key = "tpm",
+        tracing::info!(node = %pending.node, token = %pending.token_rec.id, ?peer, key = "tpm",
             ek = %pending.ek_sha256, "node enrolled");
         Ok(response(issued))
     }
