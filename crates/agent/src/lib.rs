@@ -10,11 +10,13 @@ pub mod inventory;
 pub mod join;
 pub mod qemu;
 pub mod runtime;
+#[cfg(feature = "tpm")]
+pub mod tpm;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
+use tonic::transport::Channel;
 use torngat_api::Scope;
 use torngat_api::compute::{Instance, PowerState, Runtime as RuntimeKind};
 use torngat_proto::API_VERSION;
@@ -26,6 +28,26 @@ pub use runtime::{FakeRuntime, Runtime};
 
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(2);
 
+/// The node's private key.
+#[derive(Clone)]
+pub enum NodeKey {
+    /// PKCS#8 PEM, from a file (lower assurance).
+    File(Vec<u8>),
+    /// Held by the TPM; never leaves it.
+    #[cfg(feature = "tpm")]
+    Tpm(tpm::TpmKey),
+}
+
+impl std::fmt::Debug for NodeKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeKey::File(_) => f.write_str("NodeKey::File(<redacted>)"),
+            #[cfg(feature = "tpm")]
+            NodeKey::Tpm(k) => write!(f, "NodeKey::Tpm({k:?})"),
+        }
+    }
+}
+
 /// Where and how to reach the controller.
 #[derive(Clone)]
 pub struct AgentConfig {
@@ -34,8 +56,9 @@ pub struct AgentConfig {
     /// Name the controller's certificate is issued for.
     pub controller_name: String,
     pub ca_pem: Vec<u8>,
+    /// Node certificate chain (PEM).
     pub cert_pem: Vec<u8>,
-    pub key_pem: Vec<u8>,
+    pub key: NodeKey,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -54,18 +77,91 @@ pub enum AgentError {
     Rpc(#[from] tonic::Status),
     #[error("encoding: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("tls: {0}")]
+    Tls(String),
 }
 
-async fn connect(cfg: &AgentConfig) -> Result<ControlClient<Channel>, AgentError> {
-    let tls = ClientTlsConfig::new()
-        .ca_certificate(Certificate::from_pem(&cfg.ca_pem))
-        .identity(Identity::from_pem(&cfg.cert_pem, &cfg.key_pem))
-        .domain_name(cfg.controller_name.clone());
-    let channel = Channel::from_shared(cfg.controller_url.clone())
-        .map_err(|e| AgentError::Rpc(tonic::Status::invalid_argument(e.to_string())))?
-        .tls_config(tls)?
+fn tls_err(e: impl std::fmt::Display) -> AgentError {
+    AgentError::Tls(e.to_string())
+}
+
+/// Always presents the one node certificate.
+#[cfg(feature = "tpm")]
+#[derive(Debug)]
+struct NodeCert(std::sync::Arc<rustls::sign::CertifiedKey>);
+
+#[cfg(feature = "tpm")]
+impl rustls::client::ResolvesClientCert for NodeCert {
+    fn resolve(
+        &self,
+        _hints: &[&[u8]],
+        _schemes: &[rustls::SignatureScheme],
+    ) -> Option<std::sync::Arc<rustls::sign::CertifiedKey>> {
+        Some(self.0.clone())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
+/// mTLS client configuration: trust only the cluster CA, authenticate with the node key.
+fn client_tls(cfg: &AgentConfig) -> Result<rustls::ClientConfig, AgentError> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::sync::Arc;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    for c in CertificateDer::pem_slice_iter(&cfg.ca_pem) {
+        roots.add(c.map_err(tls_err)?).map_err(tls_err)?;
+    }
+    let chain = CertificateDer::pem_slice_iter(&cfg.cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(tls_err)?;
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(tls_err)?
+        .with_root_certificates(roots);
+    let mut config = match &cfg.key {
+        NodeKey::File(pem) => {
+            let key = PrivateKeyDer::from_pem_slice(pem).map_err(tls_err)?;
+            builder.with_client_auth_cert(chain, key).map_err(tls_err)?
+        }
+        #[cfg(feature = "tpm")]
+        NodeKey::Tpm(k) => {
+            let signing = Arc::new(tpm::TlsKey(k.clone()));
+            builder.with_client_cert_resolver(Arc::new(NodeCert(Arc::new(
+                rustls::sign::CertifiedKey::new(chain, signing),
+            ))))
+        }
+    };
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    Ok(config)
+}
+
+/// Opens the mTLS control channel to the controller.
+pub async fn connect(cfg: &AgentConfig) -> Result<ControlClient<Channel>, AgentError> {
+    let addr = cfg
+        .controller_url
+        .strip_prefix("https://")
+        .ok_or_else(|| tls_err("controller_url must start with https://"))?
+        .trim_end_matches('/')
+        .to_owned();
+    let name =
+        rustls::pki_types::ServerName::try_from(cfg.controller_name.clone()).map_err(tls_err)?;
+    let tls = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_tls(cfg)?));
+    // TLS is done here (tonic's own TLS cannot use a TPM-held key), so tonic sees plain h2.
+    let connector = tower::service_fn(move |_: tonic::codegen::http::Uri| {
+        let (tls, name, addr) = (tls.clone(), name.clone(), addr.clone());
+        async move {
+            let tcp = tokio::net::TcpStream::connect(&addr).await?;
+            let stream = tls.connect(name, tcp).await?;
+            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+        }
+    });
+    let channel = tonic::transport::Endpoint::from_static("http://controller.invalid")
         .connect_timeout(Duration::from_secs(5))
-        .connect()
+        .connect_with_connector(connector)
         .await?;
     Ok(ControlClient::new(channel))
 }

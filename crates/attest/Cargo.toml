@@ -1,0 +1,29 @@
+[package]
+name = "torngat-attest"
+description = "Torngat TPM attestation verification (controller side, pure Rust, no TPM needed)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+aes = "0.9"
+cfb-mode = "0.9"
+hmac = "0.13"
+p256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
+getrandom = { version = "0.4", features = ["sys_rng"] }
+rsa = { version = "0.10", default-features = false, features = ["std", "encoding", "getrandom"] }
+sha2 = "0.11"
+subtle = "2.6"
+thiserror.workspace = true
+time.workspace = true
+x509-parser = { version = "0.18", features = ["verify"] }
+
+[dev-dependencies]
+
+rcgen = { version = "0.14", features = ["x509-parser"] }
+
+[lints]
+workspace = true

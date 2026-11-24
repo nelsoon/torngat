@@ -5,13 +5,15 @@
 //! - `join`: enroll this node into an existing cluster with a join token.
 //! - `run`: run whatever this node was set up as (controller node: store, API server, controller,
 //!   join endpoint and agent; other nodes: agent only).
+//! - `tpm-pin`: print this machine's TPM endorsement key pin, to pre-register it on a join token.
 //!
 //! State directory layout. The root is 0711 (others may traverse, not list: the unprivileged QEMU
 //! user must reach `instances/`); everything secret is in 0700 directories as 0600 files:
 //! ```text
 //! node.json           role, node name, controller address (written last: marks setup done)
-//! identity/           ca.pem, node.pem (chain), node.key — this node's agent credentials
-//! pki/                ca.pem, ca.key, controller.pem (chain), controller.key — controller only
+//! identity/           ca.pem, node.pem (chain), and node.key or node.tpmkey (TPM-wrapped blob)
+//! pki/                ca.pem, ca.key, controller.pem (chain), controller.key, tpm-roots/*.pem
+//!                     (vendor CAs trusted for TPM endorsement certificates) — controller only
 //! admin-token         bootstrap admin token for the API — controller only
 //! store/              replicated store — controller only
 //! instances/          workload runtime state
@@ -26,7 +28,10 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use torngat_api::Name;
-use torngat_pki::{Ca, JoinToken, KeyStorage};
+use torngat_pki::{Ca, JoinToken, TpmPolicy};
+
+mod node_key;
+use node_key::{DEFAULT_TCTI, KeyConfig, LocalKey, TpmMode};
 
 /// Default ports: control (mTLS, agents) and join (server-only TLS, enrollment).
 const CONTROL_PORT: u16 = 7443;
@@ -48,6 +53,16 @@ enum Cmd {
         /// Node name (default: the host name).
         #[arg(long)]
         name: Option<String>,
+        /// Whether nodes must hold their key in an attested TPM.
+        #[arg(long, value_enum, default_value_t = TpmRequirement::Required)]
+        tpm: TpmRequirement,
+        /// TPM to use for this node's key.
+        #[arg(long, default_value = DEFAULT_TCTI)]
+        tpm_device: String,
+        /// CA certificate(s) (PEM) trusted to issue TPM endorsement certificates; repeatable.
+        /// Without any, TPM joins need a token pinned to the TPM (`tpm-pin`).
+        #[arg(long)]
+        tpm_ca: Vec<PathBuf>,
     },
     /// Enroll this node into an existing cluster.
     Join {
@@ -66,6 +81,16 @@ enum Cmd {
         join_port: u16,
         #[arg(long, default_value_t = CONTROL_PORT)]
         control_port: u16,
+        /// Where to keep the node key.
+        #[arg(long, value_enum, default_value_t = TpmMode::Auto)]
+        tpm: TpmMode,
+        #[arg(long, default_value = DEFAULT_TCTI)]
+        tpm_device: String,
+    },
+    /// Print this machine's TPM endorsement key pin (for `ek_sha256` on a join token).
+    TpmPin {
+        #[arg(long, default_value = DEFAULT_TCTI)]
+        tpm_device: String,
     },
     /// Run this node.
     Run {
@@ -88,6 +113,14 @@ enum Cmd {
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum TpmRequirement {
+    /// Only attested TPM-held node keys may join.
+    Required,
+    /// File keys are allowed too (lower assurance).
+    Optional,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Role {
@@ -103,6 +136,8 @@ struct NodeConfig {
     name: Name,
     /// `host:port` of the control endpoint (agent nodes).
     controller: Option<String>,
+    #[serde(default)]
+    key: KeyConfig,
 }
 
 fn private_dir(p: &Path) -> Res<()> {
@@ -190,7 +225,7 @@ fn host_port(host: &str, port: u16) -> Res<String> {
 }
 
 /// Writes a 0600 file, replacing any previous one atomically (temp file + rename).
-fn replace_private(path: &Path, data: &[u8]) -> Res<()> {
+pub(crate) fn replace_private(path: &Path, data: &[u8]) -> Res<()> {
     let tmp = path.with_extension("tmp");
     let _ = std::fs::remove_file(&tmp);
     write_private(&tmp, data)?;
@@ -220,7 +255,13 @@ async fn open_store(data: &Path) -> Res<torngat_store::Store> {
     Ok(store)
 }
 
-async fn init(data: PathBuf, name: Option<String>) -> Res<()> {
+async fn init(
+    data: PathBuf,
+    name: Option<String>,
+    tpm: TpmRequirement,
+    tpm_device: String,
+    tpm_ca: Vec<PathBuf>,
+) -> Res<()> {
     let name = node_name(name)?;
     fresh(&data)?;
     if data.join("pki").exists() || data.join("store").exists() || data.join("identity").exists() {
@@ -230,11 +271,39 @@ async fn init(data: PathBuf, name: Option<String>) -> Res<()> {
         )
         .into());
     }
+    let required = tpm == TpmRequirement::Required;
+    let key_cfg = node_key::choose(
+        if required { TpmMode::On } else { TpmMode::Auto },
+        &tpm_device,
+    )
+    .map_err(|e| {
+        if required {
+            format!("{e}; this cluster would require TPMs (use --tpm optional to allow file keys)")
+        } else {
+            e.to_string()
+        }
+    })?;
+    // Vendor roots for TPM endorsement certificates: check them before writing anything.
+    let mut roots = Vec::new();
+    for f in &tpm_ca {
+        let pem = std::fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
+        let certs = pem::parse_many(&pem).map_err(|e| format!("{}: {e}", f.display()))?;
+        if certs.is_empty() || certs.iter().any(|c| c.tag() != "CERTIFICATE") {
+            return Err(format!("{}: expected PEM certificates", f.display()).into());
+        }
+        roots.push(pem);
+    }
+
     data_root(&data)?;
     let pki = data.join("pki");
     let ident = data.join("identity");
     private_dir(&pki)?;
     private_dir(&ident)?;
+    let tpm_roots = pki.join("tpm-roots");
+    private_dir(&tpm_roots)?;
+    for (i, pem) in roots.iter().enumerate() {
+        write_private(&tpm_roots.join(format!("{i}.pem")), pem)?;
+    }
 
     let ca = Ca::generate()?;
     ca.save(&pki)?;
@@ -244,20 +313,31 @@ async fn init(data: PathBuf, name: Option<String>) -> Res<()> {
         &pki.join("controller.key"),
         ctl.key_pem.as_deref().unwrap_or_default().as_bytes(),
     )?;
-    let me = ca.issue_node(&name)?;
+    // This node's own key: the operator running init is the trust root, so it is enrolled
+    // directly, without attestation.
+    let key = node_key::create_or_resume(&ident, &key_cfg)?;
+    let me = ca.sign_node_csr(&key.csr()?, &name)?;
+    let mut my_identity = me.identity(key.storage())?;
+    // Close our TPM session first: some TPM transports take one client at a time.
+    drop(key);
+    if let KeyConfig::Tpm { tcti } = &key_cfg {
+        my_identity.ek_sha256 = node_key::ek_pin(tcti).ok();
+    }
     write_private(&ident.join("ca.pem"), ca.cert_pem().as_bytes())?;
     write_private(&ident.join("node.pem"), me.chain_pem.as_bytes())?;
-    write_private(
-        &ident.join("node.key"),
-        me.key_pem.as_deref().unwrap_or_default().as_bytes(),
-    )?;
     let admin = torngat_pki::random_secret()?;
     write_private(&data.join("admin-token"), admin.as_bytes())?;
 
     let store = open_store(&data).await?;
     let setup = async {
-        torngat_controller::identity::enroll(&store, &name, &me.identity(KeyStorage::File)?)
+        store
+            .put(
+                torngat_controller::keys::tpm_policy()?,
+                serde_json::to_vec(&TpmPolicy { required })?,
+                torngat_store::Precondition::Absent,
+            )
             .await?;
+        torngat_controller::identity::enroll(&store, &name, &my_identity).await?;
         let token = JoinToken::generate()?;
         let rec = token.record(
             None,
@@ -282,6 +362,7 @@ async fn init(data: PathBuf, name: Option<String>) -> Res<()> {
         role: Role::Controller,
         name: name.clone(),
         controller: None,
+        key: key_cfg.clone(),
     };
     write_private(&data.join("node.json"), &serde_json::to_vec_pretty(&cfg)?)?;
     let join_token = data.join("join-token");
@@ -289,6 +370,26 @@ async fn init(data: PathBuf, name: Option<String>) -> Res<()> {
 
     println!("Cluster created; this node is {name}.");
     println!("  CA:          {}", ca.hash());
+    println!(
+        "  Node key:    {}",
+        match key_cfg {
+            KeyConfig::File => "file".to_owned(),
+            KeyConfig::Tpm { tcti } => format!("TPM ({tcti})"),
+        }
+    );
+    println!(
+        "  TPM policy:  {}",
+        if required {
+            "required (only attested TPM keys may join)"
+        } else {
+            "optional (file keys allowed)"
+        }
+    );
+    if required && roots.is_empty() {
+        println!(
+            "  No TPM vendor roots (--tpm-ca): joins need a token pinned to the TPM (ek_sha256, see `torngatd tpm-pin`)."
+        );
+    }
     println!(
         "  Admin token: {} (bootstrap only; keep it secret)",
         data.join("admin-token").display()
@@ -314,43 +415,42 @@ async fn join(
     token_file: PathBuf,
     name: Option<String>,
     (join_port, control_port): (u16, u16),
+    (tpm, tpm_device): (TpmMode, String),
 ) -> Res<()> {
     let name = node_name(name)?;
     fresh(&data)?;
     let token = std::fs::read_to_string(&token_file)?;
     let join_addr = host_port(&controller, join_port)?;
     let control_addr = host_port(&controller, control_port)?;
+    let key_cfg = node_key::choose(tpm, &tpm_device)?;
     data_root(&data)?;
     let ident = data.join("identity");
     private_dir(&ident)?;
-    // The key is saved before joining, so a join whose answer was lost can simply be re-run.
-    let key_path = ident.join("node.key");
-    // An unreadable key (e.g. a crash while writing it) cannot have joined: replace it.
-    let existing = std::fs::read_to_string(&key_path)
-        .ok()
-        .filter(|pem| torngat_pki::ca::parse_node_key(pem).is_ok());
-    let key_pem = match existing {
-        Some(pem) => {
-            println!("Resuming with the existing key in {}.", key_path.display());
-            pem
+    let key = node_key::create_or_resume(&ident, &key_cfg)?;
+    let enrolled = match &key {
+        LocalKey::File(pem) => {
+            torngat_agent::join::join(&join_addr, token.trim(), &name, pem).await?
         }
-        None => {
-            let pem = torngat_pki::ca::node_key()?.serialize_pem();
-            replace_private(&key_path, pem.as_bytes())?;
-            pem
+        #[cfg(feature = "tpm")]
+        LocalKey::Tpm(k) => {
+            torngat_agent::join::join_tpm(&join_addr, token.trim(), &name, k).await?
         }
     };
-    let enrolled = torngat_agent::join::join(&join_addr, token.trim(), &name, &key_pem).await?;
     replace_private(&ident.join("ca.pem"), enrolled.ca_pem.as_bytes())?;
     replace_private(&ident.join("node.pem"), enrolled.cert_chain_pem.as_bytes())?;
     let cfg = NodeConfig {
         role: Role::Agent,
         name: name.clone(),
         controller: Some(control_addr),
+        key: key_cfg.clone(),
     };
     write_private(&data.join("node.json"), &serde_json::to_vec_pretty(&cfg)?)?;
     println!(
-        "Joined as {name}. The token is used up; you can delete {}.",
+        "Joined as {name} ({} key). The token is used up; you can delete {}.",
+        match key_cfg {
+            KeyConfig::File => "file",
+            KeyConfig::Tpm { .. } => "TPM",
+        },
         token_file.display()
     );
     println!(
@@ -358,6 +458,26 @@ async fn join(
         data.display()
     );
     Ok(())
+}
+
+/// Every certificate in `pki/tpm-roots/*.pem`.
+fn tpm_anchors(dir: &Path) -> Res<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(format!("{}: {e}", dir.display()).into()),
+    };
+    for entry in entries {
+        let p = entry?.path();
+        if p.extension().is_some_and(|x| x == "pem") {
+            let pem = std::fs::read(&p)?;
+            for c in pem::parse_many(&pem).map_err(|e| format!("{}: {e}", p.display()))? {
+                out.push(c.into_contents());
+            }
+        }
+    }
+    Ok(out)
 }
 
 async fn run(
@@ -401,7 +521,7 @@ async fn run(
         controller_name: torngat_pki::CONTROLLER_NAME.into(),
         ca_pem: read(ident.join("ca.pem"))?,
         cert_pem: read(ident.join("node.pem"))?,
-        key_pem: read(ident.join("node.key"))?,
+        key: node_key::load(&ident, &cfg.key)?,
     };
 
     if cfg.role == Role::Agent {
@@ -418,6 +538,7 @@ async fn run(
     let pki = data.join("pki");
     private_dir(&pki)?;
     let ca = Arc::new(Ca::load(&pki)?);
+    let anchors = tpm_anchors(&pki.join("tpm-roots"))?;
     let token = std::fs::read_to_string(data.join("admin-token"))?;
     let token = torngat_apiserver::AdminToken::new(token.trim())?;
     let store = open_store(&data).await?;
@@ -436,7 +557,7 @@ async fn run(
         tls.clone(),
     ));
     let joiner = tokio::spawn(torngat_controller::serve_join(
-        torngat_controller::JoinService::new(store.clone(), ca.clone()),
+        torngat_controller::JoinService::new(store.clone(), ca.clone(), anchors),
         join_l,
         tls.cert_pem.clone(),
         tls.key_pem.clone(),
@@ -489,15 +610,27 @@ fn main() -> std::process::ExitCode {
 }
 
 async fn main_async() -> Res<()> {
+    // Logs go to stderr; stdout carries command output (e.g. `tpm-pin`).
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "info,openraft=warn,raft_log=warn,openraft_log_wal=warn,chunked_wal=warn,fjall=warn,lsm_tree=warn".into()
+                "info,openraft=warn,raft_log=warn,openraft_log_wal=warn,chunked_wal=warn,fjall=warn,lsm_tree=warn,tss_esapi=warn".into()
             }),
         )
         .init();
     match Cli::parse().cmd {
-        Cmd::Init { data, name } => init(data, name).await,
+        Cmd::Init {
+            data,
+            name,
+            tpm,
+            tpm_device,
+            tpm_ca,
+        } => init(data, name, tpm, tpm_device, tpm_ca).await,
+        Cmd::TpmPin { tpm_device } => {
+            println!("{}", node_key::ek_pin(&tpm_device)?);
+            Ok(())
+        }
         Cmd::Join {
             data,
             controller,
@@ -505,6 +638,8 @@ async fn main_async() -> Res<()> {
             name,
             join_port,
             control_port,
+            tpm,
+            tpm_device,
         } => {
             join(
                 data,
@@ -512,6 +647,7 @@ async fn main_async() -> Res<()> {
                 token_file,
                 name,
                 (join_port, control_port),
+                (tpm, tpm_device),
             )
             .await
         }

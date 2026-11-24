@@ -71,6 +71,24 @@ pub struct NodeIdentity {
     pub issue_time: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub not_after: OffsetDateTime,
+    /// For TPM keys: SHA-256 (hex) of the attested TPM's endorsement key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ek_sha256: Option<String>,
+}
+
+/// Cluster policy on node keys. Server-written only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TpmPolicy {
+    /// Only TPM-held, attested node keys may join.
+    pub required: bool,
+}
+
+impl Default for TpmPolicy {
+    /// Secure by default: a cluster without a recorded policy requires TPMs.
+    fn default() -> Self {
+        Self { required: true }
+    }
 }
 
 pub(crate) fn sha256(b: &[u8]) -> [u8; 32] {

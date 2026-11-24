@@ -8,6 +8,14 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# Enables the TPM end-to-end test (needs the tpm2-tss libraries and a TPM or swtpm).
+tpm-tests = ["torngat-agent/tpm"]
+
+[[test]]
+name = "join_tpm"
+required-features = ["tpm-tests"]
+
 [dependencies]
 serde_json.workspace = true
 thiserror.workspace = true
@@ -20,6 +28,7 @@ tracing = "0.1"
 uuid.workspace = true
 x509-parser = "0.18"
 torngat-api = { path = "../../api" }
+torngat-attest = { path = "../attest" }
 torngat-pki = { path = "../pki" }
 torngat-proto = { path = "../proto" }
 torngat-store = { path = "../store" }

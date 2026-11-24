@@ -40,3 +40,8 @@ pub fn join_token(id: &str) -> Result<Key, KeyError> {
 pub fn join_tokens() -> Result<Prefix, KeyError> {
     Prefix::new("platform", ["jointokens"])
 }
+
+/// The cluster's node key policy ([`torngat_pki::TpmPolicy`]).
+pub fn tpm_policy() -> Result<Key, KeyError> {
+    Key::new("platform", ["settings", "tpm"])
+}
