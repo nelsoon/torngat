@@ -8,8 +8,14 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+default = ["tpm"]
+# TPM-held node keys (needs the tpm2-tss libraries).
+tpm = ["torngat-agent/tpm"]
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+pem = "4"
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "net", "signal"] }
@@ -18,6 +24,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 torngat-agent = { path = "../agent" }
 torngat-api = { path = "../../api" }
 torngat-apiserver = { path = "../apiserver" }
+torngat-attest = { path = "../attest" }
 torngat-controller = { path = "../controller" }
 torngat-pki = { path = "../pki" }
 torngat-store = { path = "../store" }

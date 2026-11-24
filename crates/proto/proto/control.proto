@@ -52,7 +52,13 @@ message ReportResponse {}
 // Enrollment of a new node. Served on its own port with server-only TLS: the caller has no
 // certificate yet. It has already checked the controller's CA against the pin in its token.
 service Join {
+  // Enrollment with a key held in a file (only where the cluster's TPM policy allows it). Also
+  // how a node retries a join whose answer was lost, whatever its key storage.
   rpc Join(JoinRequest) returns (JoinResponse);
+  // Enrollment with a TPM-held key, in two steps: the controller challenges the TPM, the node
+  // answers with the activated credential and a certification of its key.
+  rpc BeginTpmJoin(TpmJoinRequest) returns (TpmChallenge);
+  rpc FinishTpmJoin(TpmJoinAnswer) returns (JoinResponse);
 }
 
 message JoinRequest {
@@ -66,6 +72,35 @@ message JoinRequest {
   // How the key is held: "file" or "tpm".
   string key_storage = 6;
 }
+message TpmJoinRequest {
+  string api_version = 1;
+  string token_id = 2;
+  bytes token_secret = 3;
+  string node_name = 4;
+  // CSR (DER) signed by the TPM-held node key.
+  bytes csr_der = 5;
+  // The TPM's RSA 2048 endorsement key certificate (DER).
+  bytes ek_cert_der = 6;
+  // Marshalled TPMT_PUBLIC of the attestation key and of the node key.
+  bytes ak_public = 7;
+  bytes node_key_public = 8;
+}
+message TpmChallenge {
+  string challenge_id = 1;
+  // Contents of TPM2B_ID_OBJECT and TPM2B_ENCRYPTED_SECRET for TPM2_ActivateCredential.
+  bytes id_object = 2;
+  bytes encrypted_secret = 3;
+  // Qualifying data for TPM2_Certify of the node key by the attestation key.
+  bytes nonce = 4;
+}
+message TpmJoinAnswer {
+  string challenge_id = 1;
+  bytes activated_secret = 2;
+  // Marshalled TPMS_ATTEST and TPMT_SIGNATURE from TPM2_Certify.
+  bytes certify_attest = 3;
+  bytes certify_signature = 4;
+}
+
 message JoinResponse {
   // Node certificate followed by the CA certificate.
   string cert_chain_pem = 1;

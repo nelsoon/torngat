@@ -123,6 +123,7 @@ impl JoinToken {
             description,
             create_time: now,
             expire_time: now + ttl,
+            ek_sha256: None,
         }
     }
 }
@@ -141,6 +142,10 @@ pub struct JoinTokenRecord {
     pub create_time: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub expire_time: OffsetDateTime,
+    /// If set, the token can only enroll a node whose TPM has this endorsement key (SHA-256 of
+    /// its SubjectPublicKeyInfo, hex): pre-registered hardware.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ek_sha256: Option<String>,
 }
 
 impl JoinTokenRecord {

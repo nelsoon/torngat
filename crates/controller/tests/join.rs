@@ -57,12 +57,14 @@ async fn env() -> Env {
     let join = jl.local_addr().unwrap().to_string();
     tokio::spawn(torngat_controller::serve(ctl.clone(), cl, tls.clone()));
     tokio::spawn(torngat_controller::serve_join(
-        JoinService::new(store.clone(), ca.clone()),
+        JoinService::new(store.clone(), ca.clone(), Vec::new()),
         jl,
         tls.cert_pem,
         tls.key_pem,
     ));
     tokio::spawn(ctl.run_scheduler(Duration::from_millis(100)));
+    // These tests enroll file keys, which a TPM-required cluster refuses.
+    set_policy(&store, false).await;
     Env {
         store,
         ca,
@@ -70,6 +72,17 @@ async fn env() -> Env {
         join,
         _dir: dir,
     }
+}
+
+async fn set_policy(store: &Store, required: bool) {
+    store
+        .put(
+            keys::tpm_policy().unwrap(),
+            serde_json::to_vec(&torngat_pki::TpmPolicy { required }).unwrap(),
+            Precondition::None,
+        )
+        .await
+        .unwrap();
 }
 
 impl Env {
@@ -117,7 +130,10 @@ const DAY: time::Duration = time::Duration::hours(24);
 async fn join_then_run_as_an_enrolled_node() {
     let e = env().await;
     let text = e.token(None, DAY).await;
-    let creds = join(&e.join, &text, &n("n2")).await.unwrap();
+    let key = fresh_key();
+    let creds = torngat_agent::join::join(&e.join, &text, &n("n2"), &key)
+        .await
+        .unwrap();
     assert!(!e.token_exists(&text).await, "token must be consumed");
     assert!(creds.ca_pem.contains("BEGIN CERTIFICATE"));
 
@@ -129,7 +145,7 @@ async fn join_then_run_as_an_enrolled_node() {
             controller_name: torngat_pki::CONTROLLER_NAME.into(),
             ca_pem: creds.ca_pem.into_bytes(),
             cert_pem: creds.cert_chain_pem.into_bytes(),
-            key_pem: creds.key_pem.into_bytes(),
+            key: torngat_agent::NodeKey::File(key.into_bytes()),
         },
         FakeRuntime::default(),
     ));
@@ -342,5 +358,28 @@ async fn racing_for_one_name_burns_only_the_winning_token() {
         left += usize::from(e.token_exists(t).await);
     }
     assert_eq!(left, texts.len() - 1, "losing tokens must survive");
+    e.store.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tpm_required_cluster_refuses_file_keys() {
+    let e = env().await;
+    set_policy(&e.store, true).await;
+    let text = e.token(None, DAY).await;
+    let err = join(&e.join, &text, &n("n2")).await.unwrap_err();
+    assert!(
+        matches!(&err, JoinError::Refused(m) if m.contains("requires TPM")),
+        "{err}"
+    );
+    assert!(
+        e.token_exists(&text).await,
+        "a refused join must not burn the token"
+    );
+    // No policy recorded at all means required too.
+    e.store
+        .delete(keys::tpm_policy().unwrap(), Precondition::None)
+        .await
+        .unwrap();
+    assert!(join(&e.join, &text, &n("n2")).await.is_err());
     e.store.shutdown().await.unwrap();
 }

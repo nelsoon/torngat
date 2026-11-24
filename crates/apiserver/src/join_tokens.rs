@@ -24,6 +24,7 @@ fn info(r: JoinTokenRecord, token: Option<String>) -> JoinTokenInfo {
         description: r.description,
         create_time: r.create_time,
         expire_time: r.expire_time,
+        ek_sha256: r.ek_sha256,
         token,
     }
 }
@@ -39,7 +40,8 @@ pub async fn create_join_token(
     let req = body(b)?;
     req.validate().map_err(ApiError::InvalidArgument)?;
     let token = JoinToken::generate().map_err(|e| ApiError::Internal(e.to_string()))?;
-    let rec = token.record(req.node.clone(), req.ttl(), req.description.clone());
+    let mut rec = token.record(req.node.clone(), req.ttl(), req.description.clone());
+    rec.ek_sha256 = req.ek_sha256.clone();
     st.store
         .put(
             key(token.id())?,
@@ -47,7 +49,7 @@ pub async fn create_join_token(
             Precondition::Absent,
         )
         .await?;
-    tracing::info!(id = %rec.id, node = ?rec.node, "join token created");
+    tracing::info!(id = %rec.id, node = ?rec.node, ek = ?rec.ek_sha256, "join token created");
     let text = token.encode(&st.ca_hash);
     // The secret appears in this response only: never cache it.
     Ok((

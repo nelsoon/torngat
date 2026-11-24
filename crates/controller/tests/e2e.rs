@@ -149,26 +149,14 @@ fn unenrolled_cfg(e: &Env, cert_pem: Vec<u8>, key_pem: Vec<u8>) -> AgentConfig {
         controller_name: "controller.torngat".into(),
         ca_pem: e.pki.ca_pem(),
         cert_pem,
-        key_pem,
+        key: torngat_agent::NodeKey::File(key_pem),
     }
 }
 
 async fn control_client(
     cfg: &AgentConfig,
-) -> Result<ControlClient<tonic::transport::Channel>, tonic::transport::Error> {
-    let tls = tonic::transport::ClientTlsConfig::new()
-        .ca_certificate(tonic::transport::Certificate::from_pem(&cfg.ca_pem))
-        .identity(tonic::transport::Identity::from_pem(
-            &cfg.cert_pem,
-            &cfg.key_pem,
-        ))
-        .domain_name("controller.torngat");
-    let ch = tonic::transport::Channel::from_shared(cfg.controller_url.clone())
-        .unwrap()
-        .tls_config(tls)?
-        .connect()
-        .await?;
-    Ok(ControlClient::new(ch))
+) -> Result<ControlClient<tonic::transport::Channel>, torngat_agent::AgentError> {
+    torngat_agent::connect(cfg).await
 }
 
 async fn heartbeat_code(cfg: &AgentConfig) -> Option<tonic::Code> {

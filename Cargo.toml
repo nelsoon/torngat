@@ -25,6 +25,12 @@ unwrap_used = "warn"
 expect_used = "warn"
 panic = "warn"
 
+# RSA key generation in tests is very slow unoptimized.
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+[profile.dev.package.rsa]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

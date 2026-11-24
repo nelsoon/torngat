@@ -24,6 +24,11 @@ pub struct CreateJoinTokenRequest {
     pub ttl_seconds: Option<u64>,
     #[serde(default)]
     pub description: String,
+    /// Pre-registered hardware: only a node whose TPM has this endorsement key may use the token
+    /// (SHA-256 of the EK certificate's public key, 64 lowercase hex; `torngatd tpm-pin` prints
+    /// it). The TPM's certificate then need not chain to a configured vendor root.
+    #[serde(default)]
+    pub ek_sha256: Option<String>,
 }
 
 impl CreateJoinTokenRequest {
@@ -40,6 +45,11 @@ impl CreateJoinTokenRequest {
             return Err(format!(
                 "description must be at most {MAX_DESCRIPTION} bytes without control characters"
             ));
+        }
+        if let Some(p) = &self.ek_sha256
+            && (p.len() != 64 || !p.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        {
+            return Err("ek_sha256 must be 64 lowercase hex digits".into());
         }
         Ok(())
     }
@@ -62,6 +72,8 @@ pub struct JoinTokenInfo {
     pub create_time: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub expire_time: OffsetDateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ek_sha256: Option<String>,
     /// The full token text to pass to `join`. Only returned once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
@@ -79,12 +91,20 @@ mod tests {
             node: None,
             ttl_seconds: Some(ttl),
             description: d.into(),
+            ek_sha256: None,
         };
         assert!(r(59, "").validate().is_err());
         assert!(r(MAX_TTL_SECONDS + 1, "").validate().is_err());
         assert!(r(3600, "a\nb").validate().is_err());
         assert!(r(3600, &"x".repeat(257)).validate().is_err());
         assert!(r(3600, "rack 4").validate().is_ok());
+        let pin = |p: &str| CreateJoinTokenRequest {
+            ek_sha256: Some(p.into()),
+            ..Default::default()
+        };
+        assert!(pin(&"a".repeat(64)).validate().is_ok());
+        assert!(pin(&"A".repeat(64)).validate().is_err());
+        assert!(pin(&"a".repeat(63)).validate().is_err());
         assert!(
             serde_json::from_str::<CreateJoinTokenRequest>(r#"{"secret":"x"}"#).is_err(),
             "unknown fields are rejected"

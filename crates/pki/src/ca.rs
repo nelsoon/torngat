@@ -68,6 +68,7 @@ impl Issued {
             key_storage,
             issue_time: OffsetDateTime::now_utc(),
             not_after: self.not_after,
+            ek_sha256: None,
         })
     }
 }
