@@ -17,6 +17,7 @@ pub mod auth;
 mod error;
 mod handlers;
 mod join_tokens;
+mod settings;
 
 use std::net::SocketAddr;
 
@@ -68,6 +69,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/platform/joinTokens/{id}",
             get(join_tokens::get_join_token).delete(join_tokens::delete_join_token),
+        )
+        .route(
+            "/v1/platform/settings/tpm",
+            get(settings::get_tpm).put(settings::put_tpm),
         )
         // Unknown paths go through authentication too, so they cannot be used to probe the API.
         .fallback(not_found)

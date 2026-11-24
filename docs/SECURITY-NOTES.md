@@ -15,7 +15,7 @@ Items found in reviews that a later chunk must enforce.
   - Never accept allocations from agents.
 - **node identity / join:**
   - A node is its certificate name **and** the public key recorded at join (`platform/nodeidentities/<node>`). Every control RPC must go through `identity::authenticate`; deleting the record revokes the node.
-  - TPM policy (`platform/settings/tpm`, default and missing = required): file-key joins are refused when required. TPM keys are only recorded as `tpm` after attestation (EK trusted via `pki/tpm-roots` or a token `ek_sha256` pin, credential activation for the AK, AK certification of a fixed-TPM node key matching the CSR).
+  - TPM policy (`platform/settings/tpm`, default and missing = required): file-key joins are refused when required. TPM keys are only recorded as `tpm` after attestation (EK trusted via `pki/tpm-roots` or a token `ek_sha256` pin, credential activation for the AK, AK certification of a fixed-TPM node key matching the CSR). Admins can change it with `PUT /v1/platform/settings/tpm` (body `{"required": bool}`; admin only).
   - EK trust is one hop: the EK certificate must be signed directly by an anchor in `pki/tpm-roots` (put vendor intermediates there). No revocation checking of EK certificates yet.
   - The controller's own node is enrolled by `init` without attestation (the operator is the trust root).
   - TPM keys use no authorization value (no dictionary-attack lockout risk); access to the TPM device is the boundary. PCR-bound policies come later.
