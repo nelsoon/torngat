@@ -57,11 +57,13 @@ impl Default for QemuConfig {
     }
 }
 
-/// A resolved unprivileged account.
+/// A resolved unprivileged account, plus the one supplementary group QEMU needs (the group that
+/// owns `/dev/kvm`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Account {
     uid: u32,
     gid: u32,
+    kvm_gid: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -112,7 +114,16 @@ fn lookup_account(user: &str) -> std::io::Result<Account> {
                 if uid == 0 || gid == 0 {
                     return Err(invalid(format!("user {user} is privileged")));
                 }
-                return Ok(Account { uid, gid });
+                use std::os::unix::fs::MetadataExt;
+                let kvm_gid = std::fs::metadata("/dev/kvm")
+                    .map_err(|e| invalid(format!("/dev/kvm: {e}")))?
+                    .gid();
+                if kvm_gid == 0 {
+                    return Err(invalid(
+                        "/dev/kvm is owned by group root; expected a kvm group".into(),
+                    ));
+                }
+                return Ok(Account { uid, gid, kvm_gid });
             }
         }
     }
@@ -313,7 +324,8 @@ impl Runtime for QemuRuntime {
             cmd.arg(&self.cfg.setpriv).args([
                 format!("--reuid={}", a.uid),
                 format!("--regid={}", a.gid),
-                "--clear-groups".into(),
+                // Only the group that grants /dev/kvm; every other group is dropped.
+                format!("--groups={}", a.kvm_gid),
                 "--inh-caps=-all".into(),
                 "--bounding-set=-all".into(),
                 "--no-new-privs".into(),
