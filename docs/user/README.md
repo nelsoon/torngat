@@ -41,3 +41,17 @@ To stop it, read its `metadata.etag`, then send a `PATCH`:
 - `spec` is replaced as a whole by a `PATCH`. Read the object again if the `etag` is refused: someone
   else changed it.
 - Memory is 64 MiB or more.
+
+## Volumes
+
+Not usable by instances yet; the API exists.
+
+```
+POST /v1/orgs/acme/projects/web/volumes?volume_id=data
+{"spec": {"volume_type": "fast", "size_gib": 10}}
+```
+
+- A volume can grow. It cannot get smaller than the space it was given, and its type cannot change. For a smaller one, copy the data.
+- `"delete_protection": true` refuses deletion until you turn it off.
+- A `PATCH` replaces the whole `spec`: send `delete_protection` again, or it is turned off. Send the `etag` too.
+- It is placed on a node at its first use.

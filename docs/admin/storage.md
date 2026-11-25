@@ -1,6 +1,7 @@
 # Storage for instances
 
-The image contains the tools. Torngat does not create volumes yet: this page is about the host only.
+The image contains the tools. Pools, volume types and volumes can be described in the API, but
+**nothing is created on the nodes yet**.
 
 | | LVM | ZFS |
 |---|---|---|
@@ -39,3 +40,30 @@ the image key; with Secure Boot the kernel loads no others. It takes a few minut
   normal user with no copy of the keys, subordinate IDs in `/etc/subuid` and `/etc/subgid`, and Debian's `uidmap` package. It can read and
   change that user's own files: for releases, use a separate user, on a machine or VM for nothing else.
 - Every update of the image must be built with `--zfs` again, or the pools cannot be opened.
+
+## Pools and volume types
+
+You make the volume group or ZFS pool by hand. Torngat uses it and never creates or erases one.
+
+| | Who | What |
+|---|---|---|
+| Storage pool | admin | one volume group or ZFS pool on one node |
+| Volume type | admin | a name that tenants choose, and the pools behind it |
+| Volume | tenant | a type and a size |
+
+```
+POST /v1/platform/storagePools?storage_pool_id=n1-data
+{"spec": {"node": "n1", "driver": "lvm", "source": "data"}}
+
+POST /v1/platform/volumeTypes?volume_type_id=fast
+{"spec": {"pools": ["n1-data"], "description": "local disks"}}
+```
+
+- `source` is the name of the volume group or pool: lowercase letters, digits, `-` and `_`.
+- The node, driver and source of a pool cannot change. `"unschedulable": true` stops new volumes.
+- A pool that holds volumes or is in a type, and a type that volumes use, cannot be deleted. A pool holds at most 1024
+  volumes.
+- Space is never promised twice: a volume takes its full size from the pool, plus 16 MiB for encryption.
+- Deleting a pool that a node uses waits until the node removed its mark from the storage. If the node is lost, the
+  pool stays in deletion: there is no way to force it yet.
+- A volume gets its node when an instance first uses it.

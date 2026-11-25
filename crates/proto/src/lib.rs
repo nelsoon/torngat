@@ -13,3 +13,10 @@ pub const API_VERSION: &str = "v1alpha1";
 pub mod v1 {
     tonic::include_proto!("torngat.control.v1");
 }
+
+/// Contract with storage drivers (`proto/storage.proto`).
+pub mod storage {
+    pub mod v1 {
+        tonic::include_proto!("torngat.storage.v1");
+    }
+}

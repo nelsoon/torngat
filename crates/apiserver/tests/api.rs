@@ -519,3 +519,418 @@ async fn tpm_policy_can_be_read_and_changed() {
     assert_eq!(v, json!({"required": false}));
     e.store.shutdown().await.unwrap();
 }
+
+const POOLS: &str = "/v1/platform/storagePools";
+const TYPES: &str = "/v1/platform/volumeTypes";
+const UID: &str = "0193a000-0000-7000-8000-000000000001";
+const VOLUMES: &str = "/v1/orgs/acme/projects/web/volumes";
+
+/// Adds a node to the store, as the controller does.
+async fn add_node(store: &Store, n: &str) {
+    let node =
+        json!({"metadata": {"name": n, "scope": {"kind": "platform"}}, "spec": {}, "status": {}});
+    store
+        .put(
+            torngat_store::Key::new("platform", ["nodes", n]).unwrap(),
+            serde_json::to_vec(&node).unwrap(),
+            torngat_store::Precondition::Absent,
+        )
+        .await
+        .unwrap();
+}
+
+async fn storage_env() -> Env {
+    let e = env().await;
+    add_node(&e.store, "n1").await;
+    let pool = json!({"spec": {"node": "n1", "driver": "lvm", "source": "data"}});
+    let uri = format!("{POOLS}?storage_pool_id=n1-data");
+    let (s, v) = call(&e.app, "POST", &uri, Some(pool), true).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let t = json!({"spec": {"pools": ["n1-data"]}});
+    let uri = format!("{TYPES}?volume_type_id=fast");
+    let (s, v) = call(&e.app, "POST", &uri, Some(t), true).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    e
+}
+
+/// Changes a stored object, as the controller does.
+async fn edit(store: &Store, segs: &[&str], keyspace: &str, f: impl Fn(&mut Value)) {
+    let key = torngat_store::Key::new(keyspace, segs.iter().copied()).unwrap();
+    let cur = store.get(&key).await.unwrap().unwrap();
+    let mut v: Value = serde_json::from_slice(&cur.value).unwrap();
+    f(&mut v);
+    store
+        .put(
+            key,
+            serde_json::to_vec(&v).unwrap(),
+            torngat_store::Precondition::Revision(cur.revision),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn storage_needs_authentication() {
+    let e = storage_env().await;
+    for uri in [POOLS, TYPES, VOLUMES] {
+        for method in ["GET", "POST"] {
+            let (s, _) = call(&e.app, method, uri, None, false).await;
+            assert_eq!(s, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        }
+    }
+    e.store.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn storage_pools() {
+    let e = storage_env().await;
+    let post = async |id: &str, spec: Value| {
+        let uri = format!("{POOLS}?storage_pool_id={id}");
+        call(&e.app, "POST", &uri, Some(json!({"spec": spec})), true).await
+    };
+    let spec = json!({"node": "n1", "driver": "lvm", "source": "data"});
+    // The same name; the same storage under another name; another driver is other storage.
+    assert_eq!(post("n1-data", spec.clone()).await.0, StatusCode::CONFLICT);
+    assert_eq!(post("again", spec).await.0, StatusCode::CONFLICT);
+    let zfs = json!({"node": "n1", "driver": "zfs", "source": "data"});
+    assert_eq!(post("n1-zfs", zfs).await.0, StatusCode::OK);
+    for bad in [
+        json!({"node": "n2", "driver": "lvm", "source": "data"}),
+        json!({"node": "n1", "driver": "lvm", "source": "../data"}),
+        json!({"node": "n1", "driver": "lvm", "source": "-f"}),
+        json!({"node": "n1", "driver": "tape", "source": "x"}),
+        json!({"node": "n1", "driver": "lvm", "source": "x", "extra": 1}),
+    ] {
+        let (s, v) = post("bad", bad.clone()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+
+    // The platform's part cannot be set by a client.
+    let uri = format!("{POOLS}?storage_pool_id=forged");
+    let forged = json!({"spec": {"node": "n1", "driver": "lvm", "source": "forged"},
+        "status": {"ready": true, "capacity_bytes": 1}});
+    let (s, v) = call(&e.app, "POST", &uri, Some(forged), true).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["status"]["ready"], false);
+    assert_eq!(v["status"]["capacity_bytes"], 0);
+
+    let one = format!("{POOLS}/n1-data");
+    let patch = |spec: Value| call(&e.app, "PATCH", &one, Some(json!({"spec": spec})), true);
+    let moved = json!({"node": "n1", "driver": "lvm", "source": "other"});
+    assert_eq!(patch(moved).await.0, StatusCode::BAD_REQUEST);
+    let closed = json!({"node": "n1", "driver": "lvm", "source": "data", "unschedulable": true});
+    let (s, v) = patch(closed).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["metadata"]["generation"], 2);
+
+    // Fields written by a newer version do not get in the way.
+    edit(&e.store, &["storagepools", "n1-data"], "platform", |v| {
+        v["spec"]["later"] = json!(1);
+    })
+    .await;
+    assert_eq!(
+        call(&e.app, "GET", &one, None, true).await.0,
+        StatusCode::OK
+    );
+
+    // Not deleted while it holds volumes, nor while a type has it.
+    edit(&e.store, &["storagepools", "n1-data"], "platform", |v| {
+        v["status"]["reservations"] = json!({UID: 5});
+    })
+    .await;
+    let (s, v) = call(&e.app, "DELETE", &one, None, true).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["status"], "FAILED_PRECONDITION");
+    edit(&e.store, &["storagepools", "n1-data"], "platform", |v| {
+        v["status"]["reservations"] = json!({});
+    })
+    .await;
+    let (_, v) = call(&e.app, "DELETE", &one, None, true).await;
+    assert_eq!(v["error"]["message"], "n1-data is in a volume type");
+    let t = format!("{TYPES}/fast");
+    assert_eq!(
+        call(&e.app, "DELETE", &t, None, true).await.0,
+        StatusCode::OK
+    );
+    let stale = format!("{one}?etag=%221%22");
+    assert_eq!(
+        call(&e.app, "DELETE", &stale, None, true).await.0,
+        StatusCode::CONFLICT
+    );
+    // A pool that its node may have marked waits for it.
+    edit(&e.store, &["storagepools", "n1-data"], "platform", |v| {
+        v["status"]["claimed"] = json!(true);
+    })
+    .await;
+    assert_eq!(
+        call(&e.app, "DELETE", &one, None, true).await.0,
+        StatusCode::OK
+    );
+    let (_, v) = call(&e.app, "GET", &one, None, true).await;
+    assert!(v["metadata"]["delete_time"].is_string());
+    let b = json!({"spec": {"pools": ["n1-data"]}});
+    let uri = format!("{TYPES}?volume_type_id=late");
+    assert_eq!(
+        call(&e.app, "POST", &uri, Some(b), true).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    edit(&e.store, &["storagepools", "n1-data"], "platform", |v| {
+        v["status"]["claimed"] = json!(false);
+    })
+    .await;
+    assert_eq!(
+        call(&e.app, "DELETE", &one, None, true).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&e.app, "GET", &one, None, true).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let (_, v) = call(&e.app, "GET", POOLS, None, true).await;
+    assert_eq!(v["items"].as_array().unwrap().len(), 2);
+    e.store.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn volume_types() {
+    let e = storage_env().await;
+    for pools in [json!([]), json!(["nope"]), json!(["n1-data", "nope"])] {
+        let uri = format!("{TYPES}?volume_type_id=bad");
+        let b = json!({"spec": {"pools": pools}});
+        assert_eq!(
+            call(&e.app, "POST", &uri, Some(b), true).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let one = format!("{TYPES}/fast");
+    let b = json!({"spec": {"pools": ["nope"]}});
+    assert_eq!(
+        call(&e.app, "PATCH", &one, Some(b), true).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    let uri = format!("{VOLUMES}?volume_id=v1");
+    let b = json!({"spec": {"volume_type": "fast", "size_gib": 1}});
+    assert_eq!(
+        call(&e.app, "POST", &uri, Some(b), true).await.0,
+        StatusCode::OK
+    );
+    let (s, v) = call(&e.app, "DELETE", &one, None, true).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["status"], "FAILED_PRECONDITION");
+    let vol = format!("{VOLUMES}/v1");
+    assert_eq!(
+        call(&e.app, "DELETE", &vol, None, true).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&e.app, "DELETE", &one, None, true).await.0,
+        StatusCode::OK
+    );
+    e.store.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn volumes() {
+    let e = storage_env().await;
+    let post = async |id: &str, spec: Value| {
+        let uri = format!("{VOLUMES}?volume_id={id}");
+        call(&e.app, "POST", &uri, Some(json!({"spec": spec})), true).await
+    };
+    let (s, v) = post("v1", json!({"volume_type": "fast", "size_gib": 10})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["status"]["phase"], "pending");
+    assert_eq!(v["status"].get("pool"), None);
+    for bad in [
+        json!({"volume_type": "nope", "size_gib": 10}),
+        json!({"volume_type": "fast", "size_gib": 0}),
+        json!({"volume_type": "fast", "size_gib": 65537}),
+        json!({"volume_type": "fast", "size_gib": 1, "pool": "n1-data"}),
+        json!(["fast", 1, true]),
+    ] {
+        let (s, v) = post("bad", bad.clone()).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+    let one = format!("{VOLUMES}/v1");
+    let patch = |spec: Value| call(&e.app, "PATCH", &one, Some(json!({"spec": spec})), true);
+    // Nothing was granted yet.
+    let smaller = json!({"volume_type": "fast", "size_gib": 9});
+    let (s, v) = patch(smaller.clone()).await;
+    assert_eq!(s, StatusCode::OK);
+    // No change: no write.
+    assert_eq!(
+        patch(smaller).await.1["metadata"]["etag"],
+        v["metadata"]["etag"]
+    );
+    let other = json!({"volume_type": "slow", "size_gib": 10});
+    assert_eq!(patch(other).await.0, StatusCode::BAD_REQUEST);
+    let grown = json!({"volume_type": "fast", "size_gib": 11, "delete_protection": true});
+    assert_eq!(patch(grown).await.0, StatusCode::OK);
+    let (_, v) = call(&e.app, "DELETE", &one, None, true).await;
+    assert_eq!(v["error"]["message"], "v1 is protected from deletion");
+    let open = json!({"volume_type": "fast", "size_gib": 11});
+    assert_eq!(patch(open).await.0, StatusCode::OK);
+
+    // Other projects do not see it.
+    let other = "/v1/orgs/acme/projects/other/volumes";
+    let (_, v) = call(&e.app, "GET", other, None, true).await;
+    assert_eq!(v["items"], json!([]));
+
+    // A placed volume is deleted by the platform, and cannot change meanwhile.
+    let segs = ["orgs", "acme", "projects", "web", "volumes", "v1"];
+    edit(&e.store, &segs, "storage", |v| {
+        v["status"] = json!({"phase": "ready", "granted_bytes": 11u64 << 30, "attached_to": UID,
+            "pool": {"name": "n1-data", "uid": UID}});
+    })
+    .await;
+    let smaller = json!({"volume_type": "fast", "size_gib": 10});
+    assert_eq!(patch(smaller).await.0, StatusCode::BAD_REQUEST);
+    // Not while an instance uses it.
+    let (_, v) = call(&e.app, "DELETE", &one, None, true).await;
+    assert_eq!(v["error"]["message"], "v1 is used by an instance");
+    edit(&e.store, &segs, "storage", |v| {
+        v["status"]["attached_to"] = Value::Null;
+    })
+    .await;
+    for _ in 0..2 {
+        assert_eq!(
+            call(&e.app, "DELETE", &one, None, true).await.0,
+            StatusCode::OK
+        );
+    }
+    let (s, v) = call(&e.app, "GET", &one, None, true).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["status"]["phase"], "deleting");
+    assert!(v["metadata"]["delete_time"].is_string());
+    let grown = json!({"volume_type": "fast", "size_gib": 12});
+    assert_eq!(patch(grown).await.1["error"]["message"], "being deleted");
+    e.store.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn volume_request_ids() {
+    let e = storage_env().await;
+    let rid = "0193a000-0000-7000-8000-000000000002";
+    let post_size = async |id: &str, gib: u64| {
+        let uri = format!("{VOLUMES}?volume_id={id}&request_id={rid}");
+        let b = json!({"spec": {"volume_type": "fast", "size_gib": gib}});
+        call(&e.app, "POST", &uri, Some(b), true).await
+    };
+    let post = async |id: &str| post_size(id, 1).await;
+    let (s, first) = post("v1").await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, again) = post("v1").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(first["metadata"]["uid"], again["metadata"]["uid"]);
+    assert_eq!(post("v2").await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(post_size("v1", 2).await.0, StatusCode::BAD_REQUEST);
+    // A late retry does not bring a deleted volume back.
+    let one = format!("{VOLUMES}/v1");
+    assert_eq!(
+        call(&e.app, "DELETE", &one, None, true).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(post("v1").await.0, StatusCode::NOT_FOUND);
+    e.store.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_attempts_share_a_request_id() {
+    let e = storage_env().await;
+    for i in 0..30u32 {
+        let uri =
+            format!("{VOLUMES}?volume_id=v{i}&request_id=0193a000-0000-7000-8000-0000000001{i:02}");
+        let b = json!({"spec": {"volume_type": "fast", "size_gib": 1}});
+        let attempts: Vec<_> = (0..4)
+            .map(|_| {
+                let (app, uri, b) = (e.app.clone(), uri.clone(), b.clone());
+                tokio::spawn(async move { call(&app, "POST", &uri, Some(b), true).await })
+            })
+            .collect();
+        let mut uids = std::collections::BTreeSet::new();
+        for a in attempts {
+            let (s, v) = a.await.unwrap();
+            assert_eq!(s, StatusCode::OK, "{v}");
+            uids.insert(v["metadata"]["uid"].to_string());
+        }
+        assert_eq!(uids.len(), 1);
+    }
+    e.store.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_id_waits_for_a_name_in_use() {
+    let e = storage_env().await;
+    let b = json!({"spec": {"volume_type": "fast", "size_gib": 1}});
+    let plain = format!("{VOLUMES}?volume_id=v1");
+    let with_id = format!("{plain}&request_id=0193a000-0000-7000-8000-000000000003");
+    let one = format!("{VOLUMES}/v1");
+    let post = async |uri: &str| call(&e.app, "POST", uri, Some(b.clone()), true).await;
+    assert_eq!(post(&plain).await.0, StatusCode::OK);
+    let (s, v) = post(&with_id).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(v["error"]["status"], "ALREADY_EXISTS");
+    assert_eq!(
+        call(&e.app, "DELETE", &one, None, true).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(post(&with_id).await.0, StatusCode::OK);
+
+    // As after a crash between creating the volume and recording it.
+    let segs = [
+        "volumerequests",
+        "orgs",
+        "acme",
+        "projects",
+        "web",
+        "0193a000-0000-7000-8000-000000000003",
+    ];
+    edit(&e.store, &segs, "ops", |v| v["created"] = Value::Null).await;
+    assert_eq!(post(&with_id).await.0, StatusCode::OK);
+    assert_eq!(
+        call(&e.app, "DELETE", &one, None, true).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(post(&with_id).await.0, StatusCode::NOT_FOUND);
+    e.store.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn updates_survive_status_changes() {
+    let e = storage_env().await;
+    let uri = format!("{VOLUMES}?volume_id=v1");
+    let b = json!({"spec": {"volume_type": "fast", "size_gib": 1}});
+    assert_eq!(
+        call(&e.app, "POST", &uri, Some(b), true).await.0,
+        StatusCode::OK
+    );
+    let key = torngat_store::Key::new(
+        "storage",
+        ["orgs", "acme", "projects", "web", "volumes", "v1"],
+    )
+    .unwrap();
+    let store = e.store.clone();
+    let platform = tokio::spawn(async move {
+        for i in 0..200 {
+            let cur = store.get(&key).await.unwrap().unwrap();
+            let mut v: Value = serde_json::from_slice(&cur.value).unwrap();
+            v["status"]["message"] = json!(format!("{i}"));
+            let _ = store
+                .put(
+                    key.clone(),
+                    serde_json::to_vec(&v).unwrap(),
+                    torngat_store::Precondition::Revision(cur.revision),
+                )
+                .await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    let one = format!("{VOLUMES}/v1");
+    for gib in 2..40 {
+        let b = json!({"spec": {"volume_type": "fast", "size_gib": gib}});
+        let (s, v) = call(&e.app, "PATCH", &one, Some(b), true).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["spec"]["size_gib"], gib);
+    }
+    platform.await.unwrap();
+    e.store.shutdown().await.unwrap();
+}

@@ -22,4 +22,16 @@ Items found in reviews that a later chunk must enforce.
   - The CA key sits on the controller's disk (0600). Move it to an HSM/TPM-sealed store before multi-controller.
   - Certificates live one year and there is no rotation yet; add renewal (same key) before production.
   - `node.json`, `identity/` and `pki/` are trusted local state: anyone who can write them owns the node.
+- **storage:**
+  - Pool sizes and capabilities come from agents: only the pool's own node may report them. Reservations are written by the controller only, with compare-and-swap, before a volume is placed.
+  - A driver must refuse a volume group or ZFS pool that carries another pool's or cluster's mark.
+  - Before volumes are opened on a host: a udev rule so that their content is not probed.
+  - Volume status has the pool's name, for operators: hide it from tenants when IAM comes.
+  - A volume type or pool name in a stored object may no longer exist, or be another one: compare the uid.
+  - Placement order: pool and `granted_bytes` in the volume's status, then the reservation, then `Placed`; without space both are cleared again. Growth order: the reservation, then `granted_bytes`. Deletion order: blocks, reservation (the pool is always written), then the object. Sweep reservations of volumes that are gone. Before reserving, check the pool's uid and that it is not being deleted.
+  - Before a pool is finally removed, check again that no volume type lists it.
+  - A key for a destroyed volume uid is never made again (tombstone): racing creates with one request id can briefly reuse a uid.
+  - A device is formatted only if the volume was never formatted and its header area is blank.
+  - Volumes and request id records have no limit per project, and the records never expire: before tenants get access.
+  - An older version that changes an object drops fields that it does not know: before rolling upgrades.
 - **CI:** third-party actions are pinned to commit SHAs; keep them pinned when updating.
