@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the Torngat host image (and the platform extension it ships with). Needs root (mkosi),
-# mkosi 25 or later and systemd-repart 257 or later.
+# mkosi 25 or later, systemd-repart 257 or later and sbsigntool.
 #
 #   sudo image/build.sh --torngatd PATH [--version V] [--authorized-keys FILE] [--dev]
 #
@@ -64,4 +64,13 @@ args=(--image-version="$version" --extra-tree="$extra"
 [ -n "$dev" ] && args+=(--autologin=yes)
 cd "$here"
 mkosi "${args[@]}" -f build
+
+# mkosi silently installs a loader signed by someone else when there is none it can sign.
+systemd-dissect --copy-from "$out/torngat_$version.raw" /boot "$extra/esp"
+signed=("$extra/esp/EFI/BOOT/BOOTX64.EFI" "$extra/esp/EFI/systemd/systemd-bootx64.efi"
+  "$extra"/esp/torngat/*/vmlinuz)
+for f in "${signed[@]}"; do
+  sbverify --cert "$cert" "$f" >/dev/null 2>&1 ||
+    { echo "build.sh: ${f#"$extra/esp"} on the ESP is missing or not signed with $cert" >&2; exit 1; }
+done
 echo "build.sh: $out/torngat_$version.raw"

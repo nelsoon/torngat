@@ -7,7 +7,8 @@
 #    locked down.
 # 2. Firmware trusting only an unrelated certificate: the firmware refuses the image.
 #
-# Run it as a normal user (swtpm_setup refuses per-user configuration as root). Needs KVM, qemu, swtpm, OVMF, python3-virt-firmware, openssl, and an image built with KEY
+# Run it as a normal user (swtpm_setup refuses per-user configuration as root).
+# Needs KVM, qemu, swtpm, OVMF, python3-virt-firmware, openssl, and an image built with KEY
 # authorized. Environment:
 #   SSH_KEY   private key whose public half is the image's root authorized key (required)
 #   CERT      certificate the image is signed with (required: image/keys is readable by root only)
@@ -27,14 +28,20 @@ guest() {
 }
 stop() {
   [ -n "$boot_pid" ] || return 0
-  kill "$(cat "$1/qemu.pid" 2>/dev/null)" 2>/dev/null || true
+  # boot.sh may still be copying the disk: give QEMU time to appear rather than leave it running.
+  for _ in $(seq 60); do
+    [ -s "$dir/qemu.pid" ] && break
+    kill -0 "$boot_pid" 2>/dev/null || break
+    sleep 1
+  done
+  kill "$(cat "$dir/qemu.pid" 2>/dev/null)" 2>/dev/null || true
   wait "$boot_pid" 2>/dev/null || true
   boot_pid=
 }
 cleanup() {
   local rc=$?
   set +e
-  stop "${dir:-$work}"
+  stop
   if [ "$rc" = 0 ]; then rm -rf "$work"; else echo "workdir kept: $work" >&2; fi
 }
 trap cleanup EXIT
@@ -57,7 +64,8 @@ up=
 for _ in $(seq 60); do
   alive
   if guest true 2>/dev/null; then up=1; break; fi
-  grep -aq 'Access Denied' "$dir/serial.log" 2>/dev/null && fail "the firmware refused the image: not signed with $cert?"
+  grep -aq 'Access Denied' "$dir/serial.log" 2>/dev/null &&
+    fail "the firmware refused the image: not signed with $cert?"
   sleep 2
 done
 [ -n "$up" ] || fail "no SSH with our certificate enrolled (see $dir/serial.log)"
@@ -65,7 +73,7 @@ done
 sb=$(guest 'od -An -tu1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c' | tr -d ' ')
 [ "$sb" = 1 ] || fail "Secure Boot is not on in the guest"
 guest grep -q '\[integrity\]' /sys/kernel/security/lockdown || fail "the kernel is not locked down"
-stop "$dir"
+stop
 echo "ok: boots with our certificate, Secure Boot on, kernel locked down"
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=unrelated \
@@ -79,6 +87,6 @@ for _ in $(seq 60); do
   sleep 2
 done
 [ -n "$refused" ] || fail "the firmware did not refuse the image (see $dir/serial.log)"
-stop "$dir"
+stop
 echo "ok: refused with an unrelated certificate"
 echo "PASS"

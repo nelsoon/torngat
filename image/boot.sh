@@ -51,7 +51,7 @@ trap 'swtpm_ioctl -s --unix "$work/swtpm.sock" 2>/dev/null || true' EXIT
 
 serial=stdio
 [ -n "${SERIAL:-}" ] && serial=file:$SERIAL
-qemu-system-x86_64 -enable-kvm -machine "$machine" "${extra[@]}" -cpu host -smp "${SMP:-2}" -m "${MEM:-3072}" \
+qemu-system-x86_64 -enable-kvm -machine "$machine" -cpu host -smp "${SMP:-2}" -m "${MEM:-3072}" "${extra[@]}" \
   -drive if=pflash,format=raw,readonly=on,file="$code" \
   -drive if=pflash,format=raw,file="$work/vars.fd" \
   -drive file="$work/disk.raw",if=virtio,format=raw \
