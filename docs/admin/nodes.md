@@ -7,8 +7,7 @@
 
 ## Names
 
-Every node needs its own name: lowercase letters, digits and `-`, starting with a letter. The default is the
-host name, which is `torngat` on every image, so always pass `--name`. A name cannot be used again, as
+Every node needs its own name: lowercase letters, digits and `-`, starting with a letter. A name cannot be used again, as
 nodes cannot be removed yet.
 
 ## Add a node

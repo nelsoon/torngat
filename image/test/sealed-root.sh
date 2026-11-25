@@ -28,27 +28,6 @@ keys=$(realpath "${KEYS:?set KEYS to a directory with the dev signing keys}")
 port=${SSH_PORT:-2222}
 . "$here/lib.sh"
 
-prov=/var/lib/torngat-seal/provisional.key
-dev='$(cryptsetup status root | sed -n "s/^ *device: *//p")'
-slots() { guest "systemd-cryptenroll $dev" | awk 'NR > 1 { print $2 }' | sort | xargs; }
-expect_locked() { # WHAT
-  for _ in $(seq 60); do
-    alive
-    if grep -aqi 'enter recovery key\|enter passphrase' "$dir/serial.log" 2>/dev/null; then
-      echo "ok: locked: $1"
-      return
-    fi
-    if guest true 2>/dev/null; then fail "$1: the root was unlocked"; fi
-    sleep 2
-  done
-  fail "$1: no recovery key prompt (see $dir/serial.log)"
-}
-# Types a line on the console. The key only goes through a pipe.
-type_line() {
-  python3 -c 'import socket, sys, time
-s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(sys.stdin.buffer.read() + b"\r"); time.sleep(2)' "$dir/console.sock"
-}
-
 virt-fw-vars -i /usr/share/OVMF/OVMF_VARS_4M.ms.fd -o "$work/setup.fd" -d PK \
   >"$work/vars.log" 2>&1 || { cat "$work/vars.log" >&2; fail "virt-fw-vars"; }
 start node "$work/setup.fd"
@@ -181,6 +160,21 @@ expect_up "resealed on another TPM"
 shut_down
 rm "$work/thief/disk.raw"
 echo "ok: resealed on another TPM"
+
+# The TPM turned off, and a key file planted where a machine without a TPM has it.
+esp=$(/usr/sbin/sfdisk -J "$work/node/disk.raw" | jq '.partitiontable.partitions[0].start * 512')
+mmd -i "$work/node/disk.raw@@$esp" ::/torngat
+printf '%064d' 0 | mcopy -i "$work/node/disk.raw@@$esp" - ::/torngat/root.key
+NO_TPM=1 REUSE=1 start node "$work/setup.fd"
+expect_locked "the TPM turned off"
+printf %s "$recovery" | type_line
+expect_up "recovery key with the TPM turned off"
+guest test -e /var/lib/torngat/node.json || fail "state lost"
+shut_down
+REUSE=1 start node "$work/setup.fd"
+expect_up "the TPM turned on again"
+shut_down
+mdeltree -i "$work/node/disk.raw@@$esp" ::/torngat
 
 qemu_args=(-smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=rd.systemd.debug_shell=1")
 REUSE=1 start node "$work/setup.fd"

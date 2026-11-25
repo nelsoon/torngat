@@ -79,3 +79,24 @@ shut_down() { # cleanly, unlike stop
   ! kill -0 "$boot_pid" 2>/dev/null || fail "the guest did not power off"
   stop
 }
+
+prov=/var/lib/torngat-seal/provisional.key
+dev='$(cryptsetup status root | sed -n "s/^ *device: *//p")'
+slots() { guest "systemd-cryptenroll $dev" | awk 'NR > 1 { print $2 }' | sort | xargs; }
+expect_locked() { # WHAT
+  for _ in $(seq 60); do
+    alive
+    if grep -aqi 'enter recovery key\|enter passphrase' "$dir/serial.log" 2>/dev/null; then
+      echo "ok: locked: $1"
+      return
+    fi
+    if guest true 2>/dev/null; then fail "$1: the root was unlocked"; fi
+    sleep 2
+  done
+  fail "$1: no recovery key prompt (see $dir/serial.log)"
+}
+# Types a line on the console. The key only goes through a pipe.
+type_line() {
+  python3 -c 'import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(sys.stdin.buffer.read() + b"\r"); time.sleep(2)' "$dir/console.sock"
+}

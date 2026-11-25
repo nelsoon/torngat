@@ -1,0 +1,12 @@
+#!/bin/bash
+# Unlocks the root, and asks for the recovery key on the console if that fails.
+set -euo pipefail
+# A machine without a TPM: make-root found the key on the boot partition.
+key=/run/torngat/root.key
+options=luks,discard
+if [ ! -e "$key" ]; then
+  key=-
+  # The volume key is measured into PCR 15.
+  options+=,tpm2-device=auto,tpm2-measure-pcr=yes
+fi
+exec systemd-cryptsetup attach root /dev/gpt-auto-root-luks "$key" "$options"

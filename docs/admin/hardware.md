@@ -3,7 +3,8 @@
 ## Needed
 
 - x86-64 with hardware virtualization, UEFI and Secure Boot. Legacy BIOS does not work.
-- A TPM 2.0 with SHA-256 PCRs. Without one the first boot stops.
+- A TPM 2.0 with SHA-256 PCRs, strongly recommended, and needed on a controller that matters. See [without a
+  TPM](disk-encryption.md#without-a-tpm).
 - A system disk with 512-byte logical sectors. The whole disk is used.
 - Console access (a BMC's remote console or a screen): the recovery key can only be typed there.
 

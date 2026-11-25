@@ -50,9 +50,9 @@ enum Cmd {
     Init {
         #[arg(long, default_value = "/var/lib/torngat")]
         data: PathBuf,
-        /// Node name (default: the host name).
+        /// Node name, unique in the cluster.
         #[arg(long)]
-        name: Option<String>,
+        name: String,
         /// Whether nodes must hold their key in an attested TPM.
         #[arg(long, value_enum, default_value_t = TpmRequirement::Required)]
         tpm: TpmRequirement,
@@ -63,8 +63,8 @@ enum Cmd {
         /// Without any, TPM joins need a token pinned to the TPM (`tpm-pin`).
         #[arg(long)]
         tpm_ca: Vec<PathBuf>,
-        /// Set the node up although the host's root file system is not sealed to its TPM yet
-        /// (lab use; see `torngat-seal-root`).
+        /// Set the node up although the host's root file system is not sealed to its TPM, so that a
+        /// stolen disk gives everything on it away (see `torngat-seal-root`).
         #[arg(long)]
         allow_unsealed_root: bool,
     },
@@ -78,20 +78,20 @@ enum Cmd {
         /// File holding the join token (keeps it out of the process list and shell history).
         #[arg(long)]
         token_file: PathBuf,
-        /// Node name (default: the host name).
+        /// Node name, unique in the cluster.
         #[arg(long)]
-        name: Option<String>,
+        name: String,
         #[arg(long, default_value_t = JOIN_PORT)]
         join_port: u16,
         #[arg(long, default_value_t = CONTROL_PORT)]
         control_port: u16,
         /// Where to keep the node key.
-        #[arg(long, value_enum, default_value_t = TpmMode::Auto)]
+        #[arg(long, value_enum, default_value_t = TpmMode::On)]
         tpm: TpmMode,
         #[arg(long, default_value = DEFAULT_TCTI)]
         tpm_device: String,
-        /// Set the node up although the host's root file system is not sealed to its TPM yet
-        /// (lab use; see `torngat-seal-root`).
+        /// Set the node up although the host's root file system is not sealed to its TPM, so that a
+        /// stolen disk gives everything on it away (see `torngat-seal-root`).
         #[arg(long)]
         allow_unsealed_root: bool,
     },
@@ -118,9 +118,6 @@ enum Cmd {
         join: SocketAddr,
     },
 }
-
-/// Present on the host image until `torngat-seal-root` has run: the disk key is still next to it.
-const PROVISIONAL_ROOT_KEY: &str = "/var/lib/torngat-seal/provisional.key";
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -187,19 +184,8 @@ fn write_private(path: &Path, data: &[u8]) -> Res<()> {
     Ok(())
 }
 
-fn node_name(arg: Option<String>) -> Res<Name> {
-    let raw = match arg {
-        Some(n) => n,
-        None => {
-            let h = std::fs::read_to_string("/proc/sys/kernel/hostname")?;
-            h.trim()
-                .split('.')
-                .next()
-                .unwrap_or_default()
-                .to_lowercase()
-        }
-    };
-    Name::new(&raw).map_err(|e| format!("invalid node name {raw:?} (use --name): {e}").into())
+fn node_name(raw: &str) -> Res<Name> {
+    Name::new(raw).map_err(|e| format!("invalid node name {raw:?}: {e}").into())
 }
 
 /// Refuses to set up over an existing state directory.
@@ -266,25 +252,33 @@ async fn open_store(data: &Path) -> Res<torngat_store::Store> {
     Ok(store)
 }
 
-/// Refuses to put secrets on a root file system that is not sealed yet.
+/// Refuses to put secrets on a root file system that does not protect them.
 fn check_root_sealed(allow_unsealed: bool) -> Res<()> {
-    // An error (e.g. no permission to look) counts as unsealed.
-    if allow_unsealed || matches!(Path::new(PROVISIONAL_ROOT_KEY).try_exists(), Ok(false)) {
+    use torngat_agent::inventory::{DiskProtection, disk_protection};
+    let why = match disk_protection() {
+        DiskProtection::NoMarker => return Ok(()),
+        DiskProtection::Provisional => {
+            "is not sealed to this machine's TPM yet: run torngat-seal-root first"
+        }
+        DiskProtection::Unprotected => {
+            "has its key on the boot partition, as this machine has no TPM: anyone with the disk can read it"
+        }
+    };
+    if allow_unsealed {
+        eprintln!("WARNING: the root file system {why}");
         return Ok(());
     }
-    Err("the root file system is not sealed to this machine's TPM yet: run torngat-seal-root first \
-         (or pass --allow-unsealed-root in a lab)"
-        .into())
+    Err(format!("the root file system {why} (--allow-unsealed-root accepts that)").into())
 }
 
 async fn init(
     data: PathBuf,
-    name: Option<String>,
+    name: String,
     tpm: TpmRequirement,
     tpm_device: String,
     tpm_ca: Vec<PathBuf>,
 ) -> Res<()> {
-    let name = node_name(name)?;
+    let name = node_name(&name)?;
     fresh(&data)?;
     if data.join("pki").exists() || data.join("store").exists() || data.join("identity").exists() {
         return Err(format!(
@@ -427,11 +421,11 @@ async fn join(
     data: PathBuf,
     controller: String,
     token_file: PathBuf,
-    name: Option<String>,
+    name: String,
     (join_port, control_port): (u16, u16),
     (tpm, tpm_device): (TpmMode, String),
 ) -> Res<()> {
-    let name = node_name(name)?;
+    let name = node_name(&name)?;
     fresh(&data)?;
     let token = std::fs::read_to_string(&token_file)?;
     let join_addr = host_port(&controller, join_port)?;
