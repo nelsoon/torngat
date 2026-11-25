@@ -17,7 +17,8 @@
 | ... "a factory reset is requested" | | reboot first: it makes the root anew |
 | `torngat-enroll-secure-boot`: "no db entries" | the vendor keys were cleared too | restore the factory keys, then clear only the platform key |
 | ... "already set up" | enrolling would erase the node | reinstall it |
-| `the TPM refused the node key` | TPM cleared or replaced | join again, as the message says |
+| `the TPM refused the node key` | TPM cleared or replaced | join again as the message says, under a new name. A controller: reinstall the cluster |
+| `node name is already in use` | the name was used before | another `--name` |
 | `/dev/kvm` missing | virtualization is off | turn it on in the firmware |
 
 To look at a node: `journalctl -b`, `systemctl --failed`, `bootctl status`, `systemd-cryptenroll <root

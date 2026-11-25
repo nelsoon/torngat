@@ -33,8 +33,11 @@ To stop it, read its `metadata.etag`, then send a `PATCH`:
 {"etag": "<etag>", "spec": {"vcpus": 2, "memory_mib": 2048, "power_state": "stopped"}}
 ```
 
-- Creating, changing and deleting take time: `status.phase` goes through `pending`, `scheduled`,
-  `starting` and `running`. A create answers with an operation; `GET /v1/operations/{id}` follows it.
+- A create answers with an operation; `GET /v1/operations/{id}` follows it. Changing and deleting answer at
+  once, and the instance takes a moment to follow: `status.phase` is `pending`, `scheduled`, `starting`,
+  `running`, `stopping`, `stopped` or `failed`.
+- Organization, project and instance names: lowercase letters, digits and `-`, starting with a letter, at
+  most 63 characters.
 - `spec` is replaced as a whole by a `PATCH`. Read the object again if the `etag` is refused: someone
   else changed it.
 - Memory is 64 MiB or more.

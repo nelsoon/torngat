@@ -15,7 +15,7 @@ Torngat is pre-alpha: do not run untrusted tenants or data you cannot lose on it
 2. Keep the vendor's Secure Boot keys; clear only the platform key.
 3. Enroll the key **before** setting up the node: it erases the root file system.
 4. The recovery key is shown once. Store it away from the machine. Without
-   it you cannot make another one, and a TPM or firmware change means reinstalling the node.
+   it, a TPM or Secure Boot change means reinstalling the node.
 5. Until it is sealed, a machine must stay in trusted hands.
 6. A Secure Boot key or `dbx` update makes the TPM refuse at the next boot. Have the recovery key and
    console access ready first.

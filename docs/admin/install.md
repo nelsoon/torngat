@@ -14,7 +14,7 @@
    reboot
    ```
 
-6. Check that Secure Boot is on, then seal. Store the recovery key somewhere else:
+6. If Secure Boot is not on by itself, turn it on in the firmware setup. Check, then seal. Store the recovery key somewhere else:
 
    ```sh
    bootctl status
@@ -24,7 +24,7 @@
 7. Set the node up. On the first one:
 
    ```sh
-   torngatd init
+   torngatd init --name n1
    systemctl start torngatd
    ```
 

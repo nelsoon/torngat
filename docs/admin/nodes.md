@@ -5,12 +5,18 @@
 - `admin-token`: full access to the API;
 - `join-token`: for one node, for 24 hours.
 
+## Names
+
+Every node needs its own name: lowercase letters, digits and `-`, starting with a letter. The default is the
+host name, which is `torngat` on every image, so always pass `--name`. A name cannot be used again, as
+nodes cannot be removed yet.
+
 ## Add a node
 
 Install and seal it, then:
 
 ```sh
-torngatd join --controller <controller> --token-file <file>
+torngatd join --name n2 --controller <controller> --token-file <file>
 systemctl start torngatd
 ```
 
@@ -21,7 +27,8 @@ trust, in one of two ways:
 - a token made for that TPM. Read its pin on the new node with `torngatd tpm-pin` and pass it as
   `ek_sha256`.
 
-Make a token (API on the controller, through an SSH tunnel):
+Make a token (API on the controller, through an SSH tunnel). `TOKEN` is the content of
+`/var/lib/torngat/admin-token`; with `node`, only a node of that name can use the token:
 
 ```sh
 curl -sS --config <(printf 'header = "Authorization: Bearer %s"\n' "$TOKEN") \
@@ -30,7 +37,7 @@ curl -sS --config <(printf 'header = "Authorization: Bearer %s"\n' "$TOKEN") \
   http://127.0.0.1:8080/v1/platform/joinTokens
 ```
 
-The answer holds the token: write it to a file only root can read, and delete it after joining.
+The answer's `token` is what the node needs: write it to a file only root can read, and delete it after joining.
 
 | Operation | Request |
 |---|---|

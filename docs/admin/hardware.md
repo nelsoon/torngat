@@ -4,7 +4,7 @@
 
 - x86-64 with hardware virtualization, UEFI and Secure Boot. Legacy BIOS does not work.
 - A TPM 2.0 with SHA-256 PCRs. Without one the first boot stops.
-- A system disk with 512-byte logical sectors. 8 GB is enough to test. The whole disk is used.
+- A system disk with 512-byte logical sectors. The whole disk is used.
 - Console access (a BMC's remote console or a screen): the recovery key can only be typed there.
 
 Tested in virtual machines only so far, not on server hardware.
