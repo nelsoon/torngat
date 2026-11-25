@@ -6,8 +6,8 @@
 #
 # The image is copied (the original stays pristine) and the copy grown to DISK_SIZE (default 8G)
 # to exercise root growth. The serial console is on stdio unless SERIAL is set to a file.
-# With SECURE_BOOT_CERT=FILE (PEM) Secure Boot is on and trusts only that certificate (needs
-# virt-fw-vars); set it again when reusing the WORKDIR.
+# SECURE_BOOT_VARS=FILE uses firmware with Secure Boot and starts from that variable store (see
+# test/secure-boot.sh for making one); set it again when reusing the WORKDIR.
 # With REUSE=1 an existing WORKDIR (disk, UEFI variables, TPM state) is booted again as it is, e.g.
 # to test a reboot or an update.
 set -euo pipefail
@@ -20,21 +20,13 @@ work=$(mkdir -p "$work" && cd "$work" && pwd)
 code=/usr/share/OVMF/OVMF_CODE_4M.fd
 machine=q35
 extra=()
-if [ -n "${SECURE_BOOT_CERT:-}" ]; then
+if [ -n "${SECURE_BOOT_VARS:-}" ]; then
   code=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd
   machine=q35,smm=on
   extra=(-global driver=cfi.pflash01,property=secure,value=on)
 fi
 if [ -z "${REUSE:-}" ]; then
-  if [ -n "${SECURE_BOOT_CERT:-}" ]; then
-    owner=7a3f2c1e-5d0b-4f6a-9c38-1b2e4d6f8a90 # any fixed GUID
-    virt-fw-vars -i /usr/share/OVMF/OVMF_VARS_4M.fd -o "$work/vars.fd" --secure-boot \
-      --set-pk "$owner" "$SECURE_BOOT_CERT" --add-kek "$owner" "$SECURE_BOOT_CERT" \
-      --add-db "$owner" "$SECURE_BOOT_CERT" >"$work/vars.log" 2>&1 ||
-      { cat "$work/vars.log" >&2; exit 1; }
-  else
-    cp /usr/share/OVMF/OVMF_VARS_4M.fd "$work/vars.fd"
-  fi
+  cp "${SECURE_BOOT_VARS:-/usr/share/OVMF/OVMF_VARS_4M.fd}" "$work/vars.fd"
   cp --sparse=always "$img" "$work/disk.raw"
   truncate -s "${DISK_SIZE:-8G}" "$work/disk.raw"
 

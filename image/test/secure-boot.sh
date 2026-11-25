@@ -6,12 +6,16 @@
 # 1. Firmware trusting only our certificate: the image boots, Secure Boot is on and the kernel is
 #    locked down.
 # 2. Firmware trusting only an unrelated certificate: the firmware refuses the image.
+# 3. A changed kernel command line in the UKI is refused.
+# 4. Setup Mode without vendor keys: enrollment is refused.
+# 5. Setup Mode with vendor keys: enrollment keeps them, and after a reboot Secure Boot is on.
 #
 # Run it as a normal user (swtpm_setup refuses per-user configuration as root).
-# Needs KVM, qemu, swtpm, OVMF, python3-virt-firmware, openssl, and an image built with KEY
+# Needs KVM, qemu, swtpm, OVMF, python3-virt-firmware, openssl, mtools, jq, fdisk, and an image built with KEY
 # authorized. Environment:
 #   SSH_KEY   private key whose public half is the image's root authorized key (required)
-#   CERT      certificate the image is signed with (required: image/keys is readable by root only)
+#   CERT      certificate the image is signed with (required: image/keys is readable by root
+#             only; dev-signing.crt for a --dev image)
 #   SSH_PORT  guest SSH on localhost (default 2222)
 set -euo pipefail
 img=${1:?usage: secure-boot.sh IMAGE}
@@ -37,7 +41,13 @@ stop() {
   kill "$(cat "$dir/qemu.pid" 2>/dev/null)" 2>/dev/null || true
   wait "$boot_pid" 2>/dev/null || true
   boot_pid=
+  # swtpm exits a little after QEMU: the next boot must not race it for the state directory.
+  local tpm
+  tpm=$(cat "$dir/swtpm.pid" 2>/dev/null) || return 0
+  for _ in $(seq 50); do kill -0 "$tpm" 2>/dev/null || return 0; sleep 0.1; done
+  echo "swtpm did not exit" >&2
 }
+done_with() { stop; rm -f "$dir/disk.raw"; }
 cleanup() {
   local rc=$?
   set +e
@@ -47,46 +57,104 @@ cleanup() {
 trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-# The unrelated VM must not be answered by something else on the port.
+# The VM must not be confused with something else on the port.
 if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then fail "port $port is in use"; fi
 
-start() { # NAME CERT
+start() { # NAME VARS [IMAGE]; with REUSE=1 boots NAME again as it is
   dir=$work/$1
-  mkdir "$dir"
-  SECURE_BOOT_CERT=$2 SERIAL="$dir/serial.log" SSH_PORT=$port \
-    "$here/../boot.sh" "$img" "$dir" -- -pidfile "$dir/qemu.pid" >"$dir/boot.log" 2>&1 &
+  mkdir -p "$dir"
+  rm -f "$dir/qemu.pid" "$dir/serial.log"
+  SECURE_BOOT_VARS=$2 SERIAL="$dir/serial.log" SSH_PORT=$port \
+    "$here/../boot.sh" "${3:-$img}" "$dir" -- -pidfile "$dir/qemu.pid" >"$dir/boot.log" 2>&1 &
   boot_pid=$!
 }
 alive() { kill -0 "$boot_pid" 2>/dev/null || { cat "$dir/boot.log" >&2; fail "boot.sh exited"; }; }
+refused() { grep -aqi 'access denied' "$dir/serial.log" 2>/dev/null; }
+expect_up() { # WHAT
+  for _ in $(seq 60); do
+    alive
+    if guest true 2>/dev/null; then return; fi
+    if refused; then fail "$1: the firmware refused the image"; fi
+    sleep 2
+  done
+  fail "$1: no SSH (see $dir/serial.log)"
+}
+expect_refused() { # WHAT
+  for _ in $(seq 60); do
+    alive
+    if refused; then done_with; echo "ok: refused: $1"; return; fi
+    if guest true 2>/dev/null; then fail "$1: the image boots"; fi
+    sleep 2
+  done
+  fail "$1: the firmware did not refuse the image (see $dir/serial.log)"
+}
+# The byte after the variable's 4 bytes of attributes is 1 when Secure Boot is enforced.
+expect_enforced() {
+  local sb
+  sb=$(guest 'od -An -tu1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c' | tr -d ' ')
+  [ "$sb" = 1 ] || fail "Secure Boot is not on in the guest"
+  guest grep -q '\[integrity\]' /sys/kernel/security/lockdown || fail "the kernel is not locked down"
+}
+only_trusts() { # CERT VARS
+  local owner=7a3f2c1e-5d0b-4f6a-9c38-1b2e4d6f8a90
+  virt-fw-vars -i /usr/share/OVMF/OVMF_VARS_4M.fd -o "$2" --secure-boot --set-pk "$owner" "$1" \
+    --add-kek "$owner" "$1" --add-db "$owner" "$1" >"$work/vars.log" 2>&1 ||
+    { cat "$work/vars.log" >&2; fail "virt-fw-vars"; }
+}
 
-start ours "$cert"
-up=
-for _ in $(seq 60); do
-  alive
-  if guest true 2>/dev/null; then up=1; break; fi
-  grep -aq 'Access Denied' "$dir/serial.log" 2>/dev/null &&
-    fail "the firmware refused the image: not signed with $cert?"
-  sleep 2
-done
-[ -n "$up" ] || fail "no SSH with our certificate enrolled (see $dir/serial.log)"
-# The last byte of the SecureBoot variable (after 4 bytes of attributes) is 1 when it is enforced.
-sb=$(guest 'od -An -tu1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c' | tr -d ' ')
-[ "$sb" = 1 ] || fail "Secure Boot is not on in the guest"
-guest grep -q '\[integrity\]' /sys/kernel/security/lockdown || fail "the kernel is not locked down"
-stop
+only_trusts "$cert" "$work/ours.fd"
+start ours "$work/ours.fd"
+expect_up "our certificate"
+expect_enforced
+done_with
 echo "ok: boots with our certificate, Secure Boot on, kernel locked down"
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=unrelated \
   -keyout "$work/other.key" -out "$work/other.crt" 2>/dev/null
-start other "$work/other.crt"
-refused=
-for _ in $(seq 60); do
-  alive
-  if grep -aq 'Access Denied' "$dir/serial.log" 2>/dev/null; then refused=1; break; fi
-  if guest true 2>/dev/null; then fail "the image boots with an unrelated certificate enrolled"; fi
-  sleep 2
-done
-[ -n "$refused" ] || fail "the firmware did not refuse the image (see $dir/serial.log)"
+only_trusts "$work/other.crt" "$work/other.fd"
+start other "$work/other.fd"
+expect_refused "unrelated certificate"
+
+# The ESP is the first partition.
+esp=$(/usr/sbin/sfdisk -J "$img" | jq '.partitiontable.partitions[0].start * 512')
+cp --sparse=always "$img" "$work/tampered.raw"
+uki=$(mdir -b -i "$img@@$esp" ::/EFI/Linux | grep -m1 '\.efi')
+mcopy -n -i "$img@@$esp" "$uki" "$work/uki.efi"
+cp "$work/uki.efi" "$work/uki.orig"
+sed -i 's/systemd.firstboot=no/systemd.firstboot=ya/' "$work/uki.efi"
+! cmp -s "$work/uki.efi" "$work/uki.orig" || fail "the command line to change was not found in the UKI"
+mcopy -o -i "$work/tampered.raw@@$esp" "$work/uki.efi" "$uki"
+start tampered "$work/ours.fd" "$work/tampered.raw"
+expect_refused "changed kernel command line"
+rm -f "$work/tampered.raw" "$work/uki.efi" "$work/uki.orig"
+
+start setup-empty /usr/share/OVMF/OVMF_VARS_4M.fd
+expect_up "Setup Mode"
+if guest torngat-enroll-secure-boot >"$work/enroll.log" 2>&1; then fail "enrolled without vendor keys"; fi
+grep -q 'no db entries' "$work/enroll.log" || { cat "$work/enroll.log" >&2; fail "unexpected refusal"; }
+done_with
+echo "ok: enrollment without vendor keys refused"
+
+# The firmware's factory keys, without the platform key.
+virt-fw-vars -i /usr/share/OVMF/OVMF_VARS_4M.ms.fd -o "$work/setup.fd" -d PK \
+  >"$work/vars.log" 2>&1 || { cat "$work/vars.log" >&2; fail "virt-fw-vars"; }
+start setup "$work/setup.fd"
+expect_up "Setup Mode with vendor keys"
+db='/sys/firmware/efi/efivars/db-d719b2cb-3d3a-4596-a3bc-dad00e67656f'
+guest "cat $db | tail -c +5" >"$work/db.before"
+guest torngat-enroll-secure-boot || fail "enrollment"
+guest systemctl poweroff || true
+for _ in $(seq 60); do kill -0 "$boot_pid" 2>/dev/null || break; sleep 1; done
+kill -0 "$boot_pid" 2>/dev/null && fail "the guest did not power off"
 stop
-echo "ok: refused with an unrelated certificate"
+REUSE=1 start setup "$work/setup.fd"
+expect_up "after enrollment"
+expect_enforced
+guest "cat $db | tail -c +5" >"$work/db.after"
+[ "$(stat -c %s "$work/db.after")" -gt "$(stat -c %s "$work/db.before")" ] || fail "db did not grow"
+cmp -s -n "$(stat -c %s "$work/db.before")" "$work/db.before" "$work/db.after" || fail "vendor keys changed"
+if guest torngat-enroll-secure-boot >"$work/enroll.log" 2>&1; then fail "enrolled outside Setup Mode"; fi
+grep -q 'not in Setup Mode' "$work/enroll.log" || { cat "$work/enroll.log" >&2; fail "unexpected refusal"; }
+stop
+echo "ok: enrollment keeps vendor keys, Secure Boot on after a reboot"
 echo "PASS"
