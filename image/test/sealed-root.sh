@@ -10,17 +10,21 @@
 #    does not act on the root's fstab.
 # 4. With Secure Boot in another state the TPM refuses; the recovery key on the console opens it, and
 #    --reseal accepts the new state.
+#    A different UKI signed with the same keys (an upgrade) unlocks; one whose TPM policy is signed with
+#    another key does not.
 # 5. Another machine's TPM does not unlock it, until it is resealed there. Nor does a kernel command
 #    line extended by the firmware.
 # 6. An unencrypted file system in place of the root is not booted.
 # 7. A power cut during the first boot leaves an image that still boots.
 #
-# Run it as a normal user. Needs what secure-boot.sh needs, plus python3. Environment: see there.
+# Run it as a normal user. Needs what secure-boot.sh needs, plus python3, systemd-ukify, systemd-boot-efi and binutils. Environment: see there, and
+#   KEYS      directory with readable copies of the dev image's dev-signing.* and dev-pcr.* (required)
 set -euo pipefail
 img=${1:?usage: sealed-root.sh IMAGE}
 : "${SSH_KEY:?set SSH_KEY to the private key of the image root user}"
 here=$(cd "$(dirname "$0")" && pwd)
 cert=$(realpath "${CERT:?set CERT to the certificate the image is signed with}")
+keys=$(realpath "${KEYS:?set KEYS to a directory with the dev signing keys}")
 port=${SSH_PORT:-2222}
 . "$here/lib.sh"
 
@@ -91,8 +95,14 @@ if guest "SYSTEMD_LOG_LEVEL=debug systemd-cryptenroll --unlock-tpm2-device=auto 
   fail "the running system can unseal the root key"
 fi
 [ "$(guest findmnt -no FSTYPE /probe)" = tmpfs ] || fail "the fstab probe is wrong"
-if guest journalctl -b -o cat | grep -q '/sysroot/probe\|sysroot-probe'; then fail "the initrd acted on the root's fstab"; fi
-[ -n "$(guest journalctl -b -u torngat-root-barrier -o cat --grep torngat:root-opened)" ] || fail "no barrier in the initrd"
+# The initrd's checker sees the entry (so the journal is complete), but nothing mounts it.
+guest journalctl --flush
+guest journalctl -b -o cat >"$work/journal"
+grep -q '/sysroot/probe should be mounted in the initrd' "$work/journal" || fail "no trace of the initrd in the journal"
+if grep -q 'Mount.* sysroot-probe.mount' "$work/journal"; then fail "the initrd acted on the root's fstab"; fi
+# What was measured into PCR 15, in order (the journal may not have the initrd's messages yet).
+measured=$(guest cat /run/log/systemd/tpm2-measure.log | tr '\036' '\n' | grep -o 'cryptsetup:root\|torngat:root-opened' | xargs)
+[ "$measured" = "cryptsetup:root torngat:root-opened" ] || fail "no barrier in the initrd: $measured"
 [ "$(guest cat /sys/class/tpm/tpm0/pcr-sha256/12 | tr -d 0)" = "" ] || fail "PCR 12 is not zero"
 # Refused by the policy, not by some other error.
 grep -q "Couldn't find signature" "$work/out" || { cat "$work/out" >&2; fail "unexpected unseal error"; }
@@ -119,6 +129,39 @@ REUSE=1 start node "$work/setup.fd"
 expect_locked "the previous Secure Boot state after resealing"
 stop
 cp "$work/ours.fd" "$work/node/vars.fd"
+
+# Upgrade: another UKI, as the firmware and the TPM see it (changed command line and initrd).
+esp=$(/usr/sbin/sfdisk -J "$work/node/disk.raw" | jq '.partitiontable.partitions[0].start * 512')
+disk=$work/node/disk.raw@@$esp
+uki=$(mdir -b -i "$disk" ::/EFI/Linux | grep -m1 '\.efi')
+mcopy -n -i "$disk" "$uki" "$work/uki.efi"
+for s in linux initrd osrel uname cmdline; do
+  objcopy -O binary --only-section=".$s" "$work/uki.efi" "$work/uki.$s"
+done
+for s in osrel uname cmdline; do tr -d '\0' <"$work/uki.$s" >"$work/uki.tmp"; mv "$work/uki.tmp" "$work/uki.$s"; done
+printf ' torngat.test=1' >>"$work/uki.cmdline"
+(cd "$work" && echo upgrade >upgraded && echo upgraded | cpio -o -H newc --quiet) >"$work/extra.cpio"
+make_uki() { # PCR-KEY OUTPUT
+  /usr/lib/systemd/ukify build --linux "$work/uki.linux" --initrd "$work/uki.initrd" --initrd "$work/extra.cpio" \
+    --cmdline "@$work/uki.cmdline" --os-release "@$work/uki.osrel" --uname "$(cat "$work/uki.uname")" \
+    --pcr-private-key "$1" --phases enter-initrd --pcr-banks sha256 --no-sign-kernel \
+    --secureboot-private-key "$keys/dev-signing.key" --secureboot-certificate "$keys/dev-signing.crt" \
+    --output "$2" >"$work/ukify.log" 2>&1 || { tail -5 "$work/ukify.log" >&2; fail "ukify"; }
+}
+make_uki "$keys/dev-pcr.key" "$work/upgrade.efi"
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$work/other-pcr.key" 2>/dev/null
+make_uki "$work/other-pcr.key" "$work/other.efi"
+mcopy -o -i "$disk" "$work/upgrade.efi" "$uki"
+REUSE=1 start node "$work/setup.fd"
+expect_up "another UKI, same keys"
+guest grep -q torngat.test=1 /proc/cmdline || fail "the other UKI was not booted"
+shut_down
+mcopy -o -i "$disk" "$work/other.efi" "$uki"
+REUSE=1 start node "$work/setup.fd"
+expect_locked "a UKI with a TPM policy signed by another key"
+stop
+mcopy -o -i "$disk" "$work/uki.efi" "$uki"
+echo "ok: upgrade"
 
 # The disk in another machine: same firmware state, new TPM.
 mkdir "$work/thief"
