@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds the Torngat host image (and the platform extension it ships with). Needs root (mkosi),
-# mkosi 25 or later, systemd-repart 257 or later and sbsigntool.
+# mkosi 25 or later, systemd-repart 257 or later,
+# systemd-ukify, sbsigntool, efitools and binutils.
 #
 #   sudo image/build.sh --torngatd PATH [--version V] [--authorized-keys FILE] [--dev]
 #
@@ -48,11 +49,22 @@ sysext=$("$here/sysext/build.sh" --torngatd "$bin" --version "$version" --key "$
   --cert "$cert" --out "$out")
 
 extra=$(mktemp -d)
-trap 'rm -rf "$extra"' EXIT
+trap 'rm -rf "$extra" "$extra.esl"' EXIT
 # The extra tree's own modes are copied onto the image: / must stay 0755, /root 0700.
 chmod 0755 "$extra"
 install -D -m 0644 "$cert" "$extra/usr/lib/verity.d/torngat.crt"
 install -D -m 0644 "$sysext" "$extra/var/lib/extensions/torngat-platform.raw"
+# For torngat-enroll-secure-boot: db and KEK are appended (-a), the platform key is self-signed.
+sb=$extra/usr/lib/torngat/secure-boot
+owner=7a3f2c1e-5d0b-4f6a-9c38-1b2e4d6f8a90 # says who added an entry; any fixed GUID
+install -d -m 0755 "$extra/usr/lib/torngat" "$sb"
+cert-to-efi-sig-list -g "$owner" "$cert" "$extra.esl"
+for v in PK KEK db; do
+  append=-a
+  [ "$v" = PK ] && append=
+  sign-efi-sig-list ${append:+"$append"} -g "$owner" -k "$key" -c "$cert" "$v" "$extra.esl" "$sb/$v.auth" >/dev/null
+  chmod 0644 "$sb/$v.auth"
+done
 if [ -n "$keys_file" ]; then
   install -d -m 0700 "$extra/root" "$extra/root/.ssh"
   install -m 0600 "$keys_file" "$extra/root/.ssh/authorized_keys"
@@ -65,12 +77,21 @@ args=(--image-version="$version" --extra-tree="$extra"
 cd "$here"
 mkosi "${args[@]}" -f build
 
-# mkosi silently installs a loader signed by someone else when there is none it can sign.
+# What boots must be signed with our key (mkosi silently installs a loader signed by someone else when
+# there is none it can sign), and nothing that accepts an arbitrary initrd or command line may be.
 systemd-dissect --copy-from "$out/torngat_$version.raw" /boot "$extra/esp"
-signed=("$extra/esp/EFI/BOOT/BOOTX64.EFI" "$extra/esp/EFI/systemd/systemd-bootx64.efi"
-  "$extra"/esp/torngat/*/vmlinuz)
-for f in "${signed[@]}"; do
-  sbverify --cert "$cert" "$f" >/dev/null 2>&1 ||
-    { echo "build.sh: ${f#"$extra/esp"} on the ESP is missing or not signed with $cert" >&2; exit 1; }
+signed_by_us() { sbverify --cert "$cert" "$1" >/dev/null 2>&1; }
+die() { echo "build.sh: $*" >&2; exit 1; }
+ukis=("$extra"/esp/EFI/Linux/*.efi)
+for f in "$extra/esp/EFI/BOOT/BOOTX64.EFI" "$extra/esp/EFI/systemd/systemd-bootx64.efi" "${ukis[@]}"; do
+  signed_by_us "$f" || die "${f#"$extra/esp"} on the ESP is missing or not signed with $cert"
 done
+for f in "${ukis[@]}"; do
+  objcopy -O binary --only-section=.linux "$f" "$extra/linux"
+  [ -s "$extra/linux" ] || die "no kernel in $f"
+  ! signed_by_us "$extra/linux" || die "the kernel inside ${f##*/} is signed with $cert"
+done
+while IFS= read -r f; do
+  ! signed_by_us "$f" || die "${f#"$extra/esp"}: a kernel outside a UKI is signed with $cert"
+done < <(find "$extra/esp" -name 'vmlinuz*')
 echo "build.sh: $out/torngat_$version.raw"
