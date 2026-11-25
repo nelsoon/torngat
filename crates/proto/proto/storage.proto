@@ -1,0 +1,139 @@
+syntax = "proto3";
+
+// Contract between the node agent and a storage driver. Drivers in this repository implement it in
+// process; a socket for others comes later, with driver authentication and sandboxing.
+//
+// - Every call is idempotent: repeating it after a crash or a lost answer is safe. A call that has
+//   nothing left to do succeeds.
+// - A driver never sees keys or plain text: the agent encrypts (LUKS2) on top of block devices.
+// - A driver only touches volumes that it created. It never creates, formats or erases a pool.
+// - Sizes are of the device, with the agent's LUKS2 header. Drivers round up to the pool's allocation
+//   unit and answer with the real size.
+// - One pool record of one cluster uses a volume group or ZFS pool at a time. Every call but ClaimPool
+//   fails with FAILED_PRECONDITION unless it carries this pool's mark.
+//
+// Errors: NOT_FOUND (no such pool or volume), RESOURCE_EXHAUSTED (no space), FAILED_PRECONDITION
+// (cannot be done in this state, such as deleting an attached volume), UNAVAILABLE (retry),
+// INTERNAL.
+package torngat.storage.v1;
+
+service VolumeDriver {
+  // Marks the volume group or ZFS pool with the cluster's and the pool's uid. Fails with
+  // FAILED_PRECONDITION if it carries another mark.
+  rpc ClaimPool(ClaimPoolRequest) returns (ClaimPoolResponse);
+  // Removes the mark, if it is this one. Fails with FAILED_PRECONDITION while there are volumes.
+  rpc ReleasePool(ReleasePoolRequest) returns (ReleasePoolResponse);
+  // The pool's size and what it can do. Changes nothing.
+  rpc GetPool(GetPoolRequest) returns (GetPoolResponse);
+  // Every volume of this driver in the pool, to find leftovers.
+  rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse);
+  // Makes a volume of at least this size. Succeeds only once its first and last 16 MiB are zero, so
+  // that the agent never finds someone else's encryption header; the rest may hold old data. An
+  // existing volume is left as it is, whatever its size and content: the agent looks at the answer
+  // and grows it.
+  rpc CreateVolume(CreateVolumeRequest) returns (CreateVolumeResponse);
+  // Grows a volume to at least this size, also while attached. Never shrinks it.
+  rpc GrowVolume(GrowVolumeRequest) returns (GrowVolumeResponse);
+  // Overwrites the first 16 MiB (the LUKS2 header), discards the blocks where the storage can, and
+  // removes the volume.
+  rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse);
+  // Makes the volume usable on this node.
+  rpc AttachVolume(AttachVolumeRequest) returns (AttachVolumeResponse);
+  rpc DetachVolume(DetachVolumeRequest) returns (DetachVolumeResponse);
+}
+
+// A pool on this node.
+message Pool {
+  // uid of the platform's pool record.
+  string uid = 1;
+  // uid of the cluster.
+  string cluster_uid = 3;
+  // Name of the volume group or ZFS pool.
+  string source = 2;
+}
+
+message Capabilities {
+  bool snapshots = 1;
+  bool checksums = 2;
+}
+
+message ClaimPoolRequest {
+  Pool pool = 1;
+}
+message ClaimPoolResponse {}
+
+message ReleasePoolRequest {
+  Pool pool = 1;
+}
+message ReleasePoolResponse {}
+
+message GetPoolRequest {
+  Pool pool = 1;
+}
+message GetPoolResponse {
+  // What volumes may use in total, not counting what the pool itself needs (such as parity and slop
+  // space) nor what others use.
+  uint64 capacity_bytes = 1;
+  Capabilities capabilities = 2;
+  uint64 allocation_unit_bytes = 3;
+}
+
+message VolumeInfo {
+  string uid = 1;
+  uint64 size_bytes = 2;
+  bool attached = 3;
+}
+
+message ListVolumesRequest {
+  Pool pool = 1;
+}
+message ListVolumesResponse {
+  repeated VolumeInfo volumes = 1;
+}
+
+message CreateVolumeRequest {
+  Pool pool = 1;
+  // uid of the volume.
+  string uid = 2;
+  uint64 size_bytes = 3;
+}
+message CreateVolumeResponse {
+  uint64 size_bytes = 1;
+}
+
+message GrowVolumeRequest {
+  Pool pool = 1;
+  string uid = 2;
+  uint64 size_bytes = 3;
+}
+message GrowVolumeResponse {
+  uint64 size_bytes = 1;
+}
+
+message DeleteVolumeRequest {
+  Pool pool = 1;
+  string uid = 2;
+}
+message DeleteVolumeResponse {}
+
+message AttachVolumeRequest {
+  Pool pool = 1;
+  string uid = 2;
+}
+message AttachVolumeResponse {
+  // More kinds will follow, such as a disk that QEMU opens itself. The agent refuses kinds it does
+  // not know, and any that is not a block device unless it declares that it encrypts.
+  oneof device {
+    BlockDevice block = 1;
+  }
+}
+message BlockDevice {
+  // Absolute path of the device on this node.
+  string path = 1;
+}
+
+message DetachVolumeRequest {
+  Pool pool = 1;
+  string uid = 2;
+}
+message DetachVolumeResponse {}

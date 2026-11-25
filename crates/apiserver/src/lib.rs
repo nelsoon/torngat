@@ -14,10 +14,12 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+mod crud;
 mod error;
 mod handlers;
 mod join_tokens;
 mod settings;
+mod storage;
 
 use std::net::SocketAddr;
 
@@ -73,6 +75,36 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/platform/settings/tpm",
             get(settings::get_tpm).put(settings::put_tpm),
+        )
+        .route(
+            "/v1/platform/storagePools",
+            get(storage::list_pools).post(storage::create_pool),
+        )
+        .route(
+            "/v1/platform/storagePools/{pool}",
+            get(storage::get_pool)
+                .patch(storage::update_pool)
+                .delete(storage::delete_pool),
+        )
+        .route(
+            "/v1/platform/volumeTypes",
+            get(storage::list_types).post(storage::create_type),
+        )
+        .route(
+            "/v1/platform/volumeTypes/{type}",
+            get(storage::get_type)
+                .patch(storage::update_type)
+                .delete(storage::delete_type),
+        )
+        .route(
+            "/v1/orgs/{org}/projects/{project}/volumes",
+            get(storage::list_volumes).post(storage::create_volume),
+        )
+        .route(
+            "/v1/orgs/{org}/projects/{project}/volumes/{volume}",
+            get(storage::get_volume)
+                .patch(storage::update_volume)
+                .delete(storage::delete_volume),
         )
         // Unknown paths go through authentication too, so they cannot be used to probe the API.
         .fallback(not_found)

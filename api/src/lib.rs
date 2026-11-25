@@ -20,6 +20,7 @@ pub mod node;
 pub mod operation;
 pub mod scheduling;
 pub mod settings;
+pub mod storage;
 
 pub use meta::{Etag, Object, ObjectMeta};
 pub use name::{Name, NameError, Scope};

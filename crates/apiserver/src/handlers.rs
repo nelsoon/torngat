@@ -20,7 +20,7 @@ use crate::{ApiError, AppState};
 const DEFAULT_PAGE: usize = 100;
 const MAX_PAGE: usize = 1000;
 
-fn name(kind: &str, s: &str) -> Result<Name, ApiError> {
+pub(crate) fn name(kind: &str, s: &str) -> Result<Name, ApiError> {
     Name::new(s).map_err(|e| ApiError::InvalidArgument(format!("invalid {kind} name: {e}")))
 }
 
@@ -34,7 +34,7 @@ pub(crate) fn query<T>(q: Result<Query<T>, QueryRejection>) -> Result<T, ApiErro
         .map_err(|e| ApiError::InvalidArgument(format!("invalid query: {}", e.body_text())))
 }
 
-fn store_key(keyspace: &str, segs: &[&str]) -> Result<Key, ApiError> {
+pub(crate) fn store_key(keyspace: &str, segs: &[&str]) -> Result<Key, ApiError> {
     Key::new(keyspace, segs.iter().copied()).map_err(|e| ApiError::Internal(e.to_string()))
 }
 
@@ -51,11 +51,11 @@ fn instances_prefix(scope: &Scope) -> Result<Prefix, ApiError> {
 }
 
 /// Etags are the store revision, opaque to clients.
-fn etag(rev: u64) -> Etag {
+pub(crate) fn etag(rev: u64) -> Etag {
     Etag(format!("\"{rev}\""))
 }
 
-fn parse_etag(e: &Etag) -> Result<u64, ApiError> {
+pub(crate) fn parse_etag(e: &Etag) -> Result<u64, ApiError> {
     let bad = || ApiError::InvalidArgument("malformed etag".into());
     let inner =
         e.0.strip_prefix('"')
@@ -67,7 +67,7 @@ fn parse_etag(e: &Etag) -> Result<u64, ApiError> {
     inner.parse().map_err(|_| bad())
 }
 
-fn decode<S, St>(v: Versioned) -> Result<Object<S, St>, ApiError>
+pub(crate) fn decode<S, St>(v: Versioned) -> Result<Object<S, St>, ApiError>
 where
     S: serde::de::DeserializeOwned,
     St: serde::de::DeserializeOwned + Default,
@@ -77,7 +77,7 @@ where
     Ok(o)
 }
 
-fn now() -> OffsetDateTime {
+pub(crate) fn now() -> OffsetDateTime {
     OffsetDateTime::now_utc()
 }
 
@@ -103,14 +103,14 @@ struct RequestRecord {
     operation: Uuid,
 }
 
-fn project_scope(org: &str, project: &str) -> Result<Scope, ApiError> {
+pub(crate) fn project_scope(org: &str, project: &str) -> Result<Scope, ApiError> {
     Ok(Scope::Project {
         org: name("organization", org)?,
         project: name("project", project)?,
     })
 }
 
-fn resource_path(scope: &Scope, kind: &str, n: &Name) -> String {
+pub(crate) fn resource_path(scope: &Scope, kind: &str, n: &Name) -> String {
     format!("{}/{kind}/{n}", scope.segments().join("/"))
 }
 
@@ -301,18 +301,32 @@ pub async fn list_instances(
 ) -> Result<Json<ListResponse<Instance>>, ApiError> {
     let scope = project_scope(&org, &project)?;
     let q = query(q)?;
+    list(&st, q, &instances_prefix(&scope)?, |n| {
+        instance_key(&scope, n)
+    })
+    .await
+}
+
+/// One page of the objects directly below `prefix`. `key` is the key of a name under it.
+pub(crate) async fn list<S, So>(
+    st: &AppState,
+    q: ListQuery,
+    prefix: &Prefix,
+    key: impl Fn(&Name) -> Result<Key, ApiError>,
+) -> Result<Json<ListResponse<Object<S, So>>>, ApiError>
+where
+    S: serde::de::DeserializeOwned,
+    So: serde::de::DeserializeOwned + Default,
+{
     let size = q.page_size.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
     // The page token is the last returned name; it is validated like any name.
     let after = q
         .page_token
         .as_deref()
-        .map(|t| name("page_token", t).and_then(|n| instance_key(&scope, &n)))
+        .map(|t| name("page_token", t).and_then(|n| key(&n)))
         .transpose()?;
-    let rows = st
-        .store
-        .list(&instances_prefix(&scope)?, after.as_ref(), size)
-        .await?;
-    let next = (rows.len() == size)
+    let rows = st.store.list(prefix, after.as_ref(), size).await?;
+    let next_page_token = (rows.len() == size)
         .then(|| {
             rows.last()
                 .map(|(k, _)| k.as_str().rsplit('/').next().unwrap_or_default().to_owned())
@@ -324,7 +338,7 @@ pub async fn list_instances(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(ListResponse {
         items,
-        next_page_token: next,
+        next_page_token,
     }))
 }
 
@@ -384,7 +398,7 @@ pub async fn update_instance(
 
 #[derive(Debug, Deserialize)]
 pub struct DeleteQuery {
-    etag: Option<String>,
+    pub(crate) etag: Option<String>,
 }
 
 pub async fn delete_instance(
@@ -464,7 +478,7 @@ pub async fn get_operation(
 
 // ---------- nodes (operator API, read-only in M0: agents register through the controller) ----------
 
-fn node_key(n: &Name) -> Result<Key, ApiError> {
+pub(crate) fn node_key(n: &Name) -> Result<Key, ApiError> {
     store_key("platform", &["nodes", n.as_str()])
 }
 
@@ -486,27 +500,7 @@ pub async fn list_nodes(
     q: Result<Query<ListQuery>, QueryRejection>,
 ) -> Result<Json<ListResponse<Node>>, ApiError> {
     let q = query(q)?;
-    let size = q.page_size.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
-    let after = q
-        .page_token
-        .as_deref()
-        .map(|t| name("page_token", t).and_then(|n| node_key(&n)))
-        .transpose()?;
     let prefix =
         Prefix::new("platform", ["nodes"]).map_err(|e| ApiError::Internal(e.to_string()))?;
-    let rows = st.store.list(&prefix, after.as_ref(), size).await?;
-    let next = (rows.len() == size)
-        .then(|| {
-            rows.last()
-                .map(|(k, _)| k.as_str().rsplit('/').next().unwrap_or_default().to_owned())
-        })
-        .flatten();
-    let items = rows
-        .into_iter()
-        .map(|(_, v)| decode(v))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(ListResponse {
-        items,
-        next_page_token: next,
-    }))
+    list(&st, q, &prefix, node_key).await
 }
