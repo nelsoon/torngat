@@ -98,7 +98,8 @@ pub(crate) fn sha256(b: &[u8]) -> [u8; 32] {
     Sha256::digest(b).into()
 }
 
-pub(crate) fn hex(b: &[u8]) -> String {
+/// Lowercase. Allocates once, so that callers with a secret can erase it.
+pub fn hex(b: &[u8]) -> String {
     const H: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(b.len() * 2);
     for x in b {
@@ -108,7 +109,8 @@ pub(crate) fn hex(b: &[u8]) -> String {
     s
 }
 
-pub(crate) fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
+/// Lowercase only.
+pub fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
     let b = s.as_bytes();
     if b.len() != N * 2 {
         return None;

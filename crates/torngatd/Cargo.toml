@@ -25,6 +25,7 @@ torngat-api = { path = "../../api" }
 torngat-apiserver = { path = "../apiserver" }
 torngat-attest = { path = "../attest" }
 torngat-controller = { path = "../controller" }
+torngat-keys = { path = "../keys" }
 torngat-pki = { path = "../pki" }
 torngat-store = { path = "../store" }
 

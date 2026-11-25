@@ -30,7 +30,16 @@ Items found in reviews that a later chunk must enforce.
   - A volume type or pool name in a stored object may no longer exist, or be another one: compare the uid.
   - Placement order: pool and `granted_bytes` in the volume's status, then the reservation, then `Placed`; without space both are cleared again. Growth order: the reservation, then `granted_bytes`. Deletion order: blocks, reservation (the pool is always written), then the object. Sweep reservations of volumes that are gone. Before reserving, check the pool's uid and that it is not being deleted.
   - Before a pool is finally removed, check again that no volume type lists it.
-  - A key for a destroyed volume uid is never made again (tombstone): racing creates with one request id can briefly reuse a uid.
+  - Volume keys (`crates/controller/src/volume_keys.rs`): never made again for a formatted volume or a destroyed uid (tombstone). Tombstones are never removed.
+  - Racing creates with one request id can briefly bring a uid back, before its tombstone: whoever removes a placed volume's object writes the tombstone first, even if there was no key. The undo in `create_volume` must be retried, and placement must refuse a uid with a tombstone.
+  - Keys are given by the pool's node, which is enough for local storage. Shared storage must also check that the instance in `attached_to` runs on the caller.
+  - A node that never reports `formatted` gets keys without an attached instance: the controller should set it when it gives the key for formatting.
+  - Node removal must delete the identity before the node's record, or registering makes the record again as active. Needed before real data: a stolen node cannot be cut off yet.
+  - Core dumps are off for the `torngatd` service only, not when it is run by hand.
+  - The agent keeps received keys in memory that is erased, and never logs them.
+  - Set `formatted` before the first write to a volume, and never clear it: it decides whether a missing key may be made.
+  - Project keys are named by the project's path: when projects become objects, destroy the key with the project, so that a project made later under the same name does not get it.
+  - Every controller needs the platform key file: before multi-controller. Rotation of project and platform keys: not yet.
   - A device is formatted only if the volume was never formatted and its header area is blank.
   - Volumes and request id records have no limit per project, and the records never expire: before tenants get access.
   - An older version that changes an object drops fields that it does not know: before rolling upgrades.

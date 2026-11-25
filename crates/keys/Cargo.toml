@@ -1,0 +1,25 @@
+[package]
+name = "torngat-keys"
+description = "Torngat key hierarchy: platform key, project keys, volume keys."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+getrandom = "0.4"
+ring = "0.17"
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+zeroize = "1.9"
+torngat-pki = { path = "../pki" }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3.4"
+
+[lints]
+workspace = true

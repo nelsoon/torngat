@@ -16,18 +16,21 @@ pub mod keys;
 mod ops;
 mod scheduler;
 mod service;
+pub mod volume_keys;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use torngat_api::Name;
+use torngat_keys::PlatformKey;
 use torngat_store::Store;
 
 pub use join::{JoinService, expire_join_tokens_once, serve_join};
 pub use ops::complete_operations_once;
 pub use scheduler::schedule_once;
 pub use service::ControlService;
+pub use volume_keys::destroy_volume_keys_once;
 
 /// A node is considered alive if it sent a heartbeat within this window.
 pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -57,21 +60,22 @@ impl Liveness {
 pub struct Controller {
     pub store: Store,
     pub live: Liveness,
+    platform_key: Arc<PlatformKey>,
 }
 
 impl Controller {
-    pub fn new(store: Store) -> Self {
+    pub fn new(store: Store, platform_key: Arc<PlatformKey>) -> Self {
         Self {
             store,
             live: Liveness::default(),
+            platform_key,
         }
     }
 
-    /// Runs the reconcile loops (scheduling, operation completion) forever.
+    /// Runs the reconcile loops (scheduling, operation completion, housekeeping) forever.
     pub async fn run_scheduler(self, every: Duration) {
-        // Expired tokens are already refused; cleaning them up is housekeeping.
-        const TOKEN_EXPIRY_EVERY: Duration = Duration::from_secs(60);
-        let mut last_expiry: Option<Instant> = None;
+        const HOUSEKEEPING_EVERY: Duration = Duration::from_secs(60);
+        let mut last_housekeeping: Option<Instant> = None;
         loop {
             if let Err(e) = schedule_once(&self).await {
                 tracing::warn!(error = %e, "scheduling pass failed");
@@ -79,10 +83,14 @@ impl Controller {
             if let Err(e) = complete_operations_once(&self).await {
                 tracing::warn!(error = %e, "operation pass failed");
             }
-            if last_expiry.is_none_or(|t| t.elapsed() >= TOKEN_EXPIRY_EVERY) {
-                last_expiry = Some(Instant::now());
+            if last_housekeeping.is_none_or(|t| t.elapsed() >= HOUSEKEEPING_EVERY) {
+                last_housekeeping = Some(Instant::now());
+                // Expired tokens are already refused.
                 if let Err(e) = expire_join_tokens_once(&self.store).await {
                     tracing::warn!(error = %e, "join token expiry pass failed");
+                }
+                if let Err(e) = destroy_volume_keys_once(&self.store).await {
+                    tracing::warn!(error = %e, "volume key pass failed");
                 }
             }
             tokio::time::sleep(every).await;

@@ -18,7 +18,7 @@ use torngat_store::{Precondition, StoreError};
 use uuid::Uuid;
 
 use crate::scheduler::list_all;
-use crate::{Controller, identity, keys};
+use crate::{Controller, identity, keys, volume_keys};
 
 /// How often an agent's assignment set is recomputed.
 const ASSIGNMENT_POLL: Duration = Duration::from_millis(500);
@@ -58,6 +58,26 @@ fn check_version(v: &str) -> Result<(), Status> {
             "unsupported api_version {v:?}, controller speaks {API_VERSION}"
         )))
     }
+}
+
+fn bad(what: &str) -> Status {
+    Status::invalid_argument(format!("invalid {what}"))
+}
+
+/// The project object that a request is about.
+fn project_object(
+    org: String,
+    project: String,
+    name: String,
+    uid: &str,
+) -> Result<(Scope, Name, Uuid), Status> {
+    let scope = Scope::Project {
+        org: Name::new(org).map_err(|_| bad("org"))?,
+        project: Name::new(project).map_err(|_| bad("project"))?,
+    };
+    let name = Name::new(name).map_err(|_| bad("name"))?;
+    let uid = Uuid::parse_str(uid).map_err(|_| bad("uid"))?;
+    Ok((scope, name, uid))
 }
 
 type AssignmentStream = Pin<Box<dyn Stream<Item = Result<AssignmentSet, Status>> + Send>>;
@@ -210,13 +230,7 @@ impl Control for ControlService {
     ) -> Result<Response<ReportResponse>, Status> {
         let me = identity::authenticate(&self.ctl.store, &req).await?;
         let r = req.into_inner();
-        let bad = |what: &str| Status::invalid_argument(format!("invalid {what}"));
-        let scope = Scope::Project {
-            org: Name::new(r.org).map_err(|_| bad("org"))?,
-            project: Name::new(r.project).map_err(|_| bad("project"))?,
-        };
-        let name = Name::new(r.name).map_err(|_| bad("name"))?;
-        let uid = Uuid::parse_str(&r.uid).map_err(|_| bad("uid"))?;
+        let (scope, name, uid) = project_object(r.org, r.project, r.name, &r.uid)?;
         let phase = match r.phase.as_str() {
             "starting" => InstancePhase::Starting,
             "running" => InstancePhase::Running,
@@ -269,6 +283,19 @@ impl Control for ControlService {
             }
         }
         Err(Status::aborted("concurrent instance update, retry"))
+    }
+
+    async fn get_volume_key(
+        &self,
+        req: Request<VolumeKeyRequest>,
+    ) -> Result<Response<VolumeKeyResponse>, Status> {
+        let me = identity::authenticate(&self.ctl.store, &req).await?;
+        let r = req.into_inner();
+        let (scope, name, uid) = project_object(r.org, r.project, r.name, &r.uid)?;
+        let key = volume_keys::volume_key(&self.ctl, &me, &scope, &name, uid).await?;
+        Ok(Response::new(VolumeKeyResponse {
+            key: key.expose().to_vec(),
+        }))
     }
 }
 

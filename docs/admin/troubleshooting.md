@@ -24,6 +24,8 @@
 | ... "already set up" | enrolling would erase the node | reinstall it |
 | `the TPM refused the node key` | TPM cleared or replaced | join again as the message says, under a new name. A controller: reinstall the cluster |
 | `node name is already in use` | the name was used before | another `--name` |
+| `platform.key` is missing, malformed, or not this cluster's | the file was lost, damaged or replaced | put the right file back: the volumes depend on it ([storage](storage.md#volume-keys)) |
+| `no record of their platform key` | the store was changed or damaged | suspect tampering; do not make a new platform key |
 | `vgs` shows nothing | the disk is not in LVM's list, on purpose | [storage](storage.md#nothing-is-opened-by-itself) |
 | `modprobe zfs`: "Key was rejected" | the module was not signed by this image's key, or the key is not enrolled | rebuild the image; enroll the key |
 | `zpool import`: "in use from another system" | another machine had the pool, or the root was made anew | [storage](storage.md#nothing-is-opened-by-itself) |

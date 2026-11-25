@@ -67,3 +67,16 @@ POST /v1/platform/volumeTypes?volume_type_id=fast
 - Deleting a pool that a node uses waits until the node removed its mark from the storage. If the node is lost, the
   pool stays in deletion: there is no way to force it yet.
 - A volume gets its node when an instance first uses it.
+
+## Volume keys
+
+Volumes do not exist on the nodes yet; each will be encrypted with its own key. Keys are made and kept by the controller, encrypted under a key
+for each project, itself encrypted under the **platform key**: `/var/lib/torngat/keys/platform.key`.
+
+- A node gets a volume's key only while it is enrolled, the volume is on it, and (once the volume has data) an
+  instance uses it. The controller logs `volume key given`. A node must ask again after a reboot.
+- There is no way to remove a node yet, so a stolen one can still ask for its keys.
+- A minute or so after a volume is gone, its key is destroyed. Copies may remain for a while in the store's own log and
+  snapshots, and in backups; they are of no use without the platform key.
+- **If the platform key is lost, every volume is lost.** `torngatd` then refuses to start rather than make another.
+  There is no backup tool yet: keep no data that you cannot lose.

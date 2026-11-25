@@ -2836,6 +2836,7 @@ dependencies = [
  "http-body-util",
  "pem",
  "rcgen",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
@@ -2847,6 +2848,7 @@ dependencies = [
  "torngat-api",
  "torngat-apiserver",
  "torngat-attest",
+ "torngat-keys",
  "torngat-pki",
  "torngat-proto",
  "torngat-store",
@@ -2854,6 +2856,21 @@ dependencies = [
  "tracing",
  "uuid",
  "x509-parser",
+]
+
+[[package]]
+name = "torngat-keys"
+version = "0.0.1"
+dependencies = [
+ "getrandom 0.4.3",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "torngat-pki",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2915,6 +2932,7 @@ dependencies = [
  "torngat-apiserver",
  "torngat-attest",
  "torngat-controller",
+ "torngat-keys",
  "torngat-pki",
  "torngat-store",
  "tracing",
