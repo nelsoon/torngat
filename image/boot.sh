@@ -5,7 +5,8 @@
 #   image/boot.sh IMAGE [WORKDIR] [-- extra qemu args]
 #
 # The image is copied (the original stays pristine) and the copy grown to DISK_SIZE (default 8G)
-# to exercise root growth. The serial console is on stdio unless SERIAL is set to a file.
+# to exercise root growth. The serial console is on stdio unless SERIAL is set to a
+# file (or to chardev:ID, with that chardev among the extra qemu args).
 # SECURE_BOOT_VARS=FILE uses firmware with Secure Boot and starts from that variable store (see
 # test/secure-boot.sh for making one); set it again when reusing the WORKDIR.
 # With REUSE=1 an existing WORKDIR (disk, UEFI variables, TPM state) is booted again as it is, e.g.
@@ -42,11 +43,15 @@ swtpm socket --tpm2 --tpmstate dir="$work/tpm" --ctrl type=unixio,path="$work/sw
 trap 'swtpm_ioctl -s --unix "$work/swtpm.sock" 2>/dev/null || true' EXIT
 
 serial=stdio
-[ -n "${SERIAL:-}" ] && serial=file:$SERIAL
+case ${SERIAL:-} in
+  '') ;;
+  chardev:*) serial=$SERIAL ;;
+  *) serial=file:$SERIAL ;;
+esac
 qemu-system-x86_64 -enable-kvm -machine "$machine" -cpu host -smp "${SMP:-2}" -m "${MEM:-3072}" "${extra[@]}" \
   -drive if=pflash,format=raw,readonly=on,file="$code" \
   -drive if=pflash,format=raw,file="$work/vars.fd" \
-  -drive file="$work/disk.raw",if=virtio,format=raw \
+  -drive file="$work/disk.raw",if=virtio,format=raw,discard=unmap \
   -chardev socket,id=chrtpm,path="$work/swtpm.sock" \
   -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis,tpmdev=tpm0 \
   -nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:"${SSH_PORT:-2222}"-:22 \

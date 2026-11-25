@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the Torngat host image (and the platform extension it ships with). Needs root (mkosi),
 # mkosi 25 or later, systemd-repart 257 or later,
-# systemd-ukify, sbsigntool, efitools and binutils.
+# systemd-ukify, sbsigntool, efitools, binutils, mtools, fdisk and jq.
 #
 #   sudo image/build.sh --torngatd PATH [--version V] [--authorized-keys FILE] [--dev]
 #
@@ -39,20 +39,28 @@ name=signing
 [ -n "$dev" ] && name=dev-signing
 key=$here/keys/$name.key
 cert=$here/keys/$name.crt
-if [ ! -e "$key" ] && [ ! -e "$cert" ]; then
-  echo "build.sh: creating a development signing key in $here/keys" >&2
-  (umask 077 && mkdir -p "$here/keys" &&
-    openssl req -new -x509 -newkey rsa:3072 -nodes -sha256 -days 3650 \
-      -subj "/CN=Torngat development image signing" -keyout "$key" -out "$cert" 2>/dev/null)
-fi
-[ -e "$key" ] && [ -e "$cert" ] || { echo "build.sh: need both $key and $cert" >&2; exit 1; }
+pcr_key=$here/keys/${name/signing/pcr}.key
+pcr_cert=$here/keys/${name/signing/pcr}.crt
+make_pair() { # KEY CERT RSA-BITS COMMON-NAME
+  if [ ! -e "$1" ] && [ ! -e "$2" ]; then
+    echo "build.sh: creating a development key in $1" >&2
+    (umask 077 && mkdir -p "$here/keys" &&
+      openssl req -new -x509 -newkey "rsa:$3" -nodes -sha256 -days 3650 -subj "/CN=$4" \
+        -keyout "$1" -out "$2" 2>/dev/null)
+  fi
+  [ -e "$1" ] && [ -e "$2" ] || { echo "build.sh: need both $1 and $2" >&2; exit 1; }
+}
+make_pair "$key" "$cert" 3072 "Torngat development image signing"
+# The TPM checks this one's signatures: 2048 bits is what every TPM supports.
+make_pair "$pcr_key" "$pcr_cert" 2048 "Torngat development PCR policy signing"
 
 out=$here/out
 sysext=$("$here/sysext/build.sh" --torngatd "$bin" --version "$version" --key "$key" \
   --cert "$cert" --out "$out")
 
 extra=$(mktemp -d)
-trap 'rm -rf "$extra"' EXIT
+mkdir "$extra.initrd"
+trap 'rm -rf "$extra" "$extra.initrd"' EXIT
 # The extra tree's own modes are copied onto the image: / must stay 0755, /root 0700.
 chmod 0755 "$extra"
 install -D -m 0644 "$cert" "$extra/usr/lib/verity.d/torngat.crt"
@@ -75,15 +83,21 @@ fi
 
 args=(--image-version="$version" --extra-tree="$extra"
   --secure-boot-key="$key" --secure-boot-certificate="$cert"
-  --verity-key="$key" --verity-certificate="$cert")
+  --verity-key="$key" --verity-certificate="$cert"
+  --sign-expected-pcr-key="$pcr_key" --sign-expected-pcr-certificate="$pcr_cert"
+  --initrd="$extra.initrd/initrd")
 [ -n "$dev" ] && args+=(--autologin=yes)
 cd "$here"
+mkosi --directory initrd --output-directory "$extra.initrd" --image-version="$version" -f build
 mkosi "${args[@]}" -f build
 
 # The boot loader and UKIs must be signed with our key (mkosi silently installs a loader signed by
 # someone else when there is none it can sign). Nothing else may be: a signed kernel would boot with
 # any initrd and command line.
-systemd-dissect --copy-from "$out/torngat_$version.raw" /boot "$extra/esp"
+# The ESP is the first partition.
+offset=$(sfdisk -J "$out/torngat_$version.raw" | jq '.partitiontable.partitions[0].start * 512')
+mkdir "$extra/esp"
+mcopy -s -i "$out/torngat_$version.raw@@$offset" '::/*' "$extra/esp"
 die() { echo "build.sh: $*" >&2; exit 1; }
 signed_by_us() { sbverify --cert "$cert" "$1" >/dev/null 2>&1; }
 # For what must not be signed: looks at the signature's subject, so a file whose hash does not check
@@ -102,6 +116,11 @@ for f in "${ukis[@]}"; do
   objcopy -O binary --only-section=.cmdline "$f" "$extra/cmdline"
   grep -aqE '(^| )usrhash=[0-9a-f]{64}( |$)' <(tr -d '\0' <"$extra/cmdline") ||
     die "no usrhash= in the command line of ${f##*/}"
+  grep -aqE '(^| )root=/dev/mapper/root ' "$extra/cmdline" || die "${f##*/} may boot another root"
+  # A policy for a later phase would let a substituted root unseal the disk key.
+  objcopy -O binary --only-section=.pcrsig "$f" "$extra/pcrsig"
+  [ "$(tr -d '\0' <"$extra/pcrsig" | jq '[.[] | length] == [1]')" = true ] ||
+    die "${f##*/} must have exactly one signed PCR policy"
   objcopy -O binary --only-section=.linux "$f" "$extra/linux"
   [ -s "$extra/linux" ] || die "no kernel in ${f##*/}"
   ! mentions_us "$extra/linux" || die "the kernel inside ${f##*/} is signed with $cert"

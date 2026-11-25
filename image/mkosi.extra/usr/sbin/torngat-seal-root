@@ -1,0 +1,53 @@
+#!/bin/bash
+# Seals the encrypted root to this machine: the TPM then unlocks it only with Secure Boot in its
+# current state (PCR 7) and in the initrd of a UKI signed with our key (PCR 11).
+#
+#   torngat-seal-root [--allow-no-secure-boot]   once, after enrolling the Secure Boot key
+#   torngat-seal-root --reseal                   after a change of the Secure Boot state
+#
+# The first form shows a new recovery key, once, and removes the provisional key slots. The second
+# asks for the recovery key and only replaces the TPM slot. An interrupted run can be repeated.
+set -euo pipefail
+die() { echo "torngat-seal-root: $*" >&2; exit 1; }
+reseal=
+allow=
+for a in "$@"; do
+  case $a in
+    --reseal) reseal=1 ;;
+    --allow-no-secure-boot) allow=1 ;;
+    *) die "unknown argument $a" ;;
+  esac
+done
+[ "$(id -u)" = 0 ] || die "run as root"
+dev=$(cryptsetup status root | sed -n 's/^ *device: *//p')
+[ -b "$dev" ] || die "the root file system is not on the encrypted volume"
+# 4 bytes of attributes, then the value.
+sb=$(od -An -tu1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c 2>/dev/null | tr -d ' ') || true
+[ "$sb" = 1 ] || [ -n "$allow" ] ||
+  die "Secure Boot is not on: enroll the key first (torngat-enroll-secure-boot) and reboot"
+pub=/run/systemd/tpm2-pcr-public-key.pem
+[ -s "$pub" ] || die "$pub is missing: not booted from a signed UKI"
+tpm=(--wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrs=7 --tpm2-public-key="$pub"
+  --tpm2-public-key-pcrs=11)
+key=/var/lib/torngat-seal/provisional.key
+
+if [ -n "$reseal" ]; then
+  [ ! -e "$key" ] || die "not sealed yet: run it without --reseal"
+  systemd-cryptenroll "${tpm[@]}" "$dev"
+  exit
+fi
+[ -e "$key" ] || die "already sealed (--reseal replaces the TPM slot, with the recovery key)"
+if ! cryptsetup open --test-passphrase --key-file "$key" "$dev" 2>/dev/null; then
+  # A previous run stopped just before its last step.
+  systemd-cryptenroll "$dev" | grep -q '^ *[0-9][0-9]* *tpm2$' ||
+    die "the provisional key does not open $dev"
+  rm "$key"
+  exit
+fi
+echo "Recovery key, needed on the console if the TPM refuses to unlock the disk (after a firmware" >&2
+echo "or Secure Boot change). It is shown only now: store it away from this machine." >&2
+systemd-cryptenroll --unlock-key-file="$key" --wipe-slot=recovery --recovery-key "$dev"
+systemd-cryptenroll --unlock-key-file="$key" "${tpm[@]}" "$dev"
+systemd-cryptenroll --wipe-slot=password "$dev"
+rm "$key"
+sync -f /var/lib/torngat-seal

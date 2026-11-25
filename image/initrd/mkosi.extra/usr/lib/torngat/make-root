@@ -1,0 +1,26 @@
+#!/bin/bash
+# Creates the encrypted root partition at first boot (and does nothing once it exists).
+#
+# The root is made from the template in the verified /usr. It gets two provisional key slots: a
+# random key, saved inside the encrypted root itself, and one sealed to the TPM for UKIs signed with
+# our key, not yet to the Secure Boot state, which is only final once our key is enrolled.
+# torngat-seal-root then replaces both.
+set -euo pipefail
+work=/run/torngat/make-root
+mkdir -p "$work"
+mount -t tmpfs -o mode=0700 tmpfs "$work"
+trap 'umount "$work/tree" 2>/dev/null || true; umount "$work"' EXIT
+mkdir "$work/upper" "$work/work" "$work/tree"
+chmod 0755 "$work/upper"
+mount -t overlay -o "lowerdir=/sysusr/usr/lib/torngat/root,upperdir=$work/upper,workdir=$work/work" \
+  overlay "$work/tree"
+key=$work/tree/var/lib/torngat-seal/provisional.key
+install -d -m 0700 "${key%/*}"
+(umask 077 && od -An -vtx1 -N32 /dev/urandom | tr -d ' \n' >"$key")
+[ "$(stat -c %s "$key")" = 64 ] || { echo "make-root: no random key" >&2; exit 1; }
+# The discard of mkfs would reach the disk as zeroes to write over all of it (repart discards the
+# partition itself).
+export SYSTEMD_REPART_MKFS_OPTIONS_EXT4="-E nodiscard"
+# Offline, repart would write the whole partition: hours on a large disk.
+systemd-repart --dry-run=no --offline=no --copy-source="$work/tree" --key-file="$key" --tpm2-device=auto \
+  --tpm2-pcrs= --tpm2-public-key=/.extra/tpm2-pcr-public-key.pem --tpm2-public-key-pcrs=11

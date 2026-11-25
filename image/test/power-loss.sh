@@ -253,7 +253,7 @@ check_guest() {
 t_ssh=0 t_api=0
 echo "== first boot"
 boot_vm ""
-guest torngatd init --name n1 >"$work/init.log" 2>&1 || { tail -n 10 "$work/init.log" >&2; fail "torngatd init failed"; }
+guest torngatd init --allow-unsealed-root --name n1 >"$work/init.log" 2>&1 || { tail -n 10 "$work/init.log" >&2; fail "torngatd init failed"; }
 guest systemctl start torngatd || fail "starting torngatd failed"
 connect_api
 wait_node_active

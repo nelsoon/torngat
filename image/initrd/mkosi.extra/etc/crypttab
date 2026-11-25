@@ -1,0 +1,3 @@
+# The TPM unlocks the root; if it refuses, the recovery key is asked for on the console. The volume
+# key is measured into PCR 15, so that a substituted root can be told apart.
+root /dev/gpt-auto-root-luks - luks,discard,tpm2-device=auto,tpm2-measure-pcr=yes
