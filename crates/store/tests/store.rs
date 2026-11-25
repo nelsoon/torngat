@@ -346,24 +346,32 @@ async fn snapshot_install_resets_watchers() {
             .await
             .unwrap();
     }
-    // Compact the leader's log past what the isolated follower has.
-    leader.raft().trigger().snapshot().await.unwrap();
-    leader
-        .raft()
-        .wait(Some(Duration::from_secs(10)))
-        .metrics(
-            |m| m.snapshot.map(|l| l.index) >= Some(last),
-            "snapshot built",
-        )
-        .await
-        .unwrap();
-    leader.raft().trigger().purge_log(last).await.unwrap();
-    leader
-        .raft()
-        .wait(Some(Duration::from_secs(10)))
-        .metrics(|m| m.purged.map(|l| l.index) >= Some(last), "log purged")
-        .await
-        .unwrap();
+    // Compact the log past what the isolated follower has, on both others: the isolated one may call an
+    // election when it is back, and either of them can then become the leader.
+    for s in stores.iter().filter(|s| s.id() != follower.id()) {
+        let raft = s.raft();
+        let wait = || raft.wait(Some(Duration::from_secs(10)));
+        wait()
+            .metrics(
+                |m| m.last_applied.map(|l| l.index) >= Some(last),
+                "writes applied",
+            )
+            .await
+            .unwrap();
+        raft.trigger().snapshot().await.unwrap();
+        wait()
+            .metrics(
+                |m| m.snapshot.map(|l| l.index) >= Some(last),
+                "snapshot built",
+            )
+            .await
+            .unwrap();
+        raft.trigger().purge_log(last).await.unwrap();
+        wait()
+            .metrics(|m| m.purged.map(|l| l.index) >= Some(last), "log purged")
+            .await
+            .unwrap();
+    }
     net.heal();
 
     let r = tokio::time::timeout(Duration::from_secs(15), async {
