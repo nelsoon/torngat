@@ -6,6 +6,8 @@
 #
 # The image is copied (the original stays pristine) and the copy grown to DISK_SIZE (default 8G)
 # to exercise root growth. The serial console is on stdio unless SERIAL is set to a file.
+# With SECURE_BOOT_CERT=FILE (PEM) Secure Boot is on and trusts only that certificate (needs
+# virt-fw-vars); set it again when reusing the WORKDIR.
 # With REUSE=1 an existing WORKDIR (disk, UEFI variables, TPM state) is booted again as it is, e.g.
 # to test a reboot or an update.
 set -euo pipefail
@@ -16,8 +18,23 @@ if [ $# -gt 0 ] && [ "$1" != -- ]; then work=$1; shift; fi
 [ "${1:-}" = -- ] && shift
 work=$(mkdir -p "$work" && cd "$work" && pwd)
 code=/usr/share/OVMF/OVMF_CODE_4M.fd
+machine=q35
+extra=()
+if [ -n "${SECURE_BOOT_CERT:-}" ]; then
+  code=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd
+  machine=q35,smm=on
+  extra=(-global driver=cfi.pflash01,property=secure,value=on)
+fi
 if [ -z "${REUSE:-}" ]; then
-  cp /usr/share/OVMF/OVMF_VARS_4M.fd "$work/vars.fd"
+  if [ -n "${SECURE_BOOT_CERT:-}" ]; then
+    owner=7a3f2c1e-5d0b-4f6a-9c38-1b2e4d6f8a90 # any fixed GUID
+    virt-fw-vars -i /usr/share/OVMF/OVMF_VARS_4M.fd -o "$work/vars.fd" --secure-boot \
+      --set-pk "$owner" "$SECURE_BOOT_CERT" --add-kek "$owner" "$SECURE_BOOT_CERT" \
+      --add-db "$owner" "$SECURE_BOOT_CERT" >"$work/vars.log" 2>&1 ||
+      { cat "$work/vars.log" >&2; exit 1; }
+  else
+    cp /usr/share/OVMF/OVMF_VARS_4M.fd "$work/vars.fd"
+  fi
   cp --sparse=always "$img" "$work/disk.raw"
   truncate -s "${DISK_SIZE:-8G}" "$work/disk.raw"
 
@@ -34,7 +51,7 @@ trap 'swtpm_ioctl -s --unix "$work/swtpm.sock" 2>/dev/null || true' EXIT
 
 serial=stdio
 [ -n "${SERIAL:-}" ] && serial=file:$SERIAL
-qemu-system-x86_64 -enable-kvm -machine q35 -cpu host -smp "${SMP:-2}" -m "${MEM:-3072}" \
+qemu-system-x86_64 -enable-kvm -machine "$machine" "${extra[@]}" -cpu host -smp "${SMP:-2}" -m "${MEM:-3072}" \
   -drive if=pflash,format=raw,readonly=on,file="$code" \
   -drive if=pflash,format=raw,file="$work/vars.fd" \
   -drive file="$work/disk.raw",if=virtio,format=raw \
