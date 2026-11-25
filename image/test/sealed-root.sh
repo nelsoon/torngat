@@ -214,7 +214,8 @@ echo "ok: an unencrypted root is refused, the emergency shell is locked"
 # The partition table is written at the end: cut before and after that (4 and 5 partitions).
 before=0
 after=0
-for delay in 5 8 11 14 17 20; do
+# How long it takes depends on the host: go on until two cuts were after it.
+for delay in $(seq 5 3 59); do
   start cut "$work/ours.fd"
   until [ -s "$dir/qemu.pid" ]; do alive; sleep 0.2; done
   sleep "$delay"
@@ -228,7 +229,8 @@ for delay in 5 8 11 14 17 20; do
   guest test -s "$prov" || fail "no provisional key after a power cut"
   done_with
   rm -rf "$work/cut"
+  [ "$after" -lt 2 ] || break
 done
-[ "$before" -gt 0 ] && [ "$after" -gt 0 ] || fail "the cuts were not spread around the creation of the root"
+[ "$before" -gt 0 ] && [ "$after" -gt 1 ] || fail "the cuts were not spread around the creation of the root"
 echo "ok: power cuts during the first boot"
 echo "PASS"
