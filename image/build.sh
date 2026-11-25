@@ -39,8 +39,8 @@ name=signing
 [ -n "$dev" ] && name=dev-signing
 key=$here/keys/$name.key
 cert=$here/keys/$name.crt
-pcr_key=$here/keys/${name/signing/pcr}.key
-pcr_cert=$here/keys/${name/signing/pcr}.crt
+pcr_key=$here/keys/${dev:+dev-}pcr.key
+pcr_cert=$here/keys/${dev:+dev-}pcr.crt
 make_pair() { # KEY CERT RSA-BITS COMMON-NAME
   if [ ! -e "$1" ] && [ ! -e "$2" ]; then
     echo "build.sh: creating a development key in $1" >&2
@@ -50,6 +50,10 @@ make_pair() { # KEY CERT RSA-BITS COMMON-NAME
   fi
   [ -e "$1" ] && [ -e "$2" ] || { echo "build.sh: need both $1 and $2" >&2; exit 1; }
 }
+if [ -z "$dev" ] && [ -e "$key" ] && [ ! -e "$pcr_key" ]; then
+  echo "build.sh: $key has no PCR policy key next to it ($pcr_key)" >&2
+  exit 1
+fi
 make_pair "$key" "$cert" 3072 "Torngat development image signing"
 # The TPM checks this one's signatures: 2048 bits is what every TPM supports.
 make_pair "$pcr_key" "$pcr_cert" 2048 "Torngat development PCR policy signing"
@@ -112,15 +116,19 @@ done
 ukis=("$extra"/esp/EFI/Linux/*.efi)
 for f in "${ukis[@]}"; do
   signed_by_us "$f" || die "no UKI on the ESP, or not signed with $cert: ${f##*/}"
-  # The signed command line is what ties the UKI to this image's /usr.
-  objcopy -O binary --only-section=.cmdline "$f" "$extra/cmdline"
-  grep -aqE '(^| )usrhash=[0-9a-f]{64}( |$)' <(tr -d '\0' <"$extra/cmdline") ||
-    die "no usrhash= in the command line of ${f##*/}"
-  grep -aqE '(^| )root=/dev/mapper/root ' "$extra/cmdline" || die "${f##*/} may boot another root"
+  section() { rm -f "$extra/section"; objcopy -O binary --only-section="$1" "$f" "$extra/section"; tr -d '\0' <"$extra/section"; }
+  # The signed command line is what ties the UKI to this image's /usr and to the encrypted root.
+  cmdline=" $(section .cmdline) "
+  [[ $cmdline =~ \ usrhash=[0-9a-f]{64}\  ]] || die "no usrhash= in the command line of ${f##*/}"
+  [ "$(grep -o ' root=' <<<"$cmdline" | wc -l)" = 1 ] || die "${f##*/} must have one root="
+  for o in root=/dev/mapper/root systemd.gpt_auto=no systemd.import_credentials=no rd.fstab=no; do
+    [[ $cmdline == *" $o "* ]] || die "no $o in the command line of ${f##*/}"
+  done
   # A policy for a later phase would let a substituted root unseal the disk key.
-  objcopy -O binary --only-section=.pcrsig "$f" "$extra/pcrsig"
-  [ "$(tr -d '\0' <"$extra/pcrsig" | jq '[.[] | length] == [1]')" = true ] ||
+  [ "$(section .pcrsig | jq '[.[] | length] == [1]')" = true ] ||
     die "${f##*/} must have exactly one signed PCR policy"
+  [ "$(section .pcrpkey)" = "$(openssl x509 -in "$pcr_cert" -noout -pubkey)" ] ||
+    die "the PCR policy key in ${f##*/} is not $pcr_cert"
   objcopy -O binary --only-section=.linux "$f" "$extra/linux"
   [ -s "$extra/linux" ] || die "no kernel in ${f##*/}"
   ! mentions_us "$extra/linux" || die "the kernel inside ${f##*/} is signed with $cert"
@@ -128,8 +136,8 @@ done
 find "$extra/esp" -type f >"$extra/files"
 while IFS= read -r f; do
   case ${f#"$extra/esp/"} in
+    loader/keys/* | *.addon.efi | *.cred | EFI/Linux/*/*) die "unexpected ${f#"$extra/esp/"} on the ESP" ;;
     EFI/BOOT/BOOTX64.EFI | EFI/systemd/systemd-bootx64.efi | EFI/Linux/*.efi) ;;
-    loader/keys/* | *.addon.efi | *.cred) die "unexpected ${f#"$extra/esp/"} on the ESP" ;;
     *) ! mentions_us "$f" || die "${f#"$extra/esp/"} must not be signed with $cert" ;;
   esac
 done <"$extra/files"

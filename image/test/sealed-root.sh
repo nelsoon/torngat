@@ -4,12 +4,14 @@
 #   SSH_KEY=KEY CERT=FILE image/test/sealed-root.sh IMAGE
 #
 # 1. First boot in Setup Mode: the root is encrypted; a node cannot be set up, nor the root sealed.
-# 2. After enrolling our key the root still unlocks and can be sealed: the recovery key and the TPM
-#    are then the only ways in.
-# 3. The sealed root unlocks by itself, but the running system cannot unseal its key.
+# 2. Enrolling our key makes the root anew. It can then be sealed: the recovery key and the TPM are the
+#    only ways in.
+# 3. The sealed root unlocks by itself, but the running system cannot unseal its key, and the initrd
+#    does not act on the root's fstab.
 # 4. With Secure Boot in another state the TPM refuses; the recovery key on the console opens it, and
 #    --reseal accepts the new state.
-# 5. Another machine's TPM does not unlock it.
+# 5. Another machine's TPM does not unlock it, until it is resealed there. Nor does a kernel command
+#    line extended by the firmware.
 # 6. An unencrypted file system in place of the root is not booted.
 # 7. A power cut during the first boot leaves an image that still boots.
 #
@@ -58,16 +60,26 @@ if guest torngat-seal-root >"$work/out" 2>&1; then fail "sealed without Secure B
 grep -q 'Secure Boot is not on' "$work/out" || { cat "$work/out" >&2; fail "unexpected seal refusal"; }
 echo "ok: first boot: encrypted, init and sealing refused"
 
+uuid=$(guest "cryptsetup luksUUID $dev")
 guest torngat-enroll-secure-boot >"$work/out" 2>&1 || { cat "$work/out" >&2; fail "enrollment"; }
 shut_down
 REUSE=1 start node "$work/setup.fd"
 expect_up "after enrollment"
 expect_enforced
+[ "$(guest "cryptsetup luksUUID $dev")" != "$uuid" ] || fail "enrollment did not make the root anew"
+guest 'test ! -e /sys/firmware/efi/efivars/FactoryReset-*' || fail "the factory reset request is still there"
+# A foreign slot, hidden from --wipe-slot=password by a token of its own.
+guest "echo -n hidden | cryptsetup luksAddKey --pbkdf pbkdf2 --key-file $prov --new-key-slot 7 $dev - &&
+  echo '{\"type\":\"other\",\"keyslots\":[\"7\"]}' | cryptsetup token import --token-id 9 $dev" || fail "adding a slot"
+if guest torngat-seal-root >"$work/out" 2>&1; then fail "sealed with a foreign key slot"; fi
+grep -q 'unexpected key slots' "$work/out" || { cat "$work/out" >&2; fail "unexpected seal refusal"; }
+guest "cryptsetup token remove --token-id 9 $dev && cryptsetup luksKillSlot -q $dev 7" || fail "removing the slot"
 recovery=$(guest torngat-seal-root 2>"$work/seal.err") || { cat "$work/seal.err" >&2; fail "sealing"; }
 recovery=$(grep -oE '[a-z]{8}(-[a-z]{8}){7}' <<<"$recovery") || fail "no recovery key shown"
 [ "$(slots)" = "recovery tpm2" ] || fail "slots after sealing: $(slots)"
 if guest test -e "$prov"; then fail "the provisional key is still there"; fi
 if guest torngat-seal-root >"$work/out" 2>&1; then fail "sealed twice"; fi
+guest "echo 'tmpfs /probe tmpfs x-initrd.mount,nofail 0 0' >>/etc/fstab" || fail "fstab"
 guest torngatd init --name n1 >"$work/init.log" 2>&1 || { tail -5 "$work/init.log" >&2; fail "init after sealing"; }
 echo "ok: sealed, node set up"
 
@@ -75,11 +87,15 @@ shut_down
 REUSE=1 start node "$work/setup.fd"
 expect_up "sealed"
 guest test -e /var/lib/torngat/node.json || fail "state lost"
-if guest "systemd-cryptenroll --unlock-tpm2-device=auto --recovery-key $dev" </dev/null >/dev/null 2>"$work/out"; then
+if guest "SYSTEMD_LOG_LEVEL=debug systemd-cryptenroll --unlock-tpm2-device=auto --recovery-key $dev" </dev/null >/dev/null 2>"$work/out"; then
   fail "the running system can unseal the root key"
 fi
+[ "$(guest findmnt -no FSTYPE /probe)" = tmpfs ] || fail "the fstab probe is wrong"
+if guest journalctl -b -o cat | grep -q '/sysroot/probe\|sysroot-probe'; then fail "the initrd acted on the root's fstab"; fi
+[ -n "$(guest journalctl -b -u torngat-root-barrier -o cat --grep torngat:root-opened)" ] || fail "no barrier in the initrd"
+[ "$(guest cat /sys/class/tpm/tpm0/pcr-sha256/12 | tr -d 0)" = "" ] || fail "PCR 12 is not zero"
 # Refused by the policy, not by some other error.
-grep -qi 'signature\|policy' "$work/out" || { cat "$work/out" >&2; fail "unexpected unseal error"; }
+grep -q "Couldn't find signature" "$work/out" || { cat "$work/out" >&2; fail "unexpected unseal error"; }
 echo "ok: unlocks by itself; the running system cannot unseal"
 shut_down
 
@@ -113,17 +129,29 @@ swtpm_setup --tpm2 --tpmstate "$work/thief/tpm" --create-ek-cert --overwrite \
   --config "${XDG_CONFIG_HOME:-$HOME/.config}/swtpm_setup.conf" >"$work/thief/swtpm.log" 2>&1
 REUSE=1 start thief "$work/setup.fd"
 expect_locked "another TPM"
+printf %s "$recovery" | type_line
+expect_up "recovery key with another TPM"
+guest "PASSWORD=\$(cat) torngat-seal-root --reseal" <<<"$recovery" >"$work/out" 2>&1 || { cat "$work/out" >&2; fail "reseal on another TPM"; }
+shut_down
+REUSE=1 start thief "$work/setup.fd"
+expect_up "resealed on another TPM"
+shut_down
+rm "$work/thief/disk.raw"
+echo "ok: resealed on another TPM"
+
+qemu_args=(-smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=rd.systemd.debug_shell=1")
+REUSE=1 start node "$work/setup.fd"
+expect_locked "a kernel command line extended by the firmware"
 stop
+qemu_args=()
 
 # A plain file system of the attacker's in place of the root, in the genuine machine.
 read -r first count < <(/usr/sbin/sfdisk -J "$work/node/disk.raw" |
   jq -r '.partitiontable.partitions[] | select(.type == "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709") | "\(.start) \(.size)"')
 truncate -s "$((count * 512))" "$work/plain.raw"
 /usr/sbin/mkfs.ext4 -q "$work/plain.raw"
-dd if="$work/plain.raw" of="$work/node/disk.raw" bs=1M oflag=seek_bytes seek="$((first * 512))" \
-  conv=notrunc,sparse status=none
-# Sparse writing skips zeroes, so the LUKS header's magic must go explicitly.
-dd if="$work/plain.raw" of="$work/node/disk.raw" bs=1M count=17 oflag=seek_bytes seek="$((first * 512))" \
+# More than the LUKS header: the start of a file system is enough to be recognized.
+dd if="$work/plain.raw" of="$work/node/disk.raw" bs=1M count=32 oflag=seek_bytes seek="$((first * 512))" \
   conv=notrunc status=none
 rm "$work/plain.raw"
 REUSE=1 start node "$work/setup.fd"
@@ -131,25 +159,33 @@ refused=
 for _ in $(seq 90); do
   alive
   if guest true 2>/dev/null; then fail "a plain root was booted"; fi
-  if grep -aq 'root account is locked' "$dir/serial.log"; then refused=1; break; fi
+  if grep -aqs 'root account is locked' "$dir/serial.log"; then refused=1; break; fi
   sleep 2
 done
+if grep -aqi 'switching root\|switch root' "$dir/serial.log"; then fail "a plain root was booted"; fi
+grep -aq 'missing or not encrypted' "$dir/serial.log" || fail "plain root: not refused by make-root"
 [ -n "$refused" ] || fail "plain root: no locked emergency mode (see $dir/serial.log)"
 done_with
 echo "ok: an unencrypted root is refused, the emergency shell is locked"
 
-# About 5 to 20 s: the partition is created in the middle of it (5 partitions once it exists).
-for delay in 6 8 10 12 14 16 18 20; do
+# The partition table is written at the end: cut before and after that (4 and 5 partitions).
+before=0
+after=0
+for delay in 5 8 11 14 17 20; do
   start cut "$work/ours.fd"
+  until [ -s "$dir/qemu.pid" ]; do alive; sleep 0.2; done
   sleep "$delay"
-  kill -9 "$(cat "$dir/qemu.pid")" 2>/dev/null || true
+  kill -9 "$(cat "$dir/qemu.pid")"
   stop
-  echo "cut after $delay s: $(/usr/sbin/sfdisk -J "$dir/disk.raw" 2>/dev/null | jq '.partitiontable.partitions | length') partitions"
+  n=$(/usr/sbin/sfdisk -J "$dir/disk.raw" 2>/dev/null | jq '.partitiontable.partitions | length')
+  echo "cut after $delay s: $n partitions"
+  if [ "$n" = 4 ]; then before=$((before + 1)); else after=$((after + 1)); fi
   REUSE=1 start cut "$work/ours.fd"
   expect_up "power cut after $delay s of the first boot"
   guest test -s "$prov" || fail "no provisional key after a power cut"
   done_with
   rm -rf "$work/cut"
 done
+[ "$before" -gt 0 ] && [ "$after" -gt 0 ] || fail "the cuts were not spread around the creation of the root"
 echo "ok: power cuts during the first boot"
 echo "PASS"

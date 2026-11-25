@@ -2,6 +2,7 @@
 # and SSH_KEY set.
 work=$(mktemp -d "${TMPDIR:-/var/tmp}/torngat-$(basename "$0" .sh).XXXXXX")
 boot_pid=
+qemu_args=() # more arguments for QEMU
 
 guest() {
   ssh -i "$SSH_KEY" -p "$port" -o BatchMode=yes -o ConnectTimeout=3 -o StrictHostKeyChecking=no \
@@ -44,7 +45,7 @@ start() { # NAME VARS [IMAGE]; with REUSE=1 boots NAME again as it is
   # The console is a socket, so that a test can type into it.
   SECURE_BOOT_VARS=$2 SERIAL=chardev:console SSH_PORT=$port \
     "$here/../boot.sh" "${3:-$img}" "$dir" -- -pidfile "$dir/qemu.pid" \
-    -chardev "socket,id=console,path=$dir/console.sock,server=on,wait=off,logfile=$dir/serial.log" >"$dir/boot.log" 2>&1 &
+    -chardev "socket,id=console,path=$dir/console.sock,server=on,wait=off,logfile=$dir/serial.log" "${qemu_args[@]}" >"$dir/boot.log" 2>&1 &
   boot_pid=$!
 }
 alive() { kill -0 "$boot_pid" 2>/dev/null || { cat "$dir/boot.log" >&2; fail "boot.sh exited"; }; }

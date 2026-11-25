@@ -5,7 +5,7 @@
 #   image/boot.sh IMAGE [WORKDIR] [-- extra qemu args]
 #
 # The image is copied (the original stays pristine) and the copy grown to DISK_SIZE (default 8G)
-# to exercise root growth. The serial console is on stdio unless SERIAL is set to a
+# for the root. The serial console is on stdio unless SERIAL is set to a
 # file (or to chardev:ID, with that chardev among the extra qemu args).
 # SECURE_BOOT_VARS=FILE uses firmware with Secure Boot and starts from that variable store (see
 # test/secure-boot.sh for making one); set it again when reusing the WORKDIR.

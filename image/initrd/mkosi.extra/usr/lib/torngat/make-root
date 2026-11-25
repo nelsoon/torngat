@@ -1,11 +1,14 @@
 #!/bin/bash
-# Creates the encrypted root partition at first boot (and does nothing once it exists).
+# Creates the encrypted root partition if there is none, or again after a factory reset request (the
+# FactoryReset EFI variable, which torngat-enroll-secure-boot sets). Then checks that it is encrypted.
 #
-# The root is made from the template in the verified /usr. It gets two provisional key slots: a
-# random key, saved inside the encrypted root itself, and one sealed to the TPM for UKIs signed with
-# our key, not yet to the Secure Boot state, which is only final once our key is enrolled.
-# torngat-seal-root then replaces both.
+# The root is made from the template in the verified /usr. Its key slots: one sealed to the TPM, and
+# a random key saved inside the encrypted root itself, which torngat-seal-root replaces by a recovery
+# key. Without Secure Boot the TPM slot is weak and the root stays provisional: no secrets belong on
+# it, and it is made anew, with a new volume key, once Secure Boot is on.
 set -euo pipefail
+# To the kernel log, which is on every console.
+die() { echo "make-root: $*" >/dev/kmsg; exit 1; }
 work=/run/torngat/make-root
 mkdir -p "$work"
 mount -t tmpfs -o mode=0700 tmpfs "$work"
@@ -14,13 +17,38 @@ mkdir "$work/upper" "$work/work" "$work/tree"
 chmod 0755 "$work/upper"
 mount -t overlay -o "lowerdir=/sysusr/usr/lib/torngat/root,upperdir=$work/upper,workdir=$work/work" \
   overlay "$work/tree"
-key=$work/tree/var/lib/torngat-seal/provisional.key
-install -d -m 0700 "${key%/*}"
-(umask 077 && od -An -vtx1 -N32 /dev/urandom | tr -d ' \n' >"$key")
-[ "$(stat -c %s "$key")" = 64 ] || { echo "make-root: no random key" >&2; exit 1; }
+state=$work/tree/var/lib/torngat-seal
+install -d -m 0700 "$state"
+(umask 077 && od -An -vtx1 -N32 /dev/urandom | tr -d ' \n' >"$state/provisional.key")
+[ "$(stat -c %s "$state/provisional.key")" = 64 ] || die "no random key"
+
+# 4 bytes of attributes, then the value.
+sb=$(od -An -tu1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c 2>/dev/null | tr -d ' ') || sb=
+pcrs=
+if [ "$sb" = 1 ]; then
+  # 7: the Secure Boot state. 12 and 13 are zero as long as nothing changed the command line (the
+  # firmware can, even under Secure Boot) or added credentials or extensions. 15 is zero until a root was opened.
+  zero=$(printf '0%.0s' {1..64})
+  pcrs=7:sha256+12:sha256=$zero+13:sha256=$zero+15:sha256=$zero
+  : >"$state/sealable"
+fi
+
 # The discard of mkfs would reach the disk as zeroes to write over all of it (repart discards the
 # partition itself).
 export SYSTEMD_REPART_MKFS_OPTIONS_EXT4="-E nodiscard"
 # Offline, repart would write the whole partition: hours on a large disk.
-systemd-repart --dry-run=no --offline=no --copy-source="$work/tree" --key-file="$key" --tpm2-device=auto \
-  --tpm2-pcrs= --tpm2-public-key=/.extra/tpm2-pcr-public-key.pem --tpm2-public-key-pcrs=11
+systemd-repart --dry-run=no --offline=no --copy-source="$work/tree" \
+  --key-file="$state/provisional.key" --tpm2-device=auto --tpm2-pcrs="$pcrs" \
+  --tpm2-public-key=/.extra/tpm2-pcr-public-key.pem --tpm2-public-key-pcrs=11
+
+udevadm settle
+[ -b /dev/gpt-auto-root-luks ] && [ ! -e /dev/gpt-auto-root ] ||
+  die "the root partition is missing or not encrypted"
+
+# repart does not remove the request if there was nothing to reset, or if power was lost just before
+# that. Left behind, it would erase the node at a later boot.
+reset=/sys/firmware/efi/efivars/FactoryReset-8cf2644b-4b0b-428f-9387-6d876050dc67
+if [ -e "$reset" ]; then
+  chattr -i "$reset"
+  rm "$reset"
+fi

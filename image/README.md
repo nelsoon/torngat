@@ -65,6 +65,7 @@ reboot
 ```
 
 It adds the image's certificate to the machine's keys and installs it as the platform key. The
+root file system is made anew at the next boot (see below), so do this before setting up the node. The
 existing keys are kept, as option ROMs of network cards and GPUs are usually signed with them; it
 refuses to run if there are none, unless given `--allow-no-vendor-keys`. With vendor keys kept, the machine
 still boots other systems signed by them: Secure Boot alone does not tie it to this image. Not every
@@ -77,22 +78,29 @@ yet. After the reboot, check that `bootctl status` says Secure Boot is enabled.
 
 ## Seal the encrypted root
 
-Needs a TPM 2.0. At first boot the root is encrypted, but its key is only provisionally protected, as
-the Secure Boot state still has to change. Once Secure Boot is on:
+Needs a TPM 2.0. The root is encrypted from the first boot, but provisional until Secure Boot is on:
+enrolling the key makes it anew, empty, at the next boot. Then:
 
 ```sh
 torngat-seal-root            # shows the recovery key, once: store it away from this machine
 ```
 
-The TPM then unlocks the disk only with Secure Boot in this state (PCR 7) and in the initrd of a UKI
-whose policy we signed (PCR 11). `torngatd init` and `join` refuse an unsealed root. When the TPM
-refuses (changed Secure Boot keys, a `dbx` update, a new TPM), the recovery key is asked for on the
-console; then run `torngat-seal-root --reseal`.
+The TPM unlocks the disk only with Secure Boot in this state (PCR 7), in the initrd of a UKI whose
+policy we signed (PCR 11), with nothing added to its command line or extensions (PCR 12 and 13) and before any root was
+opened (PCR 15). `torngatd init` and `join` refuse a root that is not sealed. When the TPM refuses
+(changed Secure Boot keys, a `dbx` update, a new TPM), the recovery key is asked for on the console;
+then run `torngat-seal-root --reseal`. It accepts the firmware as it is, so find out first why the TPM
+refused, and be careful with a recovery key prompt that you did not expect.
 
-What this protects is the disk without its machine, or with another system booted on it. It does not
-protect a whole stolen machine (it boots by itself; what it runs is our signed system), does not authenticate
-the disk's contents, and does not stop old signed images from unlocking it. Someone with the disk in hand can
-replace the root with one of their own, encrypted: the image boots it, but the original stays sealed.
+`torngat-seal-root` refuses a machine whose firmware ran code signed by others, which is usual with
+network cards and GPUs: another boot loader signed with the same key could then unlock the disk.
+`--allow-other-signers` accepts that.
+
+Until it is sealed, a machine must be in trusted hands. From then on this protects the disk without its machine, or with another system booted on it. It does not protect
+a whole stolen machine, which boots by itself into our signed system; a TPM whose bus is tampered
+with; or the integrity of the data. Old signed images can still unlock the disk. Someone with the
+disk can put an encrypted root of their own in its place: the image boots it, but it cannot get at
+the original.
 
 `image/test/sealed-root.sh` tests all this; same environment as the test below.
 
@@ -108,12 +116,13 @@ readable copy of the signing certificate (`dev-signing.crt` for a `--dev` image)
 The image boots with the platform installed but idle. On the first node:
 
 ```sh
-torngat-seal-root             # see above
+torngat-enroll-secure-boot    # see above; then reboot
+torngat-seal-root             # shows the recovery key
 torngatd init                 # creates the cluster; node key in the TPM
 systemctl start torngatd
 ```
 
-On the others, `torngat-seal-root`, `torngatd join --controller <host> --token-file <file>` then
+On the others, the same two, then `torngatd join --controller <host> --token-file <file>` then
 `systemctl start torngatd`. From then on `torngatd.service` starts at every boot.
 
 ## Update the platform
