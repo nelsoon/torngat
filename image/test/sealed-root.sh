@@ -36,7 +36,7 @@ expect_up "first boot"
 [ "$(guest "stat -c %a $prov")" = 600 ] || fail "provisional key mode"
 [ "$(guest "stat -c %a / /etc /mnt /var/lib/torngat-seal" | xargs)" = "755 755 755 700" ] || fail "directory modes"
 [ "$(slots)" = "password tpm2" ] || fail "provisional slots: $(slots)"
-[ -z "$(guest systemctl --failed --no-legend)" ] || fail "failed units: $(guest systemctl --failed --no-legend)"
+no_failed_units
 if guest torngatd init --name n1 >"$work/out" 2>&1; then fail "init on an unsealed root"; fi
 grep -q 'not sealed' "$work/out" || { cat "$work/out" >&2; fail "unexpected init refusal"; }
 if guest torngat-seal-root >"$work/out" 2>&1; then fail "sealed without Secure Boot"; fi

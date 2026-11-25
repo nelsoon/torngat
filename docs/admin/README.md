@@ -7,7 +7,8 @@ Torngat is pre-alpha: do not run untrusted tenants or data you cannot lose on it
 3. [Secure Boot, TPM and the recovery key](disk-encryption.md)
 4. [Nodes and join tokens](nodes.md)
 5. [Updates and changes](changes.md): what is safe, and what asks for the recovery key
-6. [Troubleshooting](troubleshooting.md)
+6. [Storage for instances](storage.md): LVM, building with ZFS
+7. [Troubleshooting](troubleshooting.md)
 
 ## The ten things to remember
 

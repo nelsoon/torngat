@@ -1,0 +1,6 @@
+# The platform opens storage; nothing is imported, mounted or watched by itself. Before 50-zfs.preset.
+disable zfs*
+disable lvm2-*
+disable blk-availability.service
+disable dm-event.*
+enable torngat-hostid.service

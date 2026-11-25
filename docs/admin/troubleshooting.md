@@ -24,6 +24,9 @@
 | ... "already set up" | enrolling would erase the node | reinstall it |
 | `the TPM refused the node key` | TPM cleared or replaced | join again as the message says, under a new name. A controller: reinstall the cluster |
 | `node name is already in use` | the name was used before | another `--name` |
+| `vgs` shows nothing | the disk is not in LVM's list, on purpose | [storage](storage.md#nothing-is-opened-by-itself) |
+| `modprobe zfs`: "Key was rejected" | the module was not signed by this image's key, or the key is not enrolled | rebuild the image; enroll the key |
+| `zpool import`: "in use from another system" | another machine had the pool, or the root was made anew | [storage](storage.md#nothing-is-opened-by-itself) |
 | `/dev/kvm` missing | virtualization is off | turn it on in the firmware |
 
 To look at a node: `journalctl -b`, `systemctl --failed`, `bootctl status`, `systemd-cryptenroll <root

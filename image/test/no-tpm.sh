@@ -25,7 +25,7 @@ expect_up "first boot"
 [ "$(guest findmnt -no SOURCE /)" = /dev/mapper/root ] || fail "root is not on the encrypted volume"
 [ "$(slots)" = password ] || fail "slots: $(slots)"
 guest "test -e /var/lib/torngat-seal/unprotected && test ! -e $prov" || fail "markers"
-[ -z "$(guest systemctl --failed --no-legend)" ] || fail "failed units: $(guest systemctl --failed --no-legend)"
+no_failed_units
 if guest torngatd init --name n1 --tpm optional >"$work/out" 2>&1; then fail "init on an unprotected root"; fi
 grep -q 'key on the boot partition' "$work/out" || { cat "$work/out" >&2; fail "unexpected init refusal"; }
 if guest torngatd init --name n1 --allow-unsealed-root >"$work/out" 2>&1; then fail "init without a TPM"; fi

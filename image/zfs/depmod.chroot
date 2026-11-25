@@ -1,0 +1,4 @@
+#!/bin/sh
+# mkosi only does this for modules newer than the kernel's own module list.
+set -eu
+for d in /usr/lib/modules/*/; do depmod -a "$(basename "$d")"; done
