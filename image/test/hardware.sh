@@ -3,7 +3,7 @@
 #
 #   SSH_KEY=KEY CERT=FILE image/test/hardware.sh IMAGE
 #
-# 1. With Secure Boot, each disk controller and network card.
+# 1. With Secure Boot, each disk controller and network card, and an IOMMU.
 # 2. A passphrase for the root typed on a USB keyboard, the only one.
 # 3. Firmware files for cards that cannot be emulated are there, and the microcode is in the UKI.
 #
@@ -29,6 +29,12 @@ machine() { # NAME DISK DRIVER NIC DRIVER [QEMU ARGS]
 }
 machine nvme-e1000e nvme,serial=1 nvme e1000e e1000e
 machine sata-igb ide-hd ahci igb igb
+qemu_args=(-machine kernel-irqchip=split -device intel-iommu,intremap=on)
+start iommu "$work/ours.fd"
+expect_up iommu
+guest 'grep -qw intel_iommu=on /proc/cmdline && test -e /sys/class/iommu/dmar0 && test -n "$(ls /sys/kernel/iommu_groups)"' || fail "the IOMMU is not in use"
+done_with
+echo "ok: IOMMU"
 # The firmware in these VMs cannot boot from them: a second disk. Their drivers must be in the initrd.
 truncate -s 1G "$work/second.raw"
 for hba in megasas-gen2:megaraid_sas pvscsi:vmw_pvscsi virtio-scsi-pci:virtio_scsi; do
