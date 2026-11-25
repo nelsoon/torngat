@@ -1,0 +1,17 @@
+# From here on the TPM no longer unseals the root's key: it needs PCR 15 to be zero. So nothing that
+# is done with the content of a (possibly substituted) root, even in the initrd, can get at it.
+[Unit]
+Description=Lock the Root Key in the TPM
+DefaultDependencies=no
+After=systemd-cryptsetup@root.service
+Requires=systemd-cryptsetup@root.service
+Before=systemd-fsck-root.service sysroot.mount initrd-root-fs.target
+# The root mount requires it: stopping it on the way out of the initrd would unmount the root.
+IgnoreOnIsolate=yes
+OnFailure=emergency.target
+OnFailureJobMode=replace-irreversibly
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/torngat/root-barrier

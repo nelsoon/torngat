@@ -1,0 +1,111 @@
+#!/bin/bash
+# Finishes the sealing of the encrypted root to this machine: the TPM unlocks it only with Secure Boot
+# in its current state and in the initrd of a UKI signed with our key.
+#
+#   torngat-seal-root [--allow-other-signers]            once, with Secure Boot on
+#   torngat-seal-root --reseal [--allow-other-signers]   after a change of the Secure Boot state
+#
+# The first form shows a new recovery key, once, and removes the provisional key. The second needs
+# the recovery key (asked for, or in $PASSWORD) and replaces the TPM slot. An interrupted run can be
+# repeated.
+#
+# --allow-other-signers: the firmware has run code signed by others (usually the option ROM of a
+# network card or GPU). Other boot loaders signed with the same key may then be able to unlock the disk.
+set -euo pipefail
+die() { echo "torngat-seal-root: $*" >&2; exit 1; }
+reseal=
+others=
+for a in "$@"; do
+  case $a in
+    --reseal) reseal=1 ;;
+    --allow-other-signers) others=1 ;;
+    *) die "unknown argument $a" ;;
+  esac
+done
+[ "$(id -u)" = 0 ] || die "run as root"
+dev=$(cryptsetup status root 2>/dev/null | sed -n 's/^ *device: *//p') || true
+[ -b "$dev" ] || die "the root file system is not on the encrypted volume"
+# 4 bytes of attributes, then the value.
+sb=$(od -An -tu1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c 2>/dev/null | tr -d ' ') || true
+[ "$sb" = 1 ] ||
+  die "Secure Boot is not on: enroll the key first (torngat-enroll-secure-boot) and reboot"
+zero=$(printf '0%.0s' {1..64})
+for n in 12 13; do
+  [ "$(cat "/sys/class/tpm/tpm0/pcr-sha256/$n")" = "$zero" ] ||
+    die "PCR $n is not zero: something added to the kernel command line, or credentials or extensions"
+done
+! compgen -G '/sys/firmware/efi/efivars/FactoryReset-*' >/dev/null ||
+  die "a factory reset is requested: reboot first"
+
+# PCR 7 also covers whose signatures the firmware relied on. Ours must be the only one: what another
+# signer's code can do with the same PCR 7 is out of our hands.
+state=/var/lib/torngat-seal
+log=$(tpm2_eventlog --eventlog-version=1 /sys/kernel/security/tpm0/binary_bios_measurements 2>/dev/null) ||
+  die "cannot read the TPM event log"
+# The log is only worth what the TPM confirms: its end replays it.
+replayed=$(sed -n '/^pcrs:/,$p' <<<"$log" | sed -n '/^ *sha256:/,/^ *sha[0-9]*:$/p' | awk '$1 == "7" { print toupper(substr($3, 3)); exit }')
+[ "$replayed" = "$(cat /sys/class/tpm/tpm0/pcr-sha256/7)" ] || die "the TPM event log does not match PCR 7"
+signers=$(awk '/^ *PCRIndex:/ { pcr = $2 } /^ *EventType:/ { authority = $2 == "EV_EFI_VARIABLE_AUTHORITY" }
+  /^ *VariableData:/ && pcr == 7 && authority { gsub(/"/, "", $2); print $2 }' <<<"$log")
+ours=$(sed '/^-----/d' /usr/lib/verity.d/torngat.crt | base64 -d | od -An -vtx1 | tr -d ' \n')
+# An entry is a 16-byte owner GUID and the certificate.
+[ -n "$signers" ] && [ "${#ours}" -gt 200 ] || die "cannot tell what Secure Boot relied on"
+while IFS= read -r s; do
+  [ "${s:32}" = "$ours" ] || [ -n "$others" ] ||
+    die "the firmware has run code signed by others (see --allow-other-signers in $0)"
+done <<<"$signers"
+
+opens() { cryptsetup open --test-passphrase --key-file "$1" "$dev" 2>/dev/null; }
+slots() { systemd-cryptenroll "$dev" | awk 'NR > 1 { print $2 }' | sort | xargs; }
+only_ours() { [ "$(slots)" = "recovery tpm2" ]; }
+seal_tpm() { # [UNLOCK-OPTION]; else $PASSWORD unlocks
+  # Wiped first: with an unchanged policy but a new TPM, cryptenroll would find nothing to do.
+  systemd-cryptenroll --wipe-slot=tpm2 "$dev" >/dev/null
+  # As in make-root.
+  systemd-cryptenroll "$@" --tpm2-device=auto \
+    --tpm2-pcrs="7:sha256+12:sha256=$zero+13:sha256=$zero+15:sha256=$zero" \
+    --tpm2-public-key=/run/systemd/tpm2-pcr-public-key.pem --tpm2-public-key-pcrs=11 "$dev" >/dev/null
+}
+key=$state/provisional.key
+
+if [ -n "$reseal" ]; then
+  [ ! -e "$key" ] || die "not sealed yet: run it without --reseal"
+  echo "Resealing accepts the machine's firmware as it is now. If nobody changed its firmware or Secure" >&2
+  echo "Boot keys, find out why the TPM refused before you go on." >&2
+  if [ -z "${PASSWORD:-}" ]; then read -rsp "Recovery key: " PASSWORD; echo >&2; fi
+  export PASSWORD
+  opens <(printf %s "$PASSWORD") || die "wrong recovery key"
+  seal_tpm
+  only_ours || die "unexpected key slots: $(slots)"
+  exit
+fi
+
+[ -e "$key" ] || die "already sealed (--reseal replaces the TPM slot, with the recovery key)"
+[ -e "$state/sealable" ] ||
+  die "the root was made before Secure Boot was on: it must be made anew (torngat-enroll-secure-boot requests it)"
+if only_ours; then
+  # A previous run stopped just before its last step.
+  rm "$key"
+  sync -f "$state"
+  exit
+fi
+case $(slots) in
+  password | 'password tpm2' | 'password recovery' | 'password recovery tpm2') ;;
+  *) die "unexpected key slots: $(slots)" ;;
+esac
+opens "$key" || die "the provisional key does not open $dev"
+# Again, so that the slot's policy does not depend on what is on the disk.
+seal_tpm --unlock-key-file="$key"
+recovery=$(systemd-cryptenroll --unlock-key-file="$key" --wipe-slot=recovery --recovery-key "$dev" 2>/dev/null)
+recovery=$(grep -oE '[a-z]{8}(-[a-z]{8}){7}' <<<"$recovery") || die "no recovery key was made"
+echo "Recovery key, needed on the console if the TPM refuses to unlock the disk (after a firmware" >&2
+echo "or Secure Boot change). It is shown only now: store it away from this machine." >&2
+printf '%s\n' "$recovery" || die "could not show the recovery key"
+if [ -t 0 ]; then
+  read -rp "Type its last 8 letters to confirm that you have it: " last
+  [ "$last" = "${recovery##*-}" ] || die "that does not match: run it again for a new key"
+fi
+systemd-cryptenroll --wipe-slot=password "$dev" >/dev/null
+only_ours || die "unexpected key slots: $(slots)"
+rm "$key"
+sync -f "$state"

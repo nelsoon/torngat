@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+# To the kernel log, which is on every console.
+die() { echo "root-barrier: $*" >/dev/kmsg; exit 1; }
+# Not --graceful: without the measurement the boot stops.
+/usr/lib/systemd/systemd-pcrextend --pcr=15 torngat:root-opened
+value=$(cat /sys/class/tpm/tpm0/pcr-sha256/15)
+[[ $value =~ ^[0-9A-F]{64}$ && $value != "$(printf '0%.0s' {1..64})" ]] ||
+  die "PCR 15 was not extended"
+# The LUKS header is not authenticated: it could name the null cipher.
+table=$(dmsetup table root)
+[[ $table =~ ^0\ [0-9]+\ crypt\ (capi:xts\(aes\)-plain64|aes-xts-plain64)\  && $table != *$'\n'* ]] ||
+  die "the root is not encrypted with AES-XTS"

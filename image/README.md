@@ -8,7 +8,7 @@ from Debian 13 packages:
 | ESP | systemd-boot and a signed unified kernel image (UKI): kernel, initrd and command line |
 | `usr` (erofs, read-only) | the operating system, verified block by block by dm-verity |
 | `usr-verity`, `usr-verity-sig` | the verity hash tree and its signed root hash |
-| `root` (ext4, writable) | `/etc` and `/var`: node identity, state, installed extensions. Grows to fill the disk at first boot. |
+| `root` (LUKS2 + ext4, writable) | `/etc` and `/var`: node identity, state, installed extensions. Not in the image: the initrd creates it at first boot, on the rest of the disk, from a template in `/usr`. |
 
 The platform itself (`torngatd` and its systemd units) is not part of `/usr`. It ships as the
 **`torngat-platform` system extension**: a separate signed erofs image in
@@ -20,7 +20,7 @@ QEMU comes from trixie-backports (pinned in `mkosi.sandbox/etc/apt/preferences.d
 ## Build
 
 Needs Debian 13 (or newer) with mkosi 25+, systemd-repart 257+, systemd-ukify,
-sbsigntool, efitools, binutils and root. Build `torngatd` first on
+sbsigntool, efitools, binutils, mtools, fdisk, jq and root. Build `torngatd` first on
 Debian 13, so it links against the image's libraries:
 
 ```sh
@@ -37,8 +37,8 @@ This writes `image/out/torngat_<version>.raw` (the disk image) and
 `image/keys/signing.{key,crt}` sign the boot loader and the UKI (Secure Boot), the `/usr` verity root
 hash and the platform extension. The kernel inside the UKI is deliberately not signed with it: that
 kernel could be booted with any initrd and command line (`tools/ukify`). `build.sh` checks both.
-`--dev` images let
-anyone log in as root, so they use their own pair, `dev-signing.{key,crt}`. If they are missing, `build.sh` creates a development pair. The certificate is installed as `/usr/lib/verity.d/torngat.crt`; the host only merges extensions
+`keys/pcr.{key,crt}` (RSA 2048) sign the TPM policy that unlocks the root. `--dev` images let
+anyone log in as root, so they use their own pairs, `dev-signing.*` and `dev-pcr.*`. If they are missing, `build.sh` creates development pairs. The certificate is installed as `/usr/lib/verity.d/torngat.crt`; the host only merges extensions
 signed with it (unsigned or unprotected extensions are refused, see
 `mkosi.extra/usr/lib/systemd/system/systemd-sysext.service.d/`). Keep `image/keys/` out of version
 control; for releases, use a key held offline or in an HSM.
@@ -65,6 +65,7 @@ reboot
 ```
 
 It adds the image's certificate to the machine's keys and installs it as the platform key. The
+root file system is made anew at the next boot (see below), so do this before setting up the node. The
 existing keys are kept, as option ROMs of network cards and GPUs are usually signed with them; it
 refuses to run if there are none, unless given `--allow-no-vendor-keys`. With vendor keys kept, the machine
 still boots other systems signed by them: Secure Boot alone does not tie it to this image. Not every
@@ -74,6 +75,34 @@ Use a signing key made for this purpose and never one that signed images before 
 wrapped in a UKI: those contain a signed kernel that boots with any initrd, and only a revocation
 (`dbx`) would stop it. The same goes for old, vulnerable releases, as there is no rollback protection
 yet. After the reboot, check that `bootctl status` says Secure Boot is enabled.
+
+## Seal the encrypted root
+
+Needs a TPM 2.0. The root is encrypted from the first boot, but provisional until Secure Boot is on:
+enrolling the key makes it anew, empty, at the next boot. Then:
+
+```sh
+torngat-seal-root            # shows the recovery key, once: store it away from this machine
+```
+
+The TPM unlocks the disk only with Secure Boot in this state (PCR 7), in the initrd of a UKI whose
+policy we signed (PCR 11), with nothing added to its command line or extensions (PCR 12 and 13) and before any root was
+opened (PCR 15). `torngatd init` and `join` refuse a root that is not sealed. When the TPM refuses
+(changed Secure Boot keys, a `dbx` update, a new TPM), the recovery key is asked for on the console;
+then run `torngat-seal-root --reseal`. It accepts the firmware as it is, so find out first why the TPM
+refused, and be careful with a recovery key prompt that you did not expect.
+
+`torngat-seal-root` refuses a machine whose firmware ran code signed by others, which is usual with
+network cards and GPUs: another boot loader signed with the same key could then unlock the disk.
+`--allow-other-signers` accepts that.
+
+Until it is sealed, a machine must be in trusted hands. From then on this protects the disk without its machine, or with another system booted on it. It does not protect
+a whole stolen machine, which boots by itself into our signed system; a TPM whose bus is tampered
+with; or the integrity of the data. Old signed images can still unlock the disk. Someone with the
+disk can put an encrypted root of their own in its place: the image boots it, but it cannot get at
+the original.
+
+`image/test/sealed-root.sh` tests all this; same environment as the test below.
 
 ## Secure Boot test
 
@@ -87,11 +116,13 @@ readable copy of the signing certificate (`dev-signing.crt` for a `--dev` image)
 The image boots with the platform installed but idle. On the first node:
 
 ```sh
+torngat-enroll-secure-boot    # see above; then reboot
+torngat-seal-root             # shows the recovery key
 torngatd init                 # creates the cluster; node key in the TPM
 systemctl start torngatd
 ```
 
-On the others, `torngatd join --controller <host> --token-file <file>` then
+On the others, the same two, then `torngatd join --controller <host> --token-file <file>` then
 `systemctl start torngatd`. From then on `torngatd.service` starts at every boot.
 
 ## Update the platform
@@ -134,6 +165,7 @@ are created noDA; a lockout fails the test.
 
 ## Not done yet
 
+- Machines without a TPM: the first boot stops, as the root cannot be created.
 - Secure Boot key enrollment through a BMC.
 - The image certificate in the kernel's trusted keyring, so the kernel itself, not only
   `systemd-sysext`, decides which signed extensions are trusted.

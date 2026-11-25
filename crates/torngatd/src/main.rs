@@ -63,6 +63,10 @@ enum Cmd {
         /// Without any, TPM joins need a token pinned to the TPM (`tpm-pin`).
         #[arg(long)]
         tpm_ca: Vec<PathBuf>,
+        /// Set the node up although the host's root file system is not sealed to its TPM yet
+        /// (lab use; see `torngat-seal-root`).
+        #[arg(long)]
+        allow_unsealed_root: bool,
     },
     /// Enroll this node into an existing cluster.
     Join {
@@ -86,6 +90,10 @@ enum Cmd {
         tpm: TpmMode,
         #[arg(long, default_value = DEFAULT_TCTI)]
         tpm_device: String,
+        /// Set the node up although the host's root file system is not sealed to its TPM yet
+        /// (lab use; see `torngat-seal-root`).
+        #[arg(long)]
+        allow_unsealed_root: bool,
     },
     /// Print this machine's TPM endorsement key pin (for `ek_sha256` on a join token).
     TpmPin {
@@ -110,6 +118,9 @@ enum Cmd {
         join: SocketAddr,
     },
 }
+
+/// Present on the host image until `torngat-seal-root` has run: the disk key is still next to it.
+const PROVISIONAL_ROOT_KEY: &str = "/var/lib/torngat-seal/provisional.key";
 
 type Res<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -253,6 +264,17 @@ async fn open_store(data: &Path) -> Res<torngat_store::Store> {
         .current_leader(1, "single node leader")
         .await?;
     Ok(store)
+}
+
+/// Refuses to put secrets on a root file system that is not sealed yet.
+fn check_root_sealed(allow_unsealed: bool) -> Res<()> {
+    // An error (e.g. no permission to look) counts as unsealed.
+    if allow_unsealed || matches!(Path::new(PROVISIONAL_ROOT_KEY).try_exists(), Ok(false)) {
+        return Ok(());
+    }
+    Err("the root file system is not sealed to this machine's TPM yet: run torngat-seal-root first \
+         (or pass --allow-unsealed-root in a lab)"
+        .into())
 }
 
 async fn init(
@@ -610,7 +632,11 @@ async fn main_async() -> Res<()> {
             tpm,
             tpm_device,
             tpm_ca,
-        } => init(data, name, tpm, tpm_device, tpm_ca).await,
+            allow_unsealed_root,
+        } => {
+            check_root_sealed(allow_unsealed_root)?;
+            init(data, name, tpm, tpm_device, tpm_ca).await
+        }
         Cmd::TpmPin { tpm_device } => {
             println!("{}", node_key::ek_pin(&tpm_device)?);
             Ok(())
@@ -624,7 +650,9 @@ async fn main_async() -> Res<()> {
             control_port,
             tpm,
             tpm_device,
+            allow_unsealed_root,
         } => {
+            check_root_sealed(allow_unsealed_root)?;
             join(
                 data,
                 controller,
