@@ -1,5 +1,7 @@
 [Match]
 Kind=!*
+# USB devices that act as a network, such as a BMC or anything plugged in.
+Driver=!cdc_ether cdc_ncm cdc_mbim cdc_subset cdc_eem rndis_host
 Type=ether
 
 [Network]

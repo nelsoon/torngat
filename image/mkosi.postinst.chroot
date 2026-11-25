@@ -1,0 +1,31 @@
+#!/bin/bash
+# Removes the kernel modules that a host never needs and that a plugged-in device, or a process that broke out of an
+# instance, could have loaded: external buses with DMA, radio, video capture, old network protocols and
+# file systems. Not with mkosi's KernelModulesExclude=, which also removes firmware that no module declares.
+set -euo pipefail
+kernel=$(ls /usr/lib/modules)
+cd "/usr/lib/modules/$kernel/kernel"
+# Also for the ZFS modules, if there are any: mkosi only does this for modules newer than the list.
+depmod -a "$kernel"
+cp ../modules.dep /tmp/modules.dep
+rm -r drivers/{firewire,thunderbolt,net/thunderbolt,pcmcia,bluetooth,net/wireless,net/can,net/hamradio,net/ieee802154,net/arcnet,nfc,staging,isdn,atm,usb/atm,comedi,scsi/pcmcia,ssb,target/sbp,tty/ipwireless} \
+  drivers/media/{common,dvb-core,dvb-frontends,firewire,i2c,mc,mmc,pci,platform,radio,test-drivers,tuners,usb,v4l2-core} \
+  sound/{firewire,pcmcia,usb} \
+  net/{6lowpan,appletalk,atm,ax25,batman-adv,bluetooth,can,dccp,ieee802154,kcm,l2tp,lapb,mac80211,mac802154,netrom,nfc,phonet,qrtr,rds,rose,rxrpc,sctp,smc,tipc,wireless} \
+  fs/{adfs,affs,afs,befs,bfs,ceph,coda,ecryptfs,efs,freevxfs,gfs2,hfs,hfsplus,hpfs,jffs2,jfs,minix,nilfs2,ntfs3,ocfs2,omfs,orangefs,qnx4,qnx6,reiserfs,romfs,smb,sysv,ubifs,ufs,zonefs}
+cd ..
+missing=
+while read -r module needs; do
+  [ -e "${module%:}" ] || continue
+  for n in $needs; do
+    [ ! -e "$n" ] || continue
+    case ${module##*/} in
+      # Useless without it.
+      *_cs.ko* | *pcmcia* | *phonet* | b44.ko* | sur40.ko* | usb_f_uvc.ko* | snd-es1968.ko* | snd-fm801.ko*) rm "${module%:}"; break ;;
+      *) missing+=" ${module%:}->$n" ;;
+    esac
+  done
+done </tmp/modules.dep
+rm /tmp/modules.dep
+[ -z "$missing" ] || { echo "mkosi.postinst: needed by modules that stay:$missing" >&2; exit 1; }
+depmod -a "$kernel"

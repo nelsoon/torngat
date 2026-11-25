@@ -9,6 +9,8 @@
 # file (or to chardev:ID, with that chardev among the extra qemu args).
 # SECURE_BOOT_VARS=FILE uses firmware with Secure Boot and starts from that variable store (see
 # test/secure-boot.sh for making one); set it again when reusing the WORKDIR.
+# DISK (default virtio-blk-pci) and NIC (default virtio-net-pci) are the QEMU devices of the disk and the
+# network card; a controller the disk needs goes into the extra qemu args.
 # With NO_TPM=1 the machine has no TPM.
 # With REUSE=1 an existing WORKDIR (disk, UEFI variables, TPM state) is booted again as it is, e.g.
 # to test a reboot or an update.
@@ -57,7 +59,8 @@ esac
 qemu-system-x86_64 -enable-kvm -machine "$machine" -cpu host -smp "${SMP:-2}" -m "${MEM:-3072}" "${extra[@]}" \
   -drive if=pflash,format=raw,readonly=on,file="$code" \
   -drive if=pflash,format=raw,file="$work/vars.fd" \
-  -drive file="$work/disk.raw",if=virtio,format=raw,discard=unmap \
+  -drive file="$work/disk.raw",if=none,id=root,format=raw,discard=unmap \
   "${tpm[@]}" \
-  -nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:"${SSH_PORT:-2222}"-:22 \
-  -display none -monitor none -serial "$serial" "$@"
+  -nic user,model="${NIC:-virtio-net-pci}",hostfwd=tcp:127.0.0.1:"${SSH_PORT:-2222}"-:22 \
+  -display none -monitor none -serial "$serial" "$@" \
+  -device "${DISK:-virtio-blk-pci},drive=root"

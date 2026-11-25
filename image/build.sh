@@ -133,7 +133,7 @@ if [ -n "$zfs" ]; then
     sign_module "$modules/$m.ko"
     chmod 0644 "$modules/$m.ko"
   done
-  args+=(--package="zfsutils-linux=$zfs_version" --postinst-script="$here/zfs/depmod.chroot")
+  args+=(--package="zfsutils-linux=$zfs_version")
 fi
 mkosi --directory initrd --output-directory "$extra.initrd" --image-version="$version" -f build
 mkosi "${args[@]}" -f build
