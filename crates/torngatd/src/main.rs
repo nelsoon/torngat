@@ -14,6 +14,7 @@
 //! identity/           ca.pem, node.pem (chain), and node.key or node.tpmkey (TPM-wrapped blob)
 //! pki/                ca.pem, ca.key, controller.pem (chain), controller.key, tpm-roots/*.pem
 //!                     (vendor CAs trusted for TPM endorsement certificates) — controller only
+//! keys/               platform.key, which every volume depends on — controller only
 //! admin-token         bootstrap admin token for the API — controller only
 //! store/              replicated store — controller only
 //! instances/          workload runtime state
@@ -252,6 +253,19 @@ async fn open_store(data: &Path) -> Res<torngat_store::Store> {
     Ok(store)
 }
 
+/// Creates it if the cluster never had one.
+async fn load_platform_key(
+    store: &torngat_store::Store,
+    data: &Path,
+) -> Res<torngat_keys::PlatformKey> {
+    let dir = data.join("keys");
+    private_dir(&dir)?;
+    Ok(
+        torngat_controller::volume_keys::load_platform_key(store, &dir.join("platform.key"))
+            .await?,
+    )
+}
+
 /// Refuses to put secrets on a root file system that does not protect them.
 fn check_root_sealed(allow_unsealed: bool) -> Res<()> {
     use torngat_agent::inventory::{DiskProtection, disk_protection};
@@ -280,7 +294,11 @@ async fn init(
 ) -> Res<()> {
     let name = node_name(&name)?;
     fresh(&data)?;
-    if data.join("pki").exists() || data.join("store").exists() || data.join("identity").exists() {
+    if data.join("pki").exists()
+        || data.join("store").exists()
+        || data.join("identity").exists()
+        || data.join("keys").exists()
+    {
         return Err(format!(
             "{} holds a partial setup; remove it to start over",
             data.display()
@@ -344,6 +362,7 @@ async fn init(
 
     let store = open_store(&data).await?;
     let setup = async {
+        load_platform_key(&store, &data).await?;
         store
             .put(
                 torngat_controller::keys::tpm_policy()?,
@@ -543,7 +562,8 @@ async fn run(
     let token = torngat_apiserver::AdminToken::new(token.trim())?;
     let store = open_store(&data).await?;
 
-    let ctl = torngat_controller::Controller::new(store.clone());
+    let platform_key = load_platform_key(&store, &data).await?;
+    let ctl = torngat_controller::Controller::new(store.clone(), Arc::new(platform_key));
     let tls = torngat_controller::TlsConfig {
         cert_pem: read(pki.join("controller.pem"))?,
         key_pem: read(pki.join("controller.key"))?,

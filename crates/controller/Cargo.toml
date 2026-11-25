@@ -17,6 +17,7 @@ name = "join_tpm"
 required-features = ["tpm-tests"]
 
 [dependencies]
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
@@ -29,6 +30,7 @@ uuid.workspace = true
 x509-parser = "0.18"
 torngat-api = { path = "../../api" }
 torngat-attest = { path = "../attest" }
+torngat-keys = { path = "../keys" }
 torngat-pki = { path = "../pki" }
 torngat-proto = { path = "../proto" }
 torngat-store = { path = "../store" }

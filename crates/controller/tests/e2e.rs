@@ -95,7 +95,10 @@ async fn env() -> Env {
         ctl_cert.chain_pem.into_bytes(),
         ctl_cert.key_pem.unwrap().into_bytes(),
     );
-    let ctl = Controller::new(store.clone());
+    let ctl = Controller::new(
+        store.clone(),
+        std::sync::Arc::new(torngat_keys::PlatformKey::generate().unwrap()),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
         "https://127.0.0.1:{}",

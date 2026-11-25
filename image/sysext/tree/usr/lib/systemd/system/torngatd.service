@@ -18,6 +18,8 @@ RestartSec=2s
 # Instances are QEMU processes in their own session: stopping or restarting the daemon (an update,
 # a crash) must not kill them. The agent finds them again on start.
 KillMode=process
+# It holds keys.
+LimitCORE=0
 ProtectSystem=full
 ProtectHome=yes
 PrivateTmp=yes

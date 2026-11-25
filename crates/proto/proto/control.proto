@@ -15,6 +15,9 @@ service Control {
   rpc Assignments(AssignmentsRequest) returns (stream AssignmentSet);
   // Observed state of one instance assigned to the caller.
   rpc ReportInstance(InstanceReport) returns (ReportResponse);
+  // Key of a volume that is on the caller. The node keeps it in memory only, and asks again after a
+  // reboot. Made at the first call.
+  rpc GetVolumeKey(VolumeKeyRequest) returns (VolumeKeyResponse);
 }
 
 message RegisterRequest {
@@ -48,6 +51,18 @@ message InstanceReport {
   string message = 8;
 }
 message ReportResponse {}
+
+message VolumeKeyRequest {
+  string org = 1;
+  string project = 2;
+  string name = 3;
+  // The volume's metadata.uid.
+  string uid = 4;
+}
+message VolumeKeyResponse {
+  // 32 bytes. Never logged: has no Debug that shows it.
+  bytes key = 1;
+}
 
 // Enrollment of a new node. Served on its own port with server-only TLS: the caller has no
 // certificate yet. It has already checked the controller's CA against the pin in its token.

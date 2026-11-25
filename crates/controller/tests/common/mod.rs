@@ -48,7 +48,10 @@ pub async fn env(tpm_anchors: Vec<Vec<u8>>, tpm_required: bool) -> Env {
         key_pem: c.key_pem.unwrap().into_bytes(),
         client_ca_pem: ca.cert_pem().as_bytes().to_vec(),
     };
-    let ctl = Controller::new(store.clone());
+    let ctl = Controller::new(
+        store.clone(),
+        std::sync::Arc::new(torngat_keys::PlatformKey::generate().unwrap()),
+    );
     let cl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let jl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let control = cl.local_addr().unwrap().to_string();
