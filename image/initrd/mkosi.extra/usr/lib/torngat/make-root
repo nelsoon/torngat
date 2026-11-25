@@ -6,26 +6,74 @@
 # a random key saved inside the encrypted root itself, which torngat-seal-root replaces by a recovery
 # key. Without Secure Boot the TPM slot is weak and the root stays provisional: no secrets belong on
 # it, and it is made anew, with a new volume key, once Secure Boot is on.
+#
+# On a machine without a TPM the root's only key is a file on the boot partition, which protects
+# nothing. It is written only together with a new root, and read only there.
 set -euo pipefail
 # To the kernel log, which is on every console.
 die() { echo "make-root: $*" >/dev/kmsg; exit 1; }
+trap 'echo "make-root: line $LINENO failed" >/dev/kmsg' ERR
 work=/run/torngat/make-root
 mkdir -p "$work"
 mount -t tmpfs -o mode=0700 tmpfs "$work"
-trap 'umount "$work/tree" 2>/dev/null || true; umount "$work"' EXIT
+trap 'umount "$work/tree" "$work/esp" 2>/dev/null || true; umount "$work"' EXIT
 mkdir "$work/upper" "$work/work" "$work/tree"
 chmod 0755 "$work/upper"
 mount -t overlay -o "lowerdir=/sysusr/usr/lib/torngat/root,upperdir=$work/upper,workdir=$work/work" \
   overlay "$work/tree"
 state=$work/tree/var/lib/torngat-seal
 install -d -m 0700 "$state"
-(umask 077 && od -An -vtx1 -N32 /dev/urandom | tr -d ' \n' >"$state/provisional.key")
-[ "$(stat -c %s "$state/provisional.key")" = 64 ] || die "no random key"
+key=$state/provisional.key
+reset=/sys/firmware/efi/efivars/FactoryReset-8cf2644b-4b0b-428f-9387-6d876050dc67
+# The boot partition this was booted from. A copy of the image on another disk (an installation stick)
+# has the same identifiers: either disk could then be used for any of this.
+udevadm settle
+# 4 bytes of attributes, then UTF-16. (efivarfs files cannot be seeked in.)
+id=$(cat /sys/firmware/efi/efivars/LoaderDevicePartUUID-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f | tail -c +5 | tr -d '\0')
+esp=
+for p in /sys/class/block/*/partition; do
+  dev=/dev/$(basename "${p%/partition}")
+  [ "$(blkid -p -o value -s PART_ENTRY_UUID "$dev" || true)" = "${id,,}" ] || continue
+  [ -z "$esp" ] || die "two copies of this image are attached ($esp, $dev): remove one"
+  esp=$dev
+done
+[ -n "$esp" ] || die "the boot partition was not found"
+
+valid() { [ -f "$1" ] && [ "$(stat -c %s "$1")" = 64 ] && grep -qE '^[0-9a-f]{64}$' "$1"; }
+no_tpm=
+has=0
+/usr/lib/torngat/has-tpm || has=$?
+case $has in
+  0) ;;
+  1) no_tpm=1 ;;
+  *) die "cannot tell whether there is a TPM" ;;
+esac
+if [ -n "$no_tpm" ]; then
+  mkdir "$work/esp"
+  mount -t vfat -o ro,nosuid,nodev,noexec,umask=0077 "$esp" "$work/esp" || die "cannot mount $esp"
+  key=$work/esp/torngat/root.key
+  [ ! -e "$key" ] || valid "$key" || die "torngat/root.key on the boot partition is damaged: restore it"
+  : >"$state/unprotected"
+  mkdir "$work/definitions"
+  sed 's/^Encrypt=.*/Encrypt=key-file/' /sysusr/usr/lib/repart.d/20-root.conf \
+    >"$work/definitions/20-root.conf"
+fi
+# The key on the boot partition is never written over: it may be a node's only one.
+if [ ! -e "$key" ] && { [ -z "$no_tpm" ] || [ -e "$reset" ] || [ ! -e /dev/gpt-auto-root-luks ]; }; then
+  [ -z "$no_tpm" ] || mount -o remount,rw "$work/esp"
+  mkdir -p "${key%/*}"
+  (umask 077 && od -An -vtx1 -N32 /dev/urandom | tr -d ' \n' >"$key.new")
+  valid "$key.new" || die "no random key"
+  sync "$key.new"
+  mv "$key.new" "$key"
+  sync -f "$key"
+  [ -z "$no_tpm" ] || mount -o remount,ro "$work/esp"
+fi
 
 # 4 bytes of attributes, then the value.
 sb=$(od -An -tu1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c 2>/dev/null | tr -d ' ') || sb=
 pcrs=
-if [ "$sb" = 1 ]; then
+if [ "$sb" = 1 ] && [ -z "$no_tpm" ]; then
   # 7: the Secure Boot state. 12 and 13 are zero as long as nothing changed the command line (the
   # firmware can, even under Secure Boot) or added credentials or extensions. 15 is zero until a root was opened.
   zero=$(printf '0%.0s' {1..64})
@@ -37,9 +85,13 @@ fi
 # partition itself).
 export SYSTEMD_REPART_MKFS_OPTIONS_EXT4="-E nodiscard"
 # Offline, repart would write the whole partition: hours on a large disk.
-systemd-repart --dry-run=no --offline=no --copy-source="$work/tree" \
-  --key-file="$state/provisional.key" --tpm2-device=auto --tpm2-pcrs="$pcrs" \
-  --tpm2-public-key=/.extra/tpm2-pcr-public-key.pem --tpm2-public-key-pcrs=11
+how=(--tpm2-device=auto --tpm2-pcrs="$pcrs" --tpm2-public-key=/.extra/tpm2-pcr-public-key.pem
+  --tpm2-public-key-pcrs=11)
+[ -z "$no_tpm" ] || how=(--definitions="$work/definitions")
+# Without a key file there is a root already (a sealed one whose TPM was turned off, or the file is lost).
+if [ -e "$key" ]; then
+  systemd-repart --dry-run=no --offline=no --copy-source="$work/tree" --key-file="$key" "${how[@]}"
+fi
 
 udevadm settle
 [ -b /dev/gpt-auto-root-luks ] && [ ! -e /dev/gpt-auto-root ] ||
@@ -47,8 +99,12 @@ udevadm settle
 
 # repart does not remove the request if there was nothing to reset, or if power was lost just before
 # that. Left behind, it would erase the node at a later boot.
-reset=/sys/firmware/efi/efivars/FactoryReset-8cf2644b-4b0b-428f-9387-6d876050dc67
 if [ -e "$reset" ]; then
   chattr -i "$reset"
   rm "$reset"
+fi
+
+# Without a key file (a sealed root whose TPM was turned off) unlock-root asks for the recovery key.
+if [ -n "$no_tpm" ] && [ -e "$key" ]; then
+  (umask 077 && cp "$key" /run/torngat/root.key)
 fi

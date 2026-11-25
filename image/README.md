@@ -78,7 +78,8 @@ yet. After the reboot, check that `bootctl status` says Secure Boot is enabled.
 
 ## Seal the encrypted root
 
-Needs a TPM 2.0. The root is encrypted from the first boot, but provisional until Secure Boot is on:
+Without a TPM the key of the root is a file on the boot partition (`torngat/root.key`), which protects
+nothing, and it cannot be sealed. `image/test/no-tpm.sh` tests that. With a TPM 2.0, the root is encrypted from the first boot, but provisional until Secure Boot is on:
 enrolling the key makes it anew, empty, at the next boot. Then:
 
 ```sh
@@ -118,11 +119,11 @@ The image boots with the platform installed but idle. On the first node:
 ```sh
 torngat-enroll-secure-boot    # see above; then reboot
 torngat-seal-root             # shows the recovery key
-torngatd init                 # creates the cluster; node key in the TPM
+torngatd init --name n1       # creates the cluster; node key in the TPM
 systemctl start torngatd
 ```
 
-On the others, the same two, then `torngatd join --controller <host> --token-file <file>` then
+On the others, the same two, then `torngatd join --name <name> --controller <host> --token-file <file>` then
 `systemctl start torngatd`. From then on `torngatd.service` starts at every boot.
 
 ## Update the platform
@@ -165,7 +166,6 @@ are created noDA; a lockout fails the test.
 
 ## Not done yet
 
-- Machines without a TPM: the first boot stops, as the root cannot be created.
 - Secure Boot key enrollment through a BMC.
 - The image certificate in the kernel's trusted keyring, so the kernel itself, not only
   `systemd-sysext`, decides which signed extensions are trusted.

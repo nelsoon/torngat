@@ -48,3 +48,20 @@ After typing the recovery key at boot:
    ```
 
 3. Reboot to check.
+
+## Without a TPM
+
+Make sure first that the TPM is not just turned off in the firmware. If there is none when the root is created,
+its key is a file on the boot partition, `torngat/root.key`:
+
+- The node boots by itself, and **anyone with the disk can read it**, including the node's identity and, on
+  a controller, everything.
+- It must be accepted: `torngatd init --tpm optional --allow-unsealed-root` (first node), or on a cluster that
+  allows nodes without a TPM, `torngatd join --tpm off --allow-unsealed-root`. The node shows the
+  trait `disk-not-protected` in the API.
+- The file is the **only** key and there is no recovery key. Back it up; without it the node's data is gone. To
+  read it, mount the boot partition (the first one on the disk).
+- Adding or turning on a TPM later locks the node. Turn it off again, or reinstall to use it.
+- `torngat-enroll-secure-boot` is still useful, but `torngat-seal-root` refuses.
+
+A node that was sealed never falls back to this: with its TPM off or broken it asks for the recovery key.

@@ -4,7 +4,7 @@
 2. Build the image and write it to the system disk: [host image](../../image/README.md). This erases the
    disk. Never use a `--dev` image outside a lab: anyone at the console is root.
 3. In the firmware setup, clear the **platform key** only. The machine is then in Setup Mode.
-4. Boot. The first boot creates the root file system. Log in with SSH (DHCP address, key given to
+4. Remove any USB stick or disk with a copy of the image. Boot. The first boot creates the root file system. Log in with SSH (DHCP address, key given to
    `build.sh --authorized-keys`; there is no password).
 5. Enroll the Secure Boot key, and reboot. **This erases the root file system**, and the SSH host
    keys change:

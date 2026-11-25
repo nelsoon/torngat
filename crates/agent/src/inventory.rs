@@ -99,6 +99,35 @@ fn numa_nodes() -> Vec<NumaNode> {
     out
 }
 
+/// Whether the root file system of the host image protects what is on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskProtection {
+    /// Neither marker: sealed, or not the host image (its disk is the operator's business).
+    NoMarker,
+    /// `torngat-seal-root` has not run yet: the disk key is still next to it.
+    Provisional,
+    /// Made without a TPM: the disk key is on the boot partition.
+    Unprotected,
+}
+
+/// Says how this host's root file system is protected. The markers are the host image's.
+pub fn disk_protection() -> DiskProtection {
+    // An error (e.g. no permission to look) counts as present.
+    let there = |f: &str| {
+        !matches!(
+            Path::new("/var/lib/torngat-seal").join(f).try_exists(),
+            Ok(false)
+        )
+    };
+    if there("unprotected") {
+        DiskProtection::Unprotected
+    } else if there("provisional.key") {
+        DiskProtection::Provisional
+    } else {
+        DiskProtection::NoMarker
+    }
+}
+
 /// Collects this host's inventory.
 pub fn collect(agent_version: &str) -> NodeStatus {
     let arch = match std::env::consts::ARCH {
@@ -112,6 +141,9 @@ pub fn collect(agent_version: &str) -> NodeStatus {
     }
     if Path::new("/dev/tpmrm0").exists() {
         traits.insert("tpm2".to_owned());
+    }
+    if disk_protection() != DiskProtection::NoMarker {
+        traits.insert("disk-not-protected".to_owned());
     }
     NodeStatus {
         phase: Default::default(),

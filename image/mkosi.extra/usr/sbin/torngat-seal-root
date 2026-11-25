@@ -23,6 +23,8 @@ for a in "$@"; do
   esac
 done
 [ "$(id -u)" = 0 ] || die "run as root"
+[ ! -e /var/lib/torngat-seal/unprotected ] ||
+  die "this root was made without a TPM: its key is on the boot partition and it cannot be sealed"
 dev=$(cryptsetup status root 2>/dev/null | sed -n 's/^ *device: *//p') || true
 [ -b "$dev" ] || die "the root file system is not on the encrypted volume"
 # 4 bytes of attributes, then the value.
@@ -51,8 +53,15 @@ ours=$(sed '/^-----/d' /usr/lib/verity.d/torngat.crt | base64 -d | od -An -vtx1 
 # An entry is a 16-byte owner GUID and the certificate.
 [ -n "$signers" ] && [ "${#ours}" -gt 200 ] || die "cannot tell what Secure Boot relied on"
 while IFS= read -r s; do
-  [ "${s:32}" = "$ours" ] || [ -n "$others" ] ||
-    die "the firmware has run code signed by others (see --allow-other-signers in $0)"
+  [ "${s:32}" = "$ours" ] || [ -n "$others" ] || {
+    # Whose: the certificate's subject, or the hash of a single program.
+    who=$(sed 's/../\\x&/g' <<<"${s:32}" | { read -r x; printf "%b" "$x"; } |
+      openssl x509 -inform DER -noout -subject -nameopt RFC2253 2>/dev/null) || {
+      who="an unreadable certificate"
+      [ "${#s}" != 96 ] || who="hash ${s:32}"
+    }
+    die "the firmware has run code signed by others: \"$who\" (see --allow-other-signers in $0)"
+  }
 done <<<"$signers"
 
 opens() { cryptsetup open --test-passphrase --key-file "$1" "$dev" 2>/dev/null; }

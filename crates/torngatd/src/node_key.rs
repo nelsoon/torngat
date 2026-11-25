@@ -100,7 +100,7 @@ pub fn create_or_resume(ident: &Path, cfg: &KeyConfig) -> Res<(NodeKey, bool)> {
                     Err(torngat_agent::tpm::TpmError::BadBlob) => {}
                     Err(e) => {
                         return Err(format!(
-                            "{}: the TPM refused the saved key ({e}); if this TPM was cleared or replaced, delete this file and join again with a new token",
+                            "{}: the TPM refused the saved key ({e}); if this TPM was cleared or replaced, delete this file and join again with a new token and a new node name",
                             path.display()
                         )
                         .into());
@@ -132,7 +132,8 @@ pub fn load(ident: &Path, cfg: &KeyConfig) -> Res<NodeKey> {
                 format!(
                     "{}: the TPM refused the node key ({e}); if the key was created before TPM \
                      keys were made noDA (development builds before 0.0.1's power-loss fix) or \
-                     the TPM was cleared, delete this file and join again with a new token",
+                     the TPM was cleared, delete this file and join again with a new token and a \
+                     new node name",
                     path.display()
                 )
             })?;

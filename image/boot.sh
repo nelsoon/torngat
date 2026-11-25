@@ -9,6 +9,7 @@
 # file (or to chardev:ID, with that chardev among the extra qemu args).
 # SECURE_BOOT_VARS=FILE uses firmware with Secure Boot and starts from that variable store (see
 # test/secure-boot.sh for making one); set it again when reusing the WORKDIR.
+# With NO_TPM=1 the machine has no TPM.
 # With REUSE=1 an existing WORKDIR (disk, UEFI variables, TPM state) is booted again as it is, e.g.
 # to test a reboot or an update.
 set -euo pipefail
@@ -38,9 +39,14 @@ if [ -z "${REUSE:-}" ]; then
   swtpm_setup --tpm2 --tpmstate "$work/tpm" --create-ek-cert --overwrite \
     --config "$cfg/swtpm_setup.conf" >"$work/swtpm-setup.log" 2>&1
 fi
-swtpm socket --tpm2 --tpmstate dir="$work/tpm" --ctrl type=unixio,path="$work/swtpm.sock" \
-  --daemon --pid file="$work/swtpm.pid"
-trap 'swtpm_ioctl -s --unix "$work/swtpm.sock" 2>/dev/null || true' EXIT
+tpm=()
+if [ -z "${NO_TPM:-}" ]; then
+  swtpm socket --tpm2 --tpmstate dir="$work/tpm" --ctrl type=unixio,path="$work/swtpm.sock" \
+    --daemon --pid file="$work/swtpm.pid"
+  trap 'swtpm_ioctl -s --unix "$work/swtpm.sock" 2>/dev/null || true' EXIT
+  tpm=(-chardev "socket,id=chrtpm,path=$work/swtpm.sock" -tpmdev emulator,id=tpm0,chardev=chrtpm
+    -device tpm-tis,tpmdev=tpm0)
+fi
 
 serial=stdio
 case ${SERIAL:-} in
@@ -52,7 +58,6 @@ qemu-system-x86_64 -enable-kvm -machine "$machine" -cpu host -smp "${SMP:-2}" -m
   -drive if=pflash,format=raw,readonly=on,file="$code" \
   -drive if=pflash,format=raw,file="$work/vars.fd" \
   -drive file="$work/disk.raw",if=virtio,format=raw,discard=unmap \
-  -chardev socket,id=chrtpm,path="$work/swtpm.sock" \
-  -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis,tpmdev=tpm0 \
+  "${tpm[@]}" \
   -nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:"${SSH_PORT:-2222}"-:22 \
   -display none -monitor none -serial "$serial" "$@"

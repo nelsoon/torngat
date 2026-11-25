@@ -1,0 +1,10 @@
+#!/bin/bash
+# Whether this machine has a TPM, as far as anything can tell: 0 yes, 1 no, anything else unknown.
+# Only a machine surely without one is treated differently: a TPM that does not work stops the boot or
+# asks for the recovery key.
+[ -d /sys/firmware/acpi/tables ] && compgen -G '/sys/firmware/efi/efivars/*' >/dev/null || exit 2
+[ ! -e /sys/firmware/acpi/tables/TPM2 ] || exit 0
+[ ! -e /sys/class/tpm/tpm0 ] || exit 0
+# Set by the UKI's stub when it measured into a TPM; PCR 11 is then in use.
+[ ! -e /sys/firmware/efi/efivars/StubPcrKernelImage-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f ] || exit 0
+exit 1
