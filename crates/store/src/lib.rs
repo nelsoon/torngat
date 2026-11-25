@@ -247,6 +247,12 @@ impl Store {
         Ok(self.sm()?.list(prefix, start_after, limit.min(MAX_LIST))?)
     }
 
+    /// Every key, as of one moment.
+    pub async fn export(&self) -> Result<Vec<(Key, Versioned)>, StoreError> {
+        self.linearize().await?;
+        Ok(self.sm()?.dump()?)
+    }
+
     /// Subscribes to changes under `prefix`, as they are applied on *this* replica. To watch
     /// without missing events: subscribe, then list, then ignore events at or below the listed
     /// revisions.

@@ -66,6 +66,11 @@ pub fn platform_key() -> Result<Key, KeyError> {
     Key::new("keys", ["platform"])
 }
 
+/// How backups are encrypted ([`torngat_keys::Recovery`]).
+pub fn recovery() -> Result<Key, KeyError> {
+    Key::new("keys", ["recovery"])
+}
+
 /// A project's wrapped key ([`crate::volume_keys::ProjectKeyRecord`]).
 pub fn project_key(scope: &Scope) -> Result<Key, KeyError> {
     let mut s = vec!["projects"];

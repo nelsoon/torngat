@@ -161,9 +161,7 @@ impl StateMachine {
         Ok(out)
     }
 
-    /// Every key with its value, in key order, read from local state without any Raft round
-    /// trip. For simulation checkers comparing replicas.
-    #[cfg(feature = "test-util")]
+    /// Every key with its value, in key order, from one view of the local state.
     pub fn dump(&self) -> io::Result<Vec<(Key, Versioned)>> {
         let view = self.db.snapshot();
         let mut out = Vec::new();

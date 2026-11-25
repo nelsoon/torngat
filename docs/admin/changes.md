@@ -21,8 +21,7 @@ For **no** and **may not**:
 3. `torngat-seal-root --reseal`, and reboot to check.
 
 A TPM that was cleared or replaced, or a disk moved to another machine, also loses the node's identity: join
-it again, under a new name. On a controller, that identity cannot be joined again: reinstall
-the cluster.
+it again, under a new name. On a controller, [restore](backup.md) a backup.
 
 Keep the signing keys (`image/keys`) safe and backed up. Who has them can make an image that unlocks every
 node; without them no update can be made.

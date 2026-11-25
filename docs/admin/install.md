@@ -28,6 +28,8 @@
    systemctl start torngatd
    ```
 
+   Store the recovery code that it shows: it opens [backups](backup.md).
+
    On the others, see [nodes](nodes.md). `torngatd` starts by itself at every boot from then on.
 
 8. Reboot once. The node must come back without asking for anything.

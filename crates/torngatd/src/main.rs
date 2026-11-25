@@ -5,6 +5,8 @@
 //! - `join`: enroll this node into an existing cluster with a join token.
 //! - `run`: run whatever this node was set up as (controller node: store, API server, controller,
 //!   join endpoint and agent; other nodes: agent only).
+//! - `restore`: set this machine up from a backup of the controller.
+//! - `new-recovery-code`: make the code that opens later backups.
 //! - `tpm-pin`: print this machine's TPM endorsement key pin, to pre-register it on a join token.
 //!
 //! State directory layout. The root is 0711 (others may traverse, not list: the unprivileged QEMU
@@ -31,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use torngat_api::Name;
 use torngat_pki::{Ca, JoinToken, TpmPolicy};
 
+mod backup;
 mod node_key;
 use node_key::{DEFAULT_TCTI, KeyConfig, TpmMode};
 
@@ -89,6 +92,24 @@ enum Cmd {
         /// Where to keep the node key.
         #[arg(long, value_enum, default_value_t = TpmMode::On)]
         tpm: TpmMode,
+        #[arg(long, default_value = DEFAULT_TCTI)]
+        tpm_device: String,
+        /// Set the node up although the host's root file system is not sealed to its TPM, so that a
+        /// stolen disk gives everything on it away (see `torngat-seal-root`).
+        #[arg(long)]
+        allow_unsealed_root: bool,
+    },
+    /// Make a new recovery code, for backups made from now on (stop torngatd first).
+    NewRecoveryCode {
+        #[arg(long, default_value = "/var/lib/torngat")]
+        data: PathBuf,
+    },
+    /// Set this machine up as the controller that a backup was made on. Asks for the recovery code.
+    Restore {
+        #[arg(long, default_value = "/var/lib/torngat")]
+        data: PathBuf,
+        #[arg(long)]
+        backup: PathBuf,
         #[arg(long, default_value = DEFAULT_TCTI)]
         tpm_device: String,
         /// Set the node up although the host's root file system is not sealed to its TPM, so that a
@@ -201,6 +222,19 @@ fn fresh(data: &Path) -> Res<()> {
     Ok(())
 }
 
+/// Also refuses what an interrupted setup left.
+fn fresh_controller(data: &Path) -> Res<()> {
+    fresh(data)?;
+    if CONTROLLER_STATE.iter().any(|d| data.join(d).exists()) {
+        return Err(format!(
+            "{} holds a partial setup; remove it to start over",
+            data.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// `host` is a name, an IPv4 address or an IPv6 address (bare or in brackets), without a port.
 fn host_port(host: &str, port: u16) -> Res<String> {
     let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'));
@@ -253,17 +287,60 @@ async fn open_store(data: &Path) -> Res<torngat_store::Store> {
     Ok(store)
 }
 
+fn platform_key_path(data: &Path) -> PathBuf {
+    data.join("keys/platform.key")
+}
+
 /// Creates it if the cluster never had one.
 async fn load_platform_key(
     store: &torngat_store::Store,
     data: &Path,
 ) -> Res<torngat_keys::PlatformKey> {
-    let dir = data.join("keys");
-    private_dir(&dir)?;
-    Ok(
-        torngat_controller::volume_keys::load_platform_key(store, &dir.join("platform.key"))
-            .await?,
-    )
+    private_dir(&data.join("keys"))?;
+    Ok(torngat_controller::volume_keys::load_platform_key(store, &platform_key_path(data)).await?)
+}
+
+/// Directories of a controller, besides the `node.json` that marks it complete.
+const CONTROLLER_STATE: [&str; 4] = ["pki", "store", "identity", "keys"];
+
+/// Writes the CA, the controller's certificate, the TPM roots, this node's identity and an admin
+/// token. The operator is the trust root, so this node is enrolled without attestation.
+fn set_up_controller(
+    data: &Path,
+    ca: &Ca,
+    name: &Name,
+    key_cfg: &KeyConfig,
+    roots: &[Vec<u8>],
+) -> Res<torngat_pki::NodeIdentity> {
+    let pki = data.join("pki");
+    let ident = data.join("identity");
+    private_dir(&pki)?;
+    private_dir(&ident)?;
+    let tpm_roots = pki.join("tpm-roots");
+    private_dir(&tpm_roots)?;
+    for (i, pem) in roots.iter().enumerate() {
+        write_private(&tpm_roots.join(format!("{i}.pem")), pem)?;
+    }
+    ca.save(&pki)?;
+    let ctl = ca.issue_controller()?;
+    write_private(&pki.join("controller.pem"), ctl.chain_pem.as_bytes())?;
+    write_private(
+        &pki.join("controller.key"),
+        ctl.key_pem.as_deref().unwrap_or_default().as_bytes(),
+    )?;
+    let (key, _) = node_key::create_or_resume(&ident, key_cfg)?;
+    let me = ca.sign_node_csr(&key.csr()?, name)?;
+    let mut identity = me.identity(key.storage())?;
+    // Close our TPM session first: some TPM transports take one client at a time.
+    drop(key);
+    if let KeyConfig::Tpm { tcti } = key_cfg {
+        identity.ek_sha256 = node_key::ek_pin(tcti).ok();
+    }
+    write_private(&ident.join("ca.pem"), ca.cert_pem().as_bytes())?;
+    write_private(&ident.join("node.pem"), me.chain_pem.as_bytes())?;
+    let admin = torngat_pki::random_secret()?;
+    write_private(&data.join("admin-token"), admin.as_bytes())?;
+    Ok(identity)
 }
 
 /// Refuses to put secrets on a root file system that does not protect them.
@@ -293,30 +370,9 @@ async fn init(
     tpm_ca: Vec<PathBuf>,
 ) -> Res<()> {
     let name = node_name(&name)?;
-    fresh(&data)?;
-    if data.join("pki").exists()
-        || data.join("store").exists()
-        || data.join("identity").exists()
-        || data.join("keys").exists()
-    {
-        return Err(format!(
-            "{} holds a partial setup; remove it to start over",
-            data.display()
-        )
-        .into());
-    }
+    fresh_controller(&data)?;
     let required = tpm == TpmRequirement::Required;
-    let key_cfg = node_key::choose(
-        if required { TpmMode::On } else { TpmMode::Auto },
-        &tpm_device,
-    )
-    .map_err(|e| {
-        if required {
-            format!("{e}; this cluster would require TPMs (use --tpm optional to allow file keys)")
-        } else {
-            e.to_string()
-        }
-    })?;
+    let key_cfg = node_key::for_controller(required, &tpm_device)?;
     // Vendor roots for TPM endorsement certificates: check them before writing anything.
     let mut roots = Vec::new();
     for f in &tpm_ca {
@@ -327,42 +383,13 @@ async fn init(
     }
 
     data_root(&data)?;
-    let pki = data.join("pki");
-    let ident = data.join("identity");
-    private_dir(&pki)?;
-    private_dir(&ident)?;
-    let tpm_roots = pki.join("tpm-roots");
-    private_dir(&tpm_roots)?;
-    for (i, pem) in roots.iter().enumerate() {
-        write_private(&tpm_roots.join(format!("{i}.pem")), pem)?;
-    }
-
     let ca = Ca::generate()?;
-    ca.save(&pki)?;
-    let ctl = ca.issue_controller()?;
-    write_private(&pki.join("controller.pem"), ctl.chain_pem.as_bytes())?;
-    write_private(
-        &pki.join("controller.key"),
-        ctl.key_pem.as_deref().unwrap_or_default().as_bytes(),
-    )?;
-    // This node's own key: the operator running init is the trust root, so it is enrolled
-    // directly, without attestation.
-    let (key, _) = node_key::create_or_resume(&ident, &key_cfg)?;
-    let me = ca.sign_node_csr(&key.csr()?, &name)?;
-    let mut my_identity = me.identity(key.storage())?;
-    // Close our TPM session first: some TPM transports take one client at a time.
-    drop(key);
-    if let KeyConfig::Tpm { tcti } = &key_cfg {
-        my_identity.ek_sha256 = node_key::ek_pin(tcti).ok();
-    }
-    write_private(&ident.join("ca.pem"), ca.cert_pem().as_bytes())?;
-    write_private(&ident.join("node.pem"), me.chain_pem.as_bytes())?;
-    let admin = torngat_pki::random_secret()?;
-    write_private(&data.join("admin-token"), admin.as_bytes())?;
+    let my_identity = set_up_controller(&data, &ca, &name, &key_cfg, &roots)?;
 
     let store = open_store(&data).await?;
     let setup = async {
-        load_platform_key(&store, &data).await?;
+        let platform_key = load_platform_key(&store, &data).await?;
+        let code = backup::new_code(&store, &platform_key).await?;
         store
             .put(
                 torngat_controller::keys::tpm_policy()?,
@@ -385,11 +412,11 @@ async fn init(
                 torngat_store::Precondition::Absent,
             )
             .await?;
-        Res::Ok(token)
+        Res::Ok((token, code))
     }
     .await;
     store.shutdown().await?;
-    let token = setup?;
+    let (token, code) = setup?;
 
     let cfg = NodeConfig {
         role: Role::Controller,
@@ -433,6 +460,33 @@ async fn init(
         "Add a node: copy the join token to it, then run\n  torngatd join --controller <this host> --token-file <file>"
     );
     println!("More join tokens: POST /v1/platform/joinTokens on the API (admin token as Bearer).");
+    println!();
+    backup::print_code(&code)?;
+    Ok(())
+}
+
+fn read_line() -> Res<zeroize::Zeroizing<String>> {
+    let mut s = zeroize::Zeroizing::new(String::with_capacity(256));
+    std::io::stdin().read_line(&mut s)?;
+    Ok(s)
+}
+
+async fn new_recovery_code(data: PathBuf) -> Res<()> {
+    let cfg: NodeConfig = serde_json::from_slice(&std::fs::read(data.join("node.json"))?)?;
+    if cfg.role != Role::Controller {
+        return Err("this node is not a controller".into());
+    }
+    let store = open_store(&data)
+        .await
+        .map_err(|e| format!("cannot open the store, is torngatd running? ({e})"))?;
+    let made = async {
+        let platform_key = load_platform_key(&store, &data).await?;
+        backup::new_code(&store, &platform_key).await
+    }
+    .await;
+    store.shutdown().await?;
+    backup::print_code(&made?)?;
+    println!("Backups made before still need the old code.");
     Ok(())
 }
 
@@ -481,8 +535,8 @@ async fn join(
     Ok(())
 }
 
-/// Every certificate in `pki/tpm-roots/*.pem`.
-fn tpm_anchors(dir: &Path) -> Res<Vec<Vec<u8>>> {
+/// The files of `pki/tpm-roots/*.pem`.
+fn read_tpm_roots(dir: &Path) -> Res<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -492,9 +546,17 @@ fn tpm_anchors(dir: &Path) -> Res<Vec<Vec<u8>>> {
     for entry in entries {
         let p = entry?.path();
         if p.extension().is_some_and(|x| x == "pem") {
-            let pem = std::fs::read(&p)?;
-            out.extend(torngat_pki::pem_certs(&pem).map_err(|e| format!("{}: {e}", p.display()))?);
+            out.push(std::fs::read(&p)?);
         }
+    }
+    Ok(out)
+}
+
+/// Every certificate in them.
+fn tpm_anchors(dir: &Path) -> Res<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    for pem in read_tpm_roots(dir)? {
+        out.extend(torngat_pki::pem_certs(&pem).map_err(|e| format!("{}: {e}", dir.display()))?);
     }
     Ok(out)
 }
@@ -562,8 +624,14 @@ async fn run(
     let token = torngat_apiserver::AdminToken::new(token.trim())?;
     let store = open_store(&data).await?;
 
-    let platform_key = load_platform_key(&store, &data).await?;
-    let ctl = torngat_controller::Controller::new(store.clone(), Arc::new(platform_key));
+    let platform_key = Arc::new(load_platform_key(&store, &data).await?);
+    let ctl = torngat_controller::Controller::new(store.clone(), platform_key.clone());
+    let backups = Arc::new(backup::Backups {
+        store: store.clone(),
+        platform_key,
+        data: data.clone(),
+        name: cfg.name.clone(),
+    });
     let tls = torngat_controller::TlsConfig {
         cert_pem: read(pki.join("controller.pem"))?,
         key_pem: read(pki.join("controller.key"))?,
@@ -588,6 +656,17 @@ async fn run(
         store: store.clone(),
         token,
         ca_hash: ca.hash(),
+        backup: torngat_apiserver::Backup::new(move || {
+            let backups = backups.clone();
+            async move {
+                // The whole store is read and encrypted: not on the threads that serve.
+                let rt = tokio::runtime::Handle::current();
+                tokio::task::spawn_blocking(move || rt.block_on(backups.make()))
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())
+            }
+        }),
     };
     tracing::info!(node = %cfg.name, %api, %control, join = %join_addr, "torngatd running (controller)");
     // Any component stopping is fatal: never keep running half-alive.
@@ -650,6 +729,16 @@ async fn main_async() -> Res<()> {
         } => {
             check_root_sealed(allow_unsealed_root)?;
             init(data, name, tpm, tpm_device, tpm_ca).await
+        }
+        Cmd::NewRecoveryCode { data } => new_recovery_code(data).await,
+        Cmd::Restore {
+            data,
+            backup,
+            tpm_device,
+            allow_unsealed_root,
+        } => {
+            check_root_sealed(allow_unsealed_root)?;
+            backup::restore(data, backup, tpm_device).await
         }
         Cmd::TpmPin { tpm_device } => {
             println!("{}", node_key::ek_pin(&tpm_device)?);

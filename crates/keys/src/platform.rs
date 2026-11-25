@@ -70,8 +70,17 @@ impl PlatformKey {
         }
         let text = std::str::from_utf8(&text[..n]).map_err(|_| KeyError::Malformed)?;
         let text = text.strip_suffix('\n').unwrap_or(text);
+        Ok(Some(Self::decode(text)?))
+    }
+
+    /// The key itself, as in its file.
+    pub fn encode(&self) -> Zeroizing<String> {
+        Zeroizing::new(hex(self.key.expose()))
+    }
+
+    pub fn decode(text: &str) -> Result<Self, KeyError> {
         let key = Zeroizing::new(unhex::<KEY_LEN>(text).ok_or(KeyError::Malformed)?);
-        Ok(Some(Self::new(Secret(key))))
+        Ok(Self::new(Secret(key)))
     }
 
     /// Writes the key to a new 0600 file, whole or not at all. [`PlatformKey::sync`] it afterwards.
@@ -82,8 +91,7 @@ impl PlatformKey {
             .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
-        let text = Zeroizing::new(hex(self.key.expose()));
-        f.write_all(text.as_bytes())?;
+        f.write_all(self.encode().as_bytes())?;
         f.sync_all()?;
         // Unlike a rename, never replaces a key.
         let linked = std::fs::hard_link(&tmp, path);

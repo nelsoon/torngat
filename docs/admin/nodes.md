@@ -48,4 +48,4 @@ The answer's `token` is what the node needs: write it to a file only root can re
 
 - Removing a node through the API.
 - Renewing node certificates: they last one year.
-- More than one controller. Back its state up, or expect to lose the cluster with it.
+- More than one controller. [Back it up](backup.md), or expect to lose the cluster with it.
