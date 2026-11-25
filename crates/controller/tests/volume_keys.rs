@@ -293,6 +293,10 @@ async fn keys_are_destroyed_with_their_volumes() {
 
     // The uid comes back: no key.
     save(&e, &scope(), &gone).await;
+    e.store
+        .delete(keys::project_key(&scope()).unwrap(), Precondition::None)
+        .await
+        .unwrap();
     assert_eq!(key(&mut n1, &gone).await, Err(Code::FailedPrecondition));
     e.store.shutdown().await.unwrap();
 }

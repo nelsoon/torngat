@@ -94,7 +94,7 @@ impl PlatformKey {
 
     /// Puts the file at `path` on stable storage, with the directories that lead to it.
     pub fn sync(path: &Path) -> Result<(), KeyError> {
-        for p in path.ancestors().take(3) {
+        for p in std::path::absolute(path)?.ancestors().take(3) {
             File::open(p)?.sync_all()?;
         }
         Ok(())
@@ -121,8 +121,10 @@ mod tests {
         let path = dir.path().join("platform.key");
         assert!(PlatformKey::load(&path).unwrap().is_none());
         let k = PlatformKey::generate().unwrap();
-        // Left by a crash.
+        // Left by a crash; not touched without a key file.
         std::fs::write(path.with_extension("tmp"), "x").unwrap();
+        assert!(PlatformKey::load(&path).unwrap().is_none());
+        assert!(path.with_extension("tmp").exists());
         k.save(&path).unwrap();
         assert!(!path.with_extension("tmp").exists());
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);

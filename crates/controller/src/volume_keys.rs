@@ -202,6 +202,10 @@ async fn check_and_get(
     if old.is_none() && volume.status.formatted {
         return Err(internal(format!("the key of volume {uid} is gone")));
     }
+    let destroyed = || Status::failed_precondition("the volume's key is destroyed");
+    if old.as_ref().is_some_and(|r| r.wrapped.is_none()) {
+        return Err(destroyed());
+    }
     let purpose = Purpose::Volume { volume: uid };
     let (id, project_key) = project_key(ctl, scope, old.is_none()).await?;
     let rec = match old {
@@ -218,7 +222,8 @@ async fn check_and_get(
         }
     };
     let Some(wrapped) = &rec.wrapped else {
-        return Err(Status::failed_precondition("the volume's key is destroyed"));
+        // Meanwhile.
+        return Err(destroyed());
     };
     if id != rec.project_key {
         return Err(internal(format!(

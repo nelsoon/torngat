@@ -35,6 +35,7 @@ Items found in reviews that a later chunk must enforce.
   - Keys are given by the pool's node, which is enough for local storage. Shared storage must also check that the instance in `attached_to` runs on the caller.
   - A node that never reports `formatted` gets keys without an attached instance: the controller should set it when it gives the key for formatting.
   - Node removal must delete the identity before the node's record, or registering makes the record again as active. Needed before real data: a stolen node cannot be cut off yet.
+  - Core dumps are off for the `torngatd` service only, not when it is run by hand.
   - The agent keeps received keys in memory that is erased, and never logs them.
   - Set `formatted` before the first write to a volume, and never clear it: it decides whether a missing key may be made.
   - Project keys are named by the project's path: when projects become objects, destroy the key with the project, so that a project made later under the same name does not get it.
