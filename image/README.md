@@ -19,7 +19,7 @@ QEMU comes from trixie-backports (pinned in `mkosi.sandbox/etc/apt/preferences.d
 
 ## Build
 
-Needs Debian 13 (or newer) with mkosi 25+, systemd-repart 257+ and root. Build `torngatd` first on
+Needs Debian 13 (or newer) with mkosi 25+, systemd-repart 257+, sbsigntool and root. Build `torngatd` first on
 Debian 13, so it links against the image's libraries:
 
 ```sh
@@ -33,9 +33,9 @@ This writes `image/out/torngat_<version>.raw` (the disk image) and
 
 ### Signing keys
 
-`image/keys/signing.{key,crt}` sign the boot loader and kernel (Secure Boot), the `/usr` verity
-root hash and the platform extension. If they are missing, `build.sh` creates a development pair.
-The certificate is installed as `/usr/lib/verity.d/torngat.crt`; the host only merges extensions
+`image/keys/signing.{key,crt}` sign the boot loader and kernel (Secure Boot, not the boot entry or
+initrd yet; `build.sh` checks both signatures), the `/usr` verity root hash and the platform
+extension. If they are missing, `build.sh` creates a development pair. The certificate is installed as `/usr/lib/verity.d/torngat.crt`; the host only merges extensions
 signed with it (unsigned or unprotected extensions are refused, see
 `mkosi.extra/usr/lib/systemd/system/systemd-sysext.service.d/`). Keep `image/keys/` out of version
 control; for releases, use a key held offline or in an HSM.
@@ -47,6 +47,18 @@ image/boot.sh image/out/torngat_<version>.raw
 ```
 
 UEFI, a software TPM with an endorsement certificate, nested KVM and SSH on `localhost:2222`.
+
+With `SECURE_BOOT_CERT=FILE` (a readable copy of `image/keys/signing.crt`) Secure Boot is on and
+that certificate is the only one the firmware trusts (needs `virt-fw-vars`, Debian package
+`python3-virt-firmware`).
+
+## Secure Boot test
+
+`CERT=FILE SSH_KEY=KEY image/test/secure-boot.sh IMAGE` boots the image with Secure Boot on,
+trusting only our certificate, and checks that Secure Boot is enabled and the kernel is locked down;
+then it boots with an unrelated certificate and checks that the firmware refuses the image. Run it
+as a normal user, with a readable copy of `image/keys/signing.crt` as `CERT` and an image built with
+`KEY` authorized.
 
 ## Set up a node
 
