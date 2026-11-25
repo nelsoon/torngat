@@ -119,6 +119,11 @@ readable copy of the signing certificate (`dev-signing.crt` for a `--dev` image)
 machines or inside volumes are not visible, nothing is activated by itself; with `--zfs` also module
 signatures, pools of other machines, and LUKS2 on a zvol.
 
+## Hardware test
+
+`image/test/hardware.sh IMAGE`, same environment: boots on emulated server disk controllers and network
+cards, unlocks the root with a USB keyboard, checks drivers, firmware files and microcode.
+
 ## Set up a node
 
 The image boots with the platform installed but idle. On the first node:
