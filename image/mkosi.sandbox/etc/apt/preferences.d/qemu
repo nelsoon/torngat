@@ -1,5 +1,5 @@
-# QEMU and the firmware package it needs (seabios) from trixie-backports; everything else from
-# trixie.
-Package: qemu-* src:qemu seabios
+# QEMU and the firmware package it needs (seabios), and ZFS (only with build.sh --zfs), from
+# trixie-backports; everything else from trixie.
+Package: qemu-* src:qemu src:zfs-linux seabios
 Pin: release n=trixie-backports
 Pin-Priority: 990

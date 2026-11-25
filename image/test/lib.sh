@@ -100,3 +100,8 @@ type_line() {
   python3 -c 'import socket, sys, time
 s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(sys.stdin.buffer.read() + b"\r"); time.sleep(2)' "$dir/console.sock"
 }
+no_failed_units() {
+  local failed
+  failed=$(guest systemctl --failed --no-legend) || fail "systemctl --failed"
+  [ -z "$failed" ] || fail "failed units: $failed"
+}

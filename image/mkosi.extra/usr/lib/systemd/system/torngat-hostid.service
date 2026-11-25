@@ -1,0 +1,17 @@
+[Unit]
+Description=Generate the host ID on first boot
+Documentation=man:zgenhostid(8)
+# ZFS uses it to tell that a pool belongs to another machine.
+ConditionPathExists=/usr/sbin/zgenhostid
+ConditionFileNotEmpty=!/etc/hostid
+After=local-fs.target
+Before=torngatd.service
+
+[Service]
+Type=oneshot
+# zgenhostid's own random numbers are the time and the PID.
+ExecStart=/bin/sh -c 'exec /usr/sbin/zgenhostid -f "$(od -An -N4 -tx4 /dev/urandom | tr -d " ")"'
+ExecStartPost=/usr/bin/sync /etc/hostid /etc
+
+[Install]
+WantedBy=multi-user.target

@@ -3,11 +3,13 @@
 # mkosi 25 or later, systemd-repart 257 or later,
 # systemd-ukify, sbsigntool, efitools, binutils, mtools, fdisk and jq.
 #
-#   sudo image/build.sh --torngatd PATH [--version V] [--authorized-keys FILE] [--dev]
+#   sudo image/build.sh --torngatd PATH [--version V] [--authorized-keys FILE] [--zfs] [--dev]
 #
 #   --torngatd PATH         torngatd binary built for Debian 13 (cargo build --release -p torngatd)
 #   --version V             image and extension version (default: the workspace version)
 #   --authorized-keys FILE  SSH public keys allowed to log in as root
+#   --zfs                   compile the ZFS kernel modules and include ZFS (see README.md: do not give
+#                           such an image to others without legal advice)
 #   --dev                   root autologin on the console (lab images only)
 #
 # Signing: keys/signing.key and keys/signing.crt (dev-signing.* with --dev) are used if present,
@@ -21,18 +23,22 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' "$here/../Cargo.toml")
 dev=
+zfs=
 keys_file=
 while [ $# -gt 0 ]; do
   case $1 in
     --torngatd) bin=$2; shift 2 ;;
     --version) version=$2; shift 2 ;;
     --authorized-keys) keys_file=$2; shift 2 ;;
+    --zfs) zfs=1; shift ;;
     --dev) dev=1; shift ;;
     *) echo "build.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
 : "${bin:?--torngatd is required}"
+die() { echo "build.sh: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || { echo "build.sh: run as root (mkosi needs it)" >&2; exit 1; }
+[ -z "$zfs" ] || [ "${SUDO_UID:-0}" != 0 ] || die "with --zfs, run with sudo from a normal user (who compiles ZFS)"
 
 # Dev images let anyone log in as root: machines that trust the other key must not boot them.
 name=signing
@@ -63,8 +69,8 @@ sysext=$("$here/sysext/build.sh" --torngatd "$bin" --version "$version" --key "$
   --cert "$cert" --out "$out")
 
 extra=$(mktemp -d)
-mkdir "$extra.initrd"
-trap 'rm -rf "$extra" "$extra.initrd"' EXIT
+mkdir "$extra.initrd" "$extra.zfs" "$extra.sign"
+trap 'rm -rf "$extra" "$extra.initrd" "$extra.zfs" "$extra.sign"' EXIT
 # The extra tree's own modes are copied onto the image: / must stay 0755, /root 0700.
 chmod 0755 "$extra"
 install -D -m 0644 "$cert" "$extra/usr/lib/verity.d/torngat.crt"
@@ -80,6 +86,21 @@ sign_var KEK -a
 sign_var db -a
 chmod 0644 "$sb"/*.auth
 rm "$sb/esl"
+# What the kernel's scripts/sign-file does. The kernel trusts modules signed by a key in the firmware's
+# db, where ours is.
+sign_module() { # FILE
+  openssl cms -sign -binary -noattr -nocerts -md sha256 -signer "$cert" -inkey "$key" \
+    -in "$1" -outform DER -out "$extra.sign/sig"
+  local size
+  size=$(printf %08x "$(stat -c %s "$extra.sign/sig")")
+  {
+    cat "$extra.sign/sig"
+    # struct module_signature: PKCS#7, then the signature's size, big endian.
+    printf '\0\0\2\0\0\0\0\0'
+    printf "\\x${size:0:2}\\x${size:2:2}\\x${size:4:2}\\x${size:6:2}"
+    printf '~Module signature appended~\n'
+  } >>"$1"
+}
 if [ -n "$keys_file" ]; then
   install -d -m 0700 "$extra/root" "$extra/root/.ssh"
   install -m 0600 "$keys_file" "$extra/root/.ssh/authorized_keys"
@@ -92,6 +113,28 @@ args=(--image-version="$version" --extra-tree="$extra"
   --initrd="$extra.initrd/initrd")
 [ -n "$dev" ] && args+=(--autologin=yes)
 cd "$here"
+if [ -n "$zfs" ]; then
+  # Compiled as a normal user: see zfs/mkosi.conf.
+  [ "$(stat -c '%u %a' "$key" "$pcr_key" | sort -u)" = "0 600" ] || die "$key and $pcr_key must be root's, mode 600"
+  chown "$SUDO_UID:$SUDO_GID" "$extra.zfs"
+  runuser -u "$SUDO_USER" -- env HOME="$(getent passwd "$SUDO_UID" | cut -d: -f6)" \
+    mkosi --directory zfs --output-directory "$extra.zfs" --output tree -f build
+  tree=$extra.zfs/tree
+  zfs_kernel=$(ls "$tree/usr/lib/modules")
+  [[ $zfs_kernel =~ ^[0-9][0-9A-Za-z.+-]*$ ]] || die "unexpected kernel $zfs_kernel"
+  zfs_version=$(dpkg-query --admindir="$tree/var/lib/dpkg" -W -f '${Version}' zfs-dkms)
+  modules=$extra/usr/lib/modules/$zfs_kernel/updates
+  # Every level is copied with its mode.
+  install -d -m 0755 "$extra/usr/lib/modules" "${modules%/*}" "$modules"
+  for m in spl zfs; do
+    xz -dc "$tree/usr/lib/modules/$zfs_kernel/updates/dkms/$m.ko.xz" >"$extra.sign/$m.ko"
+    # Also drops the signature made with dkms's throwaway key.
+    strip --strip-debug -o "$modules/$m.ko" "$extra.sign/$m.ko"
+    sign_module "$modules/$m.ko"
+    chmod 0644 "$modules/$m.ko"
+  done
+  args+=(--package="zfsutils-linux=$zfs_version" --postinst-script="$here/zfs/depmod.chroot")
+fi
 mkosi --directory initrd --output-directory "$extra.initrd" --image-version="$version" -f build
 mkosi "${args[@]}" -f build
 
@@ -102,7 +145,6 @@ mkosi "${args[@]}" -f build
 offset=$(sfdisk -J "$out/torngat_$version.raw" | jq '.partitiontable.partitions[0].start * 512')
 mkdir "$extra/esp"
 mcopy -s -i "$out/torngat_$version.raw@@$offset" '::/*' "$extra/esp"
-die() { echo "build.sh: $*" >&2; exit 1; }
 signed_by_us() { sbverify --cert "$cert" "$1" >/dev/null 2>&1; }
 # For what must not be signed: looks at the signature's subject, so a file whose hash does not check
 # out still counts.
@@ -131,6 +173,8 @@ for f in "${ukis[@]}"; do
     die "the PCR policy key in ${f##*/} is not $pcr_cert"
   objcopy -O binary --only-section=.linux "$f" "$extra/linux"
   [ -s "$extra/linux" ] || die "no kernel in ${f##*/}"
+  [ -z "$zfs" ] || [ "$(section .uname)" = "$zfs_kernel" ] ||
+    die "the ZFS modules are for kernel $zfs_kernel, the image has $(section .uname)"
   ! mentions_us "$extra/linux" || die "the kernel inside ${f##*/} is signed with $cert"
 done
 find "$extra/esp" -type f >"$extra/files"

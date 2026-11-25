@@ -30,6 +30,7 @@ sudo image/build.sh --torngatd target/release/torngatd --authorized-keys ~/.ssh/
 
 This writes `image/out/torngat_<version>.raw` (the disk image) and
 `image/out/torngat-platform_<version>.raw` (the extension, also preinstalled in the image).
+`--zfs` adds ZFS (see [storage](../docs/admin/storage.md)); it also needs xz-utils and more time.
 `--dev` adds root autologin on the console: never use it outside a lab.
 
 ### Signing keys
@@ -111,6 +112,12 @@ the original.
 boots with our certificate, is refused with an unrelated one or with a changed kernel command line,
 and can be enrolled from Setup Mode without losing vendor keys. Run it as a normal user, with a
 readable copy of the signing certificate (`dev-signing.crt` for a `--dev` image) as `CERT` and an image built with `KEY` authorized.
+
+## Storage test
+
+`image/test/storage.sh IMAGE`, same environment: LVM and LUKS2 over a power cut, volume groups of other
+machines or inside volumes are not visible, nothing is activated by itself; with `--zfs` also module
+signatures, pools of other machines, and LUKS2 on a zvol.
 
 ## Set up a node
 
