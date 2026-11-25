@@ -3,10 +3,10 @@
 # (no platform key). Existing db and KEK entries are kept: option ROMs of network cards and GPUs are
 # usually signed with them.
 #
-#   torngat-enroll-secure-boot [--only-our-key]
+#   torngat-enroll-secure-boot [--allow-no-vendor-keys]
 #
-# --only-our-key accepts a firmware without any existing db entry (checked by default, as hardware
-# that needs vendor-signed option ROMs may then not start).
+# --allow-no-vendor-keys accepts a firmware without any existing db entry (refused by default, as
+# hardware that needs vendor-signed option ROMs may then not start).
 set -eu
 keys=/usr/lib/torngat/secure-boot
 vars=/sys/firmware/efi/efivars
@@ -15,10 +15,10 @@ security=d719b2cb-3d3a-4596-a3bc-dad00e67656f
 die() { echo "torngat-enroll-secure-boot: $*" >&2; exit 1; }
 
 force=
-case "${1:-}" in
-  --only-our-key) force=1 ;;
+case "$*" in
+  --allow-no-vendor-keys) force=1 ;;
   '') ;;
-  *) die "unknown argument $1" ;;
+  *) die "usage: torngat-enroll-secure-boot [--allow-no-vendor-keys]" ;;
 esac
 [ "$(id -u)" = 0 ] || die "run as root"
 [ -d "$vars" ] || die "this machine was not booted with UEFI"
@@ -31,7 +31,11 @@ byte() { od -An -tu1 -j4 -N1 "$vars/$1-$global" 2>/dev/null | tr -d ' '; }
 size() { if [ -e "$1" ]; then stat -c %s "$1"; else echo 0; fi; }
 # 4 bytes are the variable's attributes.
 if [ "$(size "$vars/db-$security")" -le 4 ] && [ -z "$force" ]; then
-  die "the firmware has no db entries to keep: restore its factory keys (and clear only the platform key), or use --only-our-key"
+  die "the firmware has no db entries to keep: restore its factory keys (and clear only the platform key), or use --allow-no-vendor-keys"
+fi
+
+if [ "$(size "$vars/dbx-$security")" -le 4 ]; then
+  echo "warning: the firmware has no revocation list (dbx): boot loaders known to be vulnerable are trusted" >&2
 fi
 
 # Attributes (little endian): non-volatile, boot and runtime access, time-based authentication, and
@@ -44,9 +48,11 @@ put() { # ATTRIBUTES FILE VARIABLE
 }
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
-put '\147' "$keys/db.auth" "$vars/db-$security"
-put '\147' "$keys/KEK.auth" "$vars/KEK-$global"
+append='\147' # 0x67
+replace='\047' # 0x27
+put "$append" "$keys/db.auth" "$vars/db-$security"
+put "$append" "$keys/KEK.auth" "$vars/KEK-$global"
 # Last: it ends Setup Mode.
-put '\047' "$keys/PK.auth" "$vars/PK-$global"
+put "$replace" "$keys/PK.auth" "$vars/PK-$global"
 [ "$(byte SetupMode)" = 0 ] || die "the firmware is still in Setup Mode"
 echo "Keys enrolled. Reboot, and turn Secure Boot on in the firmware setup if it is not on by itself."

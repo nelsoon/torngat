@@ -10,9 +10,9 @@
 #   --authorized-keys FILE  SSH public keys allowed to log in as root
 #   --dev                   root autologin on the console (lab images only)
 #
-# Signing: keys/signing.key and keys/signing.crt are used if present, otherwise a development key
-# pair is created there. The same key signs the boot loader and kernel (Secure Boot), the /usr
-# dm-verity root hash, and the platform extension; the certificate is installed in
+# Signing: keys/signing.key and keys/signing.crt (dev-signing.* with --dev) are used if present,
+# otherwise a development key pair is created there. The same key signs the boot loader and the UKI
+# (Secure Boot; not the kernel inside the UKI, see tools/ukify), the /usr dm-verity root hash, and the platform extension; the certificate is installed in
 # /usr/lib/verity.d so the host only merges extensions signed with it.
 #
 # Output in out/: torngat_V.raw (write it to a disk or USB stick, or boot it in a VM) and
@@ -34,8 +34,11 @@ done
 : "${bin:?--torngatd is required}"
 [ "$(id -u)" = 0 ] || { echo "build.sh: run as root (mkosi needs it)" >&2; exit 1; }
 
-key=$here/keys/signing.key
-cert=$here/keys/signing.crt
+# Dev images let anyone log in as root: machines that trust the other key must not boot them.
+name=signing
+[ -n "$dev" ] && name=dev-signing
+key=$here/keys/$name.key
+cert=$here/keys/$name.crt
 if [ ! -e "$key" ] && [ ! -e "$cert" ]; then
   echo "build.sh: creating a development signing key in $here/keys" >&2
   (umask 077 && mkdir -p "$here/keys" &&
@@ -49,7 +52,7 @@ sysext=$("$here/sysext/build.sh" --torngatd "$bin" --version "$version" --key "$
   --cert "$cert" --out "$out")
 
 extra=$(mktemp -d)
-trap 'rm -rf "$extra" "$extra.esl"' EXIT
+trap 'rm -rf "$extra"' EXIT
 # The extra tree's own modes are copied onto the image: / must stay 0755, /root 0700.
 chmod 0755 "$extra"
 install -D -m 0644 "$cert" "$extra/usr/lib/verity.d/torngat.crt"
@@ -58,13 +61,13 @@ install -D -m 0644 "$sysext" "$extra/var/lib/extensions/torngat-platform.raw"
 sb=$extra/usr/lib/torngat/secure-boot
 owner=7a3f2c1e-5d0b-4f6a-9c38-1b2e4d6f8a90 # says who added an entry; any fixed GUID
 install -d -m 0755 "$extra/usr/lib/torngat" "$sb"
-cert-to-efi-sig-list -g "$owner" "$cert" "$extra.esl"
-for v in PK KEK db; do
-  append=-a
-  [ "$v" = PK ] && append=
-  sign-efi-sig-list ${append:+"$append"} -g "$owner" -k "$key" -c "$cert" "$v" "$extra.esl" "$sb/$v.auth" >/dev/null
-  chmod 0644 "$sb/$v.auth"
-done
+cert-to-efi-sig-list -g "$owner" "$cert" "$sb/esl"
+sign_var() { sign-efi-sig-list "${@:2}" -g "$owner" -k "$key" -c "$cert" "$1" "$sb/esl" "$sb/$1.auth" >/dev/null; }
+sign_var PK
+sign_var KEK -a
+sign_var db -a
+chmod 0644 "$sb"/*.auth
+rm "$sb/esl"
 if [ -n "$keys_file" ]; then
   install -d -m 0700 "$extra/root" "$extra/root/.ssh"
   install -m 0600 "$keys_file" "$extra/root/.ssh/authorized_keys"
@@ -77,21 +80,38 @@ args=(--image-version="$version" --extra-tree="$extra"
 cd "$here"
 mkosi "${args[@]}" -f build
 
-# What boots must be signed with our key (mkosi silently installs a loader signed by someone else when
-# there is none it can sign), and nothing that accepts an arbitrary initrd or command line may be.
+# The boot loader and UKIs must be signed with our key (mkosi silently installs a loader signed by
+# someone else when there is none it can sign). Nothing else may be: a signed kernel would boot with
+# any initrd and command line.
 systemd-dissect --copy-from "$out/torngat_$version.raw" /boot "$extra/esp"
-signed_by_us() { sbverify --cert "$cert" "$1" >/dev/null 2>&1; }
 die() { echo "build.sh: $*" >&2; exit 1; }
+signed_by_us() { sbverify --cert "$cert" "$1" >/dev/null 2>&1; }
+# For what must not be signed: looks at the signature's subject, so a file whose hash does not check
+# out still counts.
+subject=$(openssl x509 -in "$cert" -noout -subject -nameopt compat)
+subject=${subject#subject=}
+mentions_us() { sbverify --list "$1" 2>&1 | grep -qF "$subject"; }
+mentions_us "$extra/esp/EFI/BOOT/BOOTX64.EFI" || die "cannot read signature subjects with sbverify"
+for f in EFI/BOOT/BOOTX64.EFI EFI/systemd/systemd-bootx64.efi; do
+  signed_by_us "$extra/esp/$f" || die "$f on the ESP is missing or not signed with $cert"
+done
 ukis=("$extra"/esp/EFI/Linux/*.efi)
-for f in "$extra/esp/EFI/BOOT/BOOTX64.EFI" "$extra/esp/EFI/systemd/systemd-bootx64.efi" "${ukis[@]}"; do
-  signed_by_us "$f" || die "${f#"$extra/esp"} on the ESP is missing or not signed with $cert"
-done
 for f in "${ukis[@]}"; do
+  signed_by_us "$f" || die "no UKI on the ESP, or not signed with $cert: ${f##*/}"
+  # The signed command line is what ties the UKI to this image's /usr.
+  objcopy -O binary --only-section=.cmdline "$f" "$extra/cmdline"
+  grep -aqE '(^| )usrhash=[0-9a-f]{64}( |$)' <(tr -d '\0' <"$extra/cmdline") ||
+    die "no usrhash= in the command line of ${f##*/}"
   objcopy -O binary --only-section=.linux "$f" "$extra/linux"
-  [ -s "$extra/linux" ] || die "no kernel in $f"
-  ! signed_by_us "$extra/linux" || die "the kernel inside ${f##*/} is signed with $cert"
+  [ -s "$extra/linux" ] || die "no kernel in ${f##*/}"
+  ! mentions_us "$extra/linux" || die "the kernel inside ${f##*/} is signed with $cert"
 done
+find "$extra/esp" -type f >"$extra/files"
 while IFS= read -r f; do
-  ! signed_by_us "$f" || die "${f#"$extra/esp"}: a kernel outside a UKI is signed with $cert"
-done < <(find "$extra/esp" -name 'vmlinuz*')
+  case ${f#"$extra/esp/"} in
+    EFI/BOOT/BOOTX64.EFI | EFI/systemd/systemd-bootx64.efi | EFI/Linux/*.efi) ;;
+    loader/keys/* | *.addon.efi | *.cred) die "unexpected ${f#"$extra/esp/"} on the ESP" ;;
+    *) ! mentions_us "$f" || die "${f#"$extra/esp/"} must not be signed with $cert" ;;
+  esac
+done <"$extra/files"
 echo "build.sh: $out/torngat_$version.raw"

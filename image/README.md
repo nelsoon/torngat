@@ -37,7 +37,8 @@ This writes `image/out/torngat_<version>.raw` (the disk image) and
 `image/keys/signing.{key,crt}` sign the boot loader and the UKI (Secure Boot), the `/usr` verity root
 hash and the platform extension. The kernel inside the UKI is deliberately not signed with it: that
 kernel could be booted with any initrd and command line (`tools/ukify`). `build.sh` checks both.
-Never sign `--dev` images with a release key, for the same reason: they let anyone log in as root. If they are missing, `build.sh` creates a development pair. The certificate is installed as `/usr/lib/verity.d/torngat.crt`; the host only merges extensions
+`--dev` images let
+anyone log in as root, so they use their own pair, `dev-signing.{key,crt}`. If they are missing, `build.sh` creates a development pair. The certificate is installed as `/usr/lib/verity.d/torngat.crt`; the host only merges extensions
 signed with it (unsigned or unprotected extensions are refused, see
 `mkosi.extra/usr/lib/systemd/system/systemd-sysext.service.d/`). Keep `image/keys/` out of version
 control; for releases, use a key held offline or in an HSM.
@@ -65,16 +66,21 @@ reboot
 
 It adds the image's certificate to the machine's keys and installs it as the platform key. The
 existing keys are kept, as option ROMs of network cards and GPUs are usually signed with them; it
-refuses to run if there are none, unless given `--only-our-key`. With vendor keys kept, the machine
+refuses to run if there are none, unless given `--allow-no-vendor-keys`. With vendor keys kept, the machine
 still boots other systems signed by them: Secure Boot alone does not tie it to this image. Not every
 firmware supports this.
+
+Use a signing key made for this purpose and never one that signed images before the kernel was
+wrapped in a UKI: those contain a signed kernel that boots with any initrd, and only a revocation
+(`dbx`) would stop it. The same goes for old, vulnerable releases, as there is no rollback protection
+yet. After the reboot, check that `bootctl status` says Secure Boot is enabled.
 
 ## Secure Boot test
 
 `CERT=FILE SSH_KEY=KEY image/test/secure-boot.sh IMAGE` boots the image in VMs with Secure Boot: it
 boots with our certificate, is refused with an unrelated one or with a changed kernel command line,
 and can be enrolled from Setup Mode without losing vendor keys. Run it as a normal user, with a
-readable copy of `image/keys/signing.crt` as `CERT` and an image built with `KEY` authorized.
+readable copy of the signing certificate (`dev-signing.crt` for a `--dev` image) as `CERT` and an image built with `KEY` authorized.
 
 ## Set up a node
 

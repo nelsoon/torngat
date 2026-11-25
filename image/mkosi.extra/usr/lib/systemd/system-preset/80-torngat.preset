@@ -1,3 +1,5 @@
 enable systemd-networkd.service
 enable systemd-resolved.service
 enable torngat-ssh-keygen.service
+# The TPM policy will be a signed one for the UKI, not one predicted on the machine.
+disable systemd-pcrlock*
