@@ -77,6 +77,7 @@ for each project, itself encrypted under the **platform key**: `/var/lib/torngat
   instance uses it. The controller logs `volume key given`. A node must ask again after a reboot.
 - There is no way to remove a node yet, so a stolen one can still ask for its keys.
 - A minute or so after a volume is gone, its key is destroyed. Copies may remain for a while in the store's own log and
-  snapshots, and in backups; they are of no use without the platform key.
+  snapshots, and in backups; reading them takes the platform key, or
+  for a backup the recovery code.
 - **If the platform key is lost, every volume is lost.** `torngatd` then refuses to start rather than make another.
-  There is no backup tool yet: keep no data that you cannot lose.
+  [Back it up](backup.md).

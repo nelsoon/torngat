@@ -15,8 +15,10 @@ tpm = ["torngat-agent/tpm"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+rmp-serde = "1.3"
 serde.workspace = true
 serde_json.workspace = true
+time.workspace = true
 tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "net", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -28,6 +30,10 @@ torngat-controller = { path = "../controller" }
 torngat-keys = { path = "../keys" }
 torngat-pki = { path = "../pki" }
 torngat-store = { path = "../store" }
+zeroize = { version = "1.9", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3.4"
 
 [lints]
 workspace = true

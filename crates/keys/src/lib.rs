@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod platform;
+mod recovery;
 
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 pub use platform::PlatformKey;
+pub use recovery::{Recovery, RecoveryCode, RecoveryError};
 
 pub const KEY_LEN: usize = 32;
 const WRAPPED_LEN: usize = NONCE_LEN + KEY_LEN + 16;
@@ -49,6 +51,8 @@ pub enum Purpose<'a> {
     Project { id: Uuid, project: &'a str },
     /// A volume's key, under its project's key.
     Volume { volume: Uuid },
+    /// The authentication key of backups, under the platform key.
+    Recovery { public: &'a str },
 }
 
 impl Purpose<'_> {
@@ -58,6 +62,7 @@ impl Purpose<'_> {
                 format!("torngat/v1/project-key/{id}/{project}").into_bytes()
             }
             Purpose::Volume { volume } => format!("torngat/v1/volume-key/{volume}").into_bytes(),
+            Purpose::Recovery { public } => format!("torngat/v1/recovery/{public}").into_bytes(),
         }
     }
 }

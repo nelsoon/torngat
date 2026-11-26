@@ -740,6 +740,7 @@ dependencies = [
  "elliptic-curve",
  "rfc6979",
  "signature",
+ "spki",
  "zeroize",
 ]
 
@@ -761,7 +762,9 @@ dependencies = [
  "digest 0.11.3",
  "ff",
  "group",
+ "hkdf",
  "hybrid-array",
+ "pkcs8",
  "rand_core",
  "sec1",
  "subtle",
@@ -1084,6 +1087,15 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hkdf"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
+dependencies = [
+ "hmac",
+]
 
 [[package]]
 name = "hmac"
@@ -1819,6 +1831,7 @@ checksum = "5c9f42978c78a00e3d68f69fc03e57a234debae69da4020a4fb588fcdcd07b06"
 dependencies = [
  "elliptic-curve",
  "primefield",
+ "serdect",
  "wnaf",
 ]
 
@@ -2863,6 +2876,7 @@ name = "torngat-keys"
 version = "0.0.1"
 dependencies = [
  "getrandom 0.4.3",
+ "p256",
  "ring",
  "serde",
  "serde_json",
@@ -2924,8 +2938,11 @@ name = "torngatd"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "rmp-serde",
  "serde",
  "serde_json",
+ "tempfile",
+ "time",
  "tokio",
  "torngat-agent",
  "torngat-api",
@@ -2937,6 +2954,7 @@ dependencies = [
  "torngat-store",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -3378,6 +3396,7 @@ version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85ccff8a4805aba1eaa4cd4afcd49f7557dd2cf5fd79ffc37f8959466effc5aa"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 

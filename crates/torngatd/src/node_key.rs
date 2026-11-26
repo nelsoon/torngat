@@ -69,6 +69,16 @@ pub fn choose(mode: TpmMode, tcti: &str) -> Res<KeyConfig> {
     }
 }
 
+/// For a controller's own key, under the cluster's policy.
+pub fn for_controller(required: bool, tcti: &str) -> Res<KeyConfig> {
+    if !required {
+        return choose(TpmMode::Auto, tcti);
+    }
+    choose(TpmMode::On, tcti).map_err(|e| {
+        format!("{e}; this cluster requires TPMs (at init, --tpm optional allows file keys)").into()
+    })
+}
+
 /// Loads the key in `ident`, or creates and saves it first; says whether it already existed.
 /// Saving before joining lets a join whose answer was lost simply be re-run with the same key.
 pub fn create_or_resume(ident: &Path, cfg: &KeyConfig) -> Res<(NodeKey, bool)> {

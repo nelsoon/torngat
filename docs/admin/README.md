@@ -8,9 +8,10 @@ Torngat is pre-alpha: do not run untrusted tenants or data you cannot lose on it
 4. [Nodes and join tokens](nodes.md)
 5. [Updates and changes](changes.md): what is safe, and what asks for the recovery key
 6. [Storage for instances](storage.md): LVM, building with ZFS
-7. [Troubleshooting](troubleshooting.md)
+7. [Back up and restore the cluster](backup.md)
+8. [Troubleshooting](troubleshooting.md)
 
-## The ten things to remember
+## The things to remember
 
 1. Put the system disk on built-in NVMe or SATA, and turn option ROMs off for other cards.
 2. Keep the vendor's Secure Boot keys; clear only the platform key.
@@ -24,3 +25,5 @@ Torngat is pre-alpha: do not run untrusted tenants or data you cannot lose on it
 8. A stolen disk is protected. A whole stolen server is not: it boots by itself.
 9. Before a node leaves your hands, [erase its disk keys](changes.md#retire-a-node).
 10. The admin token can do everything. Never share or log it.
+11. The cluster's recovery code is shown once by `torngatd init`. Without it and a [backup](backup.md), a lost controller loses
+    every volume.

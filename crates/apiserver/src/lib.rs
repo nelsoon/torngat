@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+mod backup;
 mod crud;
 mod error;
 mod handlers;
@@ -30,6 +31,7 @@ use axum::routing::get;
 use torngat_store::Store;
 
 pub use auth::AdminToken;
+pub use backup::Backup;
 pub use error::ApiError;
 
 /// Largest accepted request body.
@@ -41,6 +43,7 @@ pub struct AppState {
     pub token: AdminToken,
     /// Pin of the cluster CA, embedded in the join tokens this server hands out.
     pub ca_hash: torngat_pki::CaHash,
+    pub backup: Backup,
 }
 
 async fn not_found() -> ApiError {
@@ -76,6 +79,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/platform/settings/tpm",
             get(settings::get_tpm).put(settings::put_tpm),
         )
+        .route("/v1/platform/backup", get(backup::get_backup))
         .route(
             "/v1/platform/storagePools",
             get(storage::list_pools).post(storage::create_pool),

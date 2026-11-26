@@ -36,6 +36,9 @@ Items found in reviews that a later chunk must enforce.
   - A node that never reports `formatted` gets keys without an attached instance: the controller should set it when it gives the key for formatting.
   - Node removal must delete the identity before the node's record, or registering makes the record again as active. Needed before real data: a stolen node cannot be cut off yet.
   - Core dumps are off for the `torngatd` service only, not when it is run by hand.
+  - After a restore, nodes have volumes that the store does not know: the agent must never delete a volume because it is unknown, only when told to.
+  - Restoring brings back revoked nodes and destroyed keys, and stops instances made since. Etags start again, so an old one can match by chance. A list of revoked nodes outside the store, and instances that are adopted rather than stopped: later.
+  - Backups (`crates/keys/src/recovery.rs`) can only be read with the recovery code, and only be made by the cluster. An old backup is not refused: the operator checks its date.
   - The agent keeps received keys in memory that is erased, and never logs them.
   - Set `formatted` before the first write to a volume, and never clear it: it decides whether a missing key may be made.
   - Project keys are named by the project's path: when projects become objects, destroy the key with the project, so that a project made later under the same name does not get it.

@@ -118,6 +118,7 @@ async fn env() -> Env {
         store: store.clone(),
         token: AdminToken::new(TOKEN).unwrap(),
         ca_hash: pki.ca.hash(),
+        backup: torngat_apiserver::Backup::new(|| async { Ok(None) }),
     });
     Env {
         api,
