@@ -57,6 +57,16 @@ pub struct Recovery {
 fn hkdf(salt: &[u8], secret: &[&[u8]], info: &[u8]) -> Result<Secret, KeyError> {
     let ikm = Zeroizing::new(secret.concat());
     let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, salt).extract(&ikm);
+    expand(&prk, info)
+}
+
+/// The code is already uniformly random: keys come from it directly (RFC 5869, section 3.3),
+/// each with its own label.
+fn from_code(code: &[u8], info: &[u8]) -> Result<Secret, KeyError> {
+    expand(&hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, code), info)
+}
+
+fn expand(prk: &hkdf::Prk, info: &[u8]) -> Result<Secret, KeyError> {
     let mut out = Zeroizing::new([0; KEY_LEN]);
     prk.expand(&[info], &AES_256_GCM)
         .and_then(|okm| okm.fill(out.as_mut()))
@@ -105,7 +115,7 @@ impl RecoveryCode {
 
     fn check(&self) -> Result<[u8; CHECK_LEN], KeyError> {
         // Independent of the keys: shown and stored only with the code.
-        let k = hkdf(b"torngat/v1/recovery-check", &[self.0.as_ref()], b"")?;
+        let k = from_code(self.0.as_ref(), b"torngat/v1/recovery/check")?;
         let mut out = [0; CHECK_LEN];
         out.copy_from_slice(&k.expose()[..CHECK_LEN]);
         Ok(out)
@@ -163,7 +173,10 @@ impl RecoveryCode {
     }
 
     fn derive(&self, info: &[u8]) -> Result<Secret, KeyError> {
-        hkdf(b"torngat/v1/recovery", &[self.0.as_ref()], info)
+        from_code(
+            self.0.as_ref(),
+            &[b"torngat/v1/recovery/".as_slice(), info].concat(),
+        )
     }
 
     fn private(&self) -> Result<SecretKey, KeyError> {
@@ -278,16 +291,16 @@ mod tests {
         let c = RecoveryCode(Zeroizing::new([7; CODE_LEN]));
         assert_eq!(
             *c.encode().unwrap(),
-            "A4DQ-OBYH-A4DQ-OBYH-A4DQ-OBYH-A4DQ-OBYH-FPIZ-6RMF"
+            "A4DQ-OBYH-A4DQ-OBYH-A4DQ-OBYH-A4DQ-OBYH-EEUB-RQQV"
         );
         assert_eq!(
             hex(&c.private().unwrap().public_key().to_sec1_bytes()),
-            "040862455a3532827e802ecb8b16ba2307356680b966c447171c52545f081c008a\
-             b5cfb18f8bbfd47e7d93389c10d8fce6fb3c0d0b57f1f252355259a633d27e1b"
+            "0417da10b875124a9c4d99e6556f53b1ab4dcb1bd4029265951004f44f9810f822\
+             cb91fe426d3e0d2edbfbc540d0dec5879f138e7b7202eb03c072a7cc1b23b3b3"
         );
         assert_eq!(
             hex(c.auth().unwrap().expose()),
-            "d3d80ce692d165ad425d7ab30b202b018cc7c28532abbd9f3c85bc31ed76a679"
+            "6408e738311094eed8c718afa4bb85911debff0fa554b09b3f403cd9f1bf5d52"
         );
     }
 
