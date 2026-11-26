@@ -176,7 +176,7 @@ pub enum InventoryError {
 
 /// True if `s` is short and free of control characters (safe to store, index and log).
 fn good_str(s: &str) -> bool {
-    s.len() <= MAX_STR_LEN && !s.chars().any(char::is_control)
+    s.len() <= MAX_STR_LEN && !s.chars().any(crate::is_hidden)
 }
 
 impl NodeStatus {

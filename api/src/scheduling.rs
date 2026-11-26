@@ -77,7 +77,7 @@ impl ResourceClaimSpec {
                 return Err(ClaimError::Count(n.to_owned()));
             }
             if let Some(sel) = &r.selector
-                && (sel.len() > MAX_SELECTOR_LEN || sel.chars().any(char::is_control))
+                && (sel.len() > MAX_SELECTOR_LEN || sel.chars().any(crate::is_hidden))
             {
                 return Err(ClaimError::Selector(n.to_owned()));
             }

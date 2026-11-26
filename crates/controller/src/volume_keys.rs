@@ -192,8 +192,8 @@ async fn check_and_get(
     {
         return Err(Status::failed_precondition("volume is not in use"));
     }
-    // Once there is data, only while an instance uses it.
-    if volume.status.formatted && volume.status.attached_to.is_none() {
+    // Only while an instance uses it, also to format it.
+    if volume.status.attached_to.is_none() {
         return Err(Status::failed_precondition("no instance uses the volume"));
     }
 
@@ -231,7 +231,24 @@ async fn check_and_get(
             rec.project_key
         )));
     }
-    project_key.unwrap(wrapped, purpose).map_err(internal)
+    let key = project_key.unwrap(wrapped, purpose).map_err(internal)?;
+    if !volume.status.formatted {
+        // The node may write to it now: from then on a missing key is never made again.
+        let vk = keys::volume(scope, name).map_err(internal)?;
+        crate::storage::modify(store, &vk, |v: &mut Volume| {
+            if v.metadata.uid != uid || v.status.formatted {
+                return false;
+            }
+            v.status.formatted = true;
+            v.metadata.etag = None;
+            true
+        })
+        .await
+        .map_err(internal)?
+        .filter(|v| v.metadata.uid == uid)
+        .ok_or_else(|| Status::permission_denied("volume is not on this node"))?;
+    }
+    Ok(key)
 }
 
 /// The project's key and its id.
@@ -308,4 +325,56 @@ async fn destroy_if_gone(store: &Store, at: &Key, v: Versioned) -> Result<bool, 
         )
         .await?;
     Ok(true)
+}
+
+/// Whether the key of `uid` was destroyed.
+pub(crate) async fn is_destroyed(store: &Store, uid: Uuid) -> Result<bool, ScheduleError> {
+    let at = keys::volume_key(uid)?;
+    Ok(match store.get(&at).await? {
+        Some(v) => serde_json::from_slice::<VolumeKeyRecord>(&v.value)
+            .map(|r| r.wrapped.is_none())
+            .unwrap_or(true),
+        None => false,
+    })
+}
+
+/// Destroys the key of a volume, or makes sure that none is made: before its object is removed.
+pub(crate) async fn destroy(
+    store: &Store,
+    scope: &Scope,
+    name: &Name,
+    uid: Uuid,
+) -> Result<(), ScheduleError> {
+    let at = keys::volume_key(uid)?;
+    for _ in 0..8 {
+        let (rec, pre) = match store.get(&at).await? {
+            Some(v) => {
+                let mut rec: VolumeKeyRecord = serde_json::from_slice(&v.value)?;
+                if rec.wrapped.is_none() {
+                    return Ok(());
+                }
+                rec.wrapped = None;
+                (rec, Precondition::Revision(v.revision))
+            }
+            None => (
+                VolumeKeyRecord {
+                    scope: scope.clone(),
+                    name: name.clone(),
+                    // There never was one.
+                    project_key: Uuid::nil(),
+                    wrapped: None,
+                },
+                Precondition::Absent,
+            ),
+        };
+        match store.put(at.clone(), serde_json::to_vec(&rec)?, pre).await {
+            Ok(_) => {
+                tracing::info!(volume = %uid, "volume key destroyed");
+                return Ok(());
+            }
+            Err(StoreError::PreconditionFailed { .. }) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(StoreError::PreconditionFailed { current: None }.into())
 }

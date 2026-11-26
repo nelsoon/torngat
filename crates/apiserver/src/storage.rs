@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::crud::{Input, Kind, Params, Update, any, invalid};
 use crate::handlers::{
-    DeleteQuery, ListQuery, ListResponse, body, decode, name, node_key, parse_etag, project_scope,
-    query, store_key,
+    DeleteQuery, ListQuery, ListResponse, body, decode, name, node_key, project_scope, query,
+    store_key,
 };
 use crate::{ApiError, AppState};
 
@@ -156,11 +156,14 @@ pub async fn delete_pool(
             "{n} is in a volume type"
         )));
     }
-    if p.status.claimed {
-        // The node removes its mark first.
-        return POOLS.delete_later(&st, &Scope::Platform, &n, rev, p).await;
+    let uid = p.metadata.uid;
+    let names = |v: &Volume| v.status.pool.as_ref().is_some_and(|r| r.uid == uid);
+    if any(&st, &VOLUMES.all()?, names).await? {
+        return Err(ApiError::FailedPrecondition(format!("{n} holds volumes")));
     }
-    POOLS.delete(&st, &Scope::Platform, &n, rev).await
+    // The controller removes it, once its node removed its mark and nothing uses it: a type may
+    // have been given it meanwhile.
+    POOLS.delete_later(&st, &Scope::Platform, &n, rev, p).await
 }
 
 // ---------- volume types ----------
@@ -378,10 +381,36 @@ pub async fn create_volume(
         return Ok(Json(volume));
     }
     // Another attempt's volume was deleted while this one was about to create it: undo.
-    if mine && let Some(e) = &volume.metadata.etag {
-        let Json(_) = VOLUMES.delete(&st, &scope, &n, parse_etag(e)?).await?;
+    if mine {
+        undo(&st, &scope, &n, rec.uid).await?;
     }
     Err(ApiError::NotFound(target))
+}
+
+/// Deletes the volume of this uid, even if it changed meanwhile (such as being placed).
+async fn undo(st: &AppState, scope: &Scope, n: &Name, uid: Uuid) -> Result<(), ApiError> {
+    for _ in 0..8 {
+        let Some(cur) = st.store.get(&VOLUMES.key(scope, n)?).await? else {
+            return Ok(());
+        };
+        let rev = cur.revision;
+        let mut v: Volume = decode(cur)?;
+        if v.metadata.uid != uid {
+            return Ok(());
+        }
+        let done = if v.status.pool.is_some() {
+            v.status.phase = VolumePhase::Deleting;
+            VOLUMES.delete_later(st, scope, n, rev, v).await
+        } else {
+            VOLUMES.delete(st, scope, n, rev).await
+        };
+        match done {
+            Ok(_) | Err(ApiError::NotFound(_)) => return Ok(()),
+            Err(ApiError::Aborted(_)) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(ApiError::Aborted("the volume changed; retry".into()))
 }
 
 pub async fn get_volume(

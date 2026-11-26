@@ -1,7 +1,8 @@
 //! The control service agents talk to.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use time::OffsetDateTime;
@@ -18,7 +19,9 @@ use torngat_store::{Precondition, StoreError};
 use uuid::Uuid;
 
 use crate::scheduler::list_all;
-use crate::{Controller, identity, keys, volume_keys};
+use torngat_api::storage::StorageCapabilities;
+
+use crate::{Controller, identity, keys, storage, volume_keys};
 
 /// How often an agent's assignment set is recomputed.
 const ASSIGNMENT_POLL: Duration = Duration::from_millis(500);
@@ -30,11 +33,16 @@ const MAX_MESSAGE: usize = 1024;
 #[derive(Debug, Clone)]
 pub struct ControlService {
     ctl: Controller,
+    /// The newest assignment stream of each node.
+    streams: Arc<Mutex<HashMap<Name, u64>>>,
 }
 
 impl ControlService {
     pub fn new(ctl: Controller) -> Self {
-        Self { ctl }
+        Self {
+            ctl,
+            streams: Arc::default(),
+        }
     }
 }
 
@@ -58,6 +66,14 @@ fn check_version(v: &str) -> Result<(), Status> {
             "unsupported api_version {v:?}, controller speaks {API_VERSION}"
         )))
     }
+}
+
+/// An agent's message, or `None` if empty.
+fn message(m: String) -> Result<Option<String>, Status> {
+    if m.len() > MAX_MESSAGE || m.chars().any(torngat_api::is_hidden) {
+        return Err(bad("message"));
+    }
+    Ok((!m.is_empty()).then_some(m))
 }
 
 fn bad(what: &str) -> Status {
@@ -182,6 +198,14 @@ impl Control for ControlService {
         req: Request<AssignmentsRequest>,
     ) -> Result<Response<Self::AssignmentsStream>, Status> {
         let me = identity::authenticate(&self.ctl.store, &req).await?;
+        // One stream per node: each reads every instance, pool and volume twice a second.
+        let generation = {
+            let mut s = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+            let g = s.entry(me.clone()).or_default();
+            *g += 1;
+            *g
+        };
+        let streams = self.streams.clone();
         // Kept to re-check enrollment while the stream is open: revoking a node ends it.
         let cert = req
             .peer_certs()
@@ -190,8 +214,19 @@ impl Control for ControlService {
         let store = self.ctl.store.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         tokio::spawn(async move {
-            let mut last: Option<Vec<Vec<u8>>> = None;
+            let mut last = None;
             loop {
+                let current = streams
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&me)
+                    == Some(&generation);
+                if !current {
+                    let _ = tx
+                        .send(Err(Status::aborted("replaced by a newer stream")))
+                        .await;
+                    return;
+                }
                 if let Err(e) = identity::check_enrolled(&store, &me, &cert).await {
                     let _ = tx.send(Err(e)).await;
                     return;
@@ -203,10 +238,23 @@ impl Control for ControlService {
                         return;
                     }
                 };
+                // Instances keep flowing when storage objects cannot be read: then the node is
+                // told to ignore the storage lists, never given a partial one.
+                let storage = match storage::assigned_storage(&store, &me).await {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        tracing::error!(node = %me, error = %e, "storage assignments unavailable");
+                        None
+                    }
+                };
+                let set = (set, storage);
                 if last.as_ref() != Some(&set) {
                     let msg = AssignmentSet {
                         api_version: API_VERSION.into(),
-                        instances_json: set.clone(),
+                        instances_json: set.0.clone(),
+                        pools_json: set.1.as_ref().map(|s| s.0.clone()).unwrap_or_default(),
+                        volumes_json: set.1.as_ref().map(|s| s.1.clone()).unwrap_or_default(),
+                        storage_unavailable: set.1.is_none(),
                     };
                     if tx.send(Ok(msg)).await.is_err() {
                         return; // agent went away
@@ -245,9 +293,7 @@ impl Control for ControlService {
             "cloud_hypervisor" => Some(Runtime::CloudHypervisor),
             _ => return Err(bad("runtime")),
         };
-        if r.message.len() > MAX_MESSAGE || r.message.chars().any(char::is_control) {
-            return Err(bad("message"));
-        }
+        let msg = message(r.message)?;
         let key = keys::instance(&scope, &name).map_err(internal)?;
 
         for _ in 0..CAS_RETRIES {
@@ -264,7 +310,7 @@ impl Control for ControlService {
             inst.status.phase = phase;
             inst.status.runtime = runtime;
             inst.status.observed_generation = r.observed_generation.min(inst.metadata.generation);
-            inst.status.message = (!r.message.is_empty()).then(|| r.message.clone());
+            inst.status.message = msg.clone();
             inst.metadata.etag = None;
             match self
                 .ctl
@@ -283,6 +329,47 @@ impl Control for ControlService {
             }
         }
         Err(Status::aborted("concurrent instance update, retry"))
+    }
+
+    async fn report_pool(
+        &self,
+        req: Request<PoolReport>,
+    ) -> Result<Response<ReportResponse>, Status> {
+        let me = identity::authenticate(&self.ctl.store, &req).await?;
+        let r = req.into_inner();
+        let name = Name::new(r.name).map_err(|_| bad("name"))?;
+        let state = storage::PoolState {
+            uid: Uuid::parse_str(&r.uid).map_err(|_| bad("uid"))?,
+            ready: r.ready,
+            capacity_bytes: r.capacity_bytes,
+            allocation_unit_bytes: r.allocation_unit_bytes,
+            capabilities: StorageCapabilities {
+                snapshots: r.snapshots,
+                checksums: r.checksums,
+            },
+            message: message(r.message)?,
+            released: r.released,
+        };
+        storage::report_pool(&self.ctl.store, &me, &name, state).await?;
+        Ok(Response::new(ReportResponse {}))
+    }
+
+    async fn report_volume(
+        &self,
+        req: Request<VolumeReport>,
+    ) -> Result<Response<ReportResponse>, Status> {
+        let me = identity::authenticate(&self.ctl.store, &req).await?;
+        let r = req.into_inner();
+        let (scope, name, uid) = project_object(r.org, r.project, r.name, &r.uid)?;
+        let state = storage::VolumeState {
+            uid,
+            created: r.created,
+            size_bytes: r.size_bytes,
+            deleted: r.deleted,
+            message: message(r.message)?,
+        };
+        storage::report_volume(&self.ctl.store, &me, &scope, &name, state).await?;
+        Ok(Response::new(ReportResponse {}))
     }
 
     async fn get_volume_key(
