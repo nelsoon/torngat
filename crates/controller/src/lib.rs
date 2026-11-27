@@ -83,7 +83,10 @@ impl Controller {
             let world = match disks::disks_once(&self).await {
                 Ok((w, 0)) => w,
                 // What it changed (such as a boot disk it made) is read again.
-                Ok(_) => disks::World::read(&self.store).await.unwrap_or(None),
+                Ok(_) => disks::World::read(&self.store).await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "cannot read instances and volumes");
+                    None
+                }),
                 Err(e) => {
                     tracing::warn!(error = %e, "disks pass failed");
                     None
