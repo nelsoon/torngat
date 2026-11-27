@@ -73,7 +73,8 @@ echo "== boot"
 SERIAL="$work/serial.log" SSH_PORT=$ssh_port "$here/../boot.sh" "$img" "$work" -- -pidfile "$work/qemu.pid" \
   >"$work/boot.log" 2>&1 &
 boot_pid=$!
-until_true "SSH" 120 guest true
+up() { guest true 2>/dev/null; }
+until_true "SSH" 120 up
 guest torngatd init --allow-unsealed-root --name n1 >"$work/init.log" 2>&1 ||
   { tail -n 10 "$work/init.log" >&2; fail "torngatd init"; }
 guest systemctl start torngatd
@@ -117,8 +118,8 @@ phase_is vm-a running || fail "vm-a not running after the restart"
 echo "ok: instances kept running"
 
 echo "== stop and delete"
-etag=$(jq -r .metadata.etag <<<"$(body "$(api GET "$base/vm-a")")")
-out=$(api PATCH "$base/vm-a" "{\"etag\": \"$etag\", \"spec\": {\"vcpus\": 1, \"memory_mib\": 128, \"power_state\": \"stopped\"}}")
+stop=$(jq -c '{etag: .metadata.etag, spec: (.spec + {power_state: "stopped"})}' <<<"$(body "$(api GET "$base/vm-a")")")
+out=$(api PATCH "$base/vm-a" "$stop")
 [ "$(code "$out")" = 200 ] || fail "stop vm-a: $(body "$out")"
 until_true "vm-a stopped" 60 phase_is vm-a stopped
 until_true "unit of vm-a gone" 30 unit_gone "$a"

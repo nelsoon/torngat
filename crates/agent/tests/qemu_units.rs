@@ -103,6 +103,8 @@ async fn instances_are_units_of_their_own() {
         assert_eq!(status(&pid, "CapEff"), "0000000000000000");
         assert_eq!(status(&pid, "CapBnd"), "0000000000000000");
         assert_ne!(ns(&pid, "net"), ns("1", "net"), "shares the host's network");
+        assert_ne!(ns(&pid, "ipc"), ns("1", "ipc"), "shares the host's IPC");
+        assert_ne!(ns(&pid, "mnt"), ns("1", "mnt"), "sees the host's /dev");
         assert!(std::path::Path::new(&console_log(u)).exists());
         assert_eq!(show(u, "LimitCORE"), "0");
         assert_eq!(show(u, "DynamicUser"), "yes");
@@ -112,6 +114,16 @@ async fn instances_are_units_of_their_own() {
     // Found again by a new agent.
     let found: BTreeSet<_> = rt().running().await.into_iter().collect();
     assert!(found.contains(&ua) && found.contains(&ub), "{found:?}");
+
+    // A QEMU taken over by its guest puts B's control socket in its own directory: stopping A
+    // must not reach B.
+    let sock = format!("/run/torngat-vm/{ua}/qmp.sock");
+    std::fs::remove_file(&sock).unwrap();
+    std::os::unix::fs::symlink(format!("/run/torngat-vm/{ub}/qmp.sock"), &sock).unwrap();
+    let b_pid = show(ub, "MainPID");
+    r.stop(ua).await.unwrap();
+    assert_eq!(show(ub, "ActiveState"), "active");
+    assert_eq!(show(ub, "MainPID"), b_pid);
 
     // Stopped: the unit is gone, the console log stays; it starts again.
     r.stop(ua).await.unwrap();

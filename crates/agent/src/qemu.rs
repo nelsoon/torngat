@@ -39,12 +39,13 @@ const SUPPORTED: &[Capability] = &[Capability::LiveMigratable];
 
 const MIB: u64 = 1 << 20;
 
+const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
+const SYSTEMCTL: &str = "/usr/bin/systemctl";
+const JOURNALCTL: &str = "/usr/bin/journalctl";
+
 #[derive(Debug, Clone)]
 pub struct QemuConfig {
     pub qemu: String,
-    pub systemd_run: String,
-    pub systemctl: String,
-    pub journalctl: String,
     /// Time allowed for a guest to power off before it is stopped.
     pub stop_timeout: Duration,
 }
@@ -53,9 +54,6 @@ impl Default for QemuConfig {
     fn default() -> Self {
         Self {
             qemu: "/usr/bin/qemu-system-x86_64".into(),
-            systemd_run: "/usr/bin/systemd-run".into(),
-            systemctl: "/usr/bin/systemctl".into(),
-            journalctl: "/usr/bin/journalctl".into(),
             stop_timeout: Duration::from_secs(10),
         }
     }
@@ -101,9 +99,12 @@ pub fn properties(inst: &Instance) -> Vec<String> {
         "MemorySwapMax=0".into(),
         format!("TasksMax={tasks}"),
         "LimitCORE=0".into(),
-        // Devices: /dev/kvm and the harmless ones (null, zero, random, ...).
+        // Devices: a /dev of its own (null, zero, random, ..., no shared /dev/shm) and /dev/kvm.
+        "PrivateDevices=yes".into(),
+        "BindPaths=/dev/kvm".into(),
         "DevicePolicy=closed".into(),
         "DeviceAllow=/dev/kvm rw".into(),
+        "PrivateIPC=yes".into(),
         // Network: none for now; networks will hand QEMU its interfaces.
         "PrivateNetwork=yes".into(),
         "IPAddressDeny=any".into(),
@@ -115,6 +116,8 @@ pub fn properties(inst: &Instance) -> Vec<String> {
         "RestrictNamespaces=yes".into(),
         "RestrictRealtime=yes".into(),
         "LockPersonality=yes".into(),
+        // KVM only: QEMU never generates code.
+        "MemoryDenyWriteExecute=yes".into(),
         "SystemCallArchitectures=native".into(),
         "KeyringMode=private".into(),
         // What it sees of the host.
@@ -129,6 +132,9 @@ pub fn properties(inst: &Instance) -> Vec<String> {
         "ProtectControlGroups=yes".into(),
         "ProtectClock=yes".into(),
         "ProtectHostname=yes".into(),
+        // The system's buses: nothing to ask systemd or others for.
+        "InaccessiblePaths=-/run/dbus -/run/systemd/private -/run/systemd/io.systemd.ManagedOOM"
+            .into(),
         // The agent decides about restarts.
         "Restart=no".into(),
         format!("TimeoutStopSec={}", KILL_AFTER.as_secs()),
@@ -203,22 +209,39 @@ impl QemuRuntime {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
-    async fn is_running(&self, uid: Uuid) -> bool {
-        let state = self
-            .output(
-                &self.cfg.systemctl,
-                &["show", "--property=ActiveState", "--value", &unit(uid)],
-            )
-            .await
-            .unwrap_or_default();
-        running_state(state.trim())
+    async fn show(&self, uid: Uuid, property: &str) -> Result<String, String> {
+        let p = format!("--property={property}");
+        let out = self
+            .output(SYSTEMCTL, &["show", &p, "--value", &unit(uid)])
+            .await?;
+        Ok(out.trim().to_owned())
+    }
+
+    async fn is_running(&self, uid: Uuid) -> Result<bool, String> {
+        Ok(running_state(&self.show(uid, "ActiveState").await?))
     }
 
     /// Runs one QMP command (one of our constants, never user input) with a timeout.
+    ///
+    /// The socket's directory belongs to the instance's user: a QEMU taken over by its guest could
+    /// put another instance's socket there. Nothing is sent unless the other end is this unit's
+    /// main process.
     async fn qmp(&self, uid: Uuid, command: &'static str) -> std::io::Result<()> {
         let sock = qmp_socket(uid);
+        let main: i32 = self
+            .show(uid, "MainPID")
+            .await
+            .map_err(std::io::Error::other)?
+            .parse()
+            .map_err(|_| std::io::Error::other("no main process"))?;
         tokio::time::timeout(QMP_TIMEOUT, async move {
             let s = UnixStream::connect(sock).await?;
+            let peer = s.peer_cred()?;
+            if main <= 0 || peer.pid() != Some(main) || peer.uid() == 0 {
+                return Err(std::io::Error::other(
+                    "the QMP socket is not the instance's own",
+                ));
+            }
             let (r, mut w) = s.into_split();
             let mut lines = BufReader::new(r).lines();
             let _greeting = lines.next_line().await?;
@@ -236,16 +259,16 @@ impl QemuRuntime {
         .map_err(|_| std::io::Error::other("qmp timed out"))?
     }
 
-    async fn wait_gone(&self, uid: Uuid, timeout: Duration) -> bool {
+    async fn wait_gone(&self, uid: Uuid, timeout: Duration) -> Result<bool, String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if !self.is_running(uid).await {
-                return true;
+            if !self.is_running(uid).await? {
+                return Ok(true);
             }
             if tokio::time::Instant::now() >= deadline {
-                return false;
+                return Ok(false);
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
 
@@ -253,7 +276,7 @@ impl QemuRuntime {
     async fn log_tail(&self, uid: Uuid) -> String {
         let out = self
             .output(
-                &self.cfg.journalctl,
+                JOURNALCTL,
                 &[
                     "--unit",
                     &unit(uid),
@@ -269,7 +292,7 @@ impl QemuRuntime {
 
     /// Stops the unit: systemd sends SIGTERM, then SIGKILL after [`KILL_AFTER`].
     async fn stop_unit(&self, uid: Uuid) -> Result<(), String> {
-        self.output(&self.cfg.systemctl, &["stop", &unit(uid)])
+        self.output(SYSTEMCTL, &["stop", &unit(uid)])
             .await
             .map(|_| ())
     }
@@ -296,13 +319,11 @@ impl Runtime for QemuRuntime {
         if effective_uid().map_err(|e| e.to_string())? != 0 {
             return Err("instances need the agent to run as root".into());
         }
-        if self.is_running(uid).await {
+        if self.is_running(uid).await? {
             return Ok(());
         }
         // A unit that failed before is kept until this.
-        let _ = self
-            .output(&self.cfg.systemctl, &["reset-failed", &unit(uid)])
-            .await;
+        let _ = self.output(SYSTEMCTL, &["reset-failed", &unit(uid)]).await;
         let mut run: Vec<String> = vec![
             format!("--unit={}", unit(uid)),
             format!("--slice={SLICE}"),
@@ -319,14 +340,17 @@ impl Runtime for QemuRuntime {
         run.push(self.cfg.qemu.clone());
         run.extend(args(inst));
         let run: Vec<&str> = run.iter().map(String::as_str).collect();
-        self.output(&self.cfg.systemd_run, &run).await?;
+        self.output(SYSTEMD_RUN, &run).await?;
 
         // Running = the unit runs and QEMU answers on QMP (it can still exit after starting, e.g.
         // when memory or KVM initialisation fails).
         let deadline = tokio::time::Instant::now() + START_TIMEOUT;
-        while tokio::time::Instant::now() < deadline && self.is_running(uid).await {
+        while tokio::time::Instant::now() < deadline {
             if self.qmp(uid, "query-status").await.is_ok() {
                 return Ok(());
+            }
+            if !self.is_running(uid).await? {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -339,26 +363,26 @@ impl Runtime for QemuRuntime {
     }
 
     async fn stop(&self, uid: Uuid) -> Result<(), String> {
-        if !self.is_running(uid).await {
+        if !self.is_running(uid).await? {
             return Ok(());
         }
-        // Ask the guest, then systemd.
+        // Ask the guest, then systemd (which waits until it is stopped).
         let _ = self.qmp(uid, "system_powerdown").await;
-        if self.wait_gone(uid, self.cfg.stop_timeout).await {
+        if self.wait_gone(uid, self.cfg.stop_timeout).await? {
             return Ok(());
         }
-        self.stop_unit(uid).await?;
-        if !self.wait_gone(uid, Duration::from_secs(5)).await {
-            return Err("qemu did not stop".into());
+        match self.stop_unit(uid).await {
+            // It may have gone meanwhile.
+            Err(e) if self.is_running(uid).await? => Err(e),
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     async fn running(&self) -> Vec<Uuid> {
         let pattern = format!("{UNIT_PREFIX}*.service");
         let out = self
             .output(
-                &self.cfg.systemctl,
+                SYSTEMCTL,
                 &[
                     "list-units",
                     "--all",
