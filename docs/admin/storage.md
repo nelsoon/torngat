@@ -69,6 +69,8 @@ POST /v1/platform/volumeTypes?volume_type_id=fast
   or no longer sees the volume group (its disks missing), the pool stays in deletion: there is no way to force it yet.
 - A volume gets its node when an instance first uses it. An instance's boot disk is a volume `<instance>-boot`
   whose `status.owner` names the instance; it is deleted after the instance unless the instance keeps it.
+- `status.open`: the node has it open for an instance. A volume is released from its instance only once closed, so
+  that two instances never have it at once. If its node is lost, it stays with its instance.
 
 What a pool's `status` says:
 

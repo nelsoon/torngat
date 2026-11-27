@@ -341,7 +341,7 @@ pub async fn session<R: Runtime, D: Drivers, C: Crypt>(
                         &set.pools_json,
                         &set.volumes_json,
                         set.storage_unavailable,
-                        instances.iter().map(|i| i.metadata.uid).collect(),
+                        storage::Assigned::instances(&instances),
                     );
                 }
                 _ = retry.tick(), if assigned.is_some() => {}

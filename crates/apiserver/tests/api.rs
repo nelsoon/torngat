@@ -972,15 +972,18 @@ async fn instance_disks() {
     let one = format!("{BASE}/web");
     let patch =
         async |spec: Value| call(&e.app, "PATCH", &one, Some(json!({ "spec": spec })), true).await;
+    // Added while it runs; removed only while stopped.
     let mut with_disk = boot("fast");
     with_disk["disks"] = json!([{"volume": "data"}]);
     let (s, v) = patch(with_disk.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = patch(boot("fast")).await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
     assert_eq!(v["error"]["status"], "FAILED_PRECONDITION");
     let mut smaller = boot("fast");
     smaller["boot_disk"]["size_gib"] = json!(5);
     assert_eq!(patch(smaller).await.0, StatusCode::BAD_REQUEST);
-    let mut bigger = boot("fast");
+    let mut bigger = with_disk.clone();
     bigger["boot_disk"]["size_gib"] = json!(20);
     bigger["boot_disk"]["keep"] = json!(true);
     let (s, v) = patch(bigger.clone()).await;
@@ -998,7 +1001,7 @@ async fn instance_disks() {
         |v| v["status"]["phase"] = json!("stopped"),
     )
     .await;
-    stopped["disks"] = json!([{"volume": "data"}]);
+    stopped["disks"] = json!([]);
     let (s, v) = patch(stopped).await;
     assert_eq!(s, StatusCode::OK, "{v}");
     e.store.shutdown().await.unwrap();

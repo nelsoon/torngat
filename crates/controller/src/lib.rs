@@ -80,10 +80,14 @@ impl Controller {
         const HOUSEKEEPING_EVERY: Duration = Duration::from_secs(60);
         let mut last_housekeeping: Option<Instant> = None;
         loop {
-            if let Err(e) = disks::disks_once(&self).await {
-                tracing::warn!(error = %e, "disks pass failed");
-            }
-            if let Err(e) = schedule_once(&self).await {
+            let world = match disks::disks_once(&self).await {
+                Ok((w, _)) => w,
+                Err(e) => {
+                    tracing::warn!(error = %e, "disks pass failed");
+                    None
+                }
+            };
+            if let Err(e) = schedule_once(&self, world.as_ref()).await {
                 tracing::warn!(error = %e, "scheduling pass failed");
             }
             if let Err(e) = storage::storage_once(&self).await {

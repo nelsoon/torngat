@@ -92,6 +92,8 @@ message VolumeReport {
   // The node formatted it, or found it formatted: from then on it is never formatted again. Never
   // cleared.
   bool formatted = 9;
+  // Open on the node for an instance. Released from its instance only once closed.
+  bool open = 10;
 }
 
 message VolumeKeyRequest {

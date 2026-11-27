@@ -89,7 +89,7 @@ pub enum InstanceError {
     BootDiskSize,
     #[error("the instance's name is too long for its boot disk's (\"<name>-boot\")")]
     BootDiskName,
-    #[error("disks can only change while the instance is stopped")]
+    #[error("disks can only be added while the instance runs; removing one needs it stopped")]
     DisksWhileRunning,
     #[error("the boot disk cannot be added, removed or change type; its size can only grow")]
     BootDiskChange,
@@ -143,8 +143,9 @@ impl InstanceSpec {
         Ok(out)
     }
 
-    /// Whether an instance may change from `self` to `new`. Disks change only while it is stopped
-    /// (or not on a node yet); the boot disk can only grow, and `keep` can change at any time.
+    /// Whether an instance may change from `self` to `new`. While it runs disks can only be added;
+    /// removing one needs it stopped (or not on a node yet). The boot disk can only grow, and
+    /// `keep` can change at any time.
     pub fn validate_update(
         &self,
         status: &InstanceStatus,
@@ -159,9 +160,10 @@ impl InstanceSpec {
         if !same_type {
             return Err(InstanceError::BootDiskChange);
         }
+        let removed = self.disks.iter().any(|d| !new.disks.contains(d));
         let stopped = status.node.is_none()
             || (self.power_state == PowerState::Stopped && status.phase == InstancePhase::Stopped);
-        if self.disks != new.disks && !stopped {
+        if removed && !stopped {
             return Err(InstanceError::DisksWhileRunning);
         }
         Ok(())
@@ -302,6 +304,8 @@ mod tests {
             spec.validate_update(&InstanceStatus::default(), &fewer),
             Ok(())
         );
+        // Added while running.
+        assert_eq!(fewer.validate_update(&running, &spec), Ok(()));
         let stopped_spec = InstanceSpec {
             power_state: PowerState::Stopped,
             ..spec.clone()

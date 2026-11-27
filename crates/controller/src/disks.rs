@@ -1,12 +1,13 @@
 //! Instance disks.
 //!
 //! - A boot disk is the volume `<instance>-boot`, made by the controller and owned by the instance
-//!   (`status.owner`); it is deleted when the instance is gone, unless `boot_disk.keep`.
+//!   (`status.owner`). Only its owner uses it. When the instance is gone it is deleted, or with
+//!   `boot_disk.keep` it becomes a volume like any other.
 //! - A volume is attached (`status.attached_to`) to the one instance that lists it, once that
 //!   instance has a node: placed on that node first if it was not placed yet. Local volumes bind
 //!   instances to their node, so the scheduler takes them into account ([`Needs`]).
-//! - A volume is released when its instance is gone or no longer lists it (only while stopped: the
-//!   API refuses it otherwise).
+//! - A volume is released when its instance is gone or no longer lists it, and only once its node
+//!   closed it (`status.open`): the instance's VM may still be stopping.
 //! - If an instance or volume does not decode, nothing is released or deleted.
 
 use std::collections::{BTreeMap, HashMap};
@@ -25,21 +26,17 @@ use crate::scheduler::ScheduleError;
 use crate::storage::{PlaceError, all, get, modify, place_volume, rounded, usable};
 use crate::{Controller, keys};
 
-type Key = (Scope, Name);
-
-fn key_of(v: &Volume) -> Key {
-    (v.metadata.scope.clone(), v.metadata.name.clone())
-}
-
-/// Every instance, pool, type and volume, or `None` if one does not decode.
-pub(crate) struct World {
+/// Every instance, pool, type and volume, read once per pass.
+#[derive(Debug)]
+pub struct World {
     pub instances: Vec<Instance>,
-    pub volumes: BTreeMap<Key, Volume>,
-    pub pools: BTreeMap<Name, StoragePool>,
-    pub types: BTreeMap<Name, VolumeType>,
+    volumes: BTreeMap<Scope, BTreeMap<Name, Volume>>,
+    pools: BTreeMap<Name, StoragePool>,
+    types: BTreeMap<Name, VolumeType>,
 }
 
 impl World {
+    /// `None` if an object does not decode.
     pub(crate) async fn read(store: &Store) -> Result<Option<Self>, ScheduleError> {
         let (Some(instances), Some(volumes), Some(pools), Some(types)) = (
             all::<Instance>(store, &keys::all_instances()?).await?,
@@ -49,9 +46,16 @@ impl World {
         ) else {
             return Ok(None);
         };
+        let mut by_scope: BTreeMap<Scope, BTreeMap<Name, Volume>> = BTreeMap::new();
+        for (v, _) in volumes {
+            by_scope
+                .entry(v.metadata.scope.clone())
+                .or_default()
+                .insert(v.metadata.name.clone(), v);
+        }
         Ok(Some(Self {
             instances: instances.into_iter().map(|(i, _)| i).collect(),
-            volumes: volumes.into_iter().map(|(v, _)| (key_of(&v), v)).collect(),
+            volumes: by_scope,
             pools: pools
                 .into_iter()
                 .map(|(p, _)| (p.metadata.name.clone(), p))
@@ -63,6 +67,10 @@ impl World {
         }))
     }
 
+    fn volume(&self, scope: &Scope, name: &Name) -> Option<&Volume> {
+        self.volumes.get(scope)?.get(name)
+    }
+
     /// The node of a placed volume's pool.
     fn node_of(&self, v: &Volume) -> Option<&Name> {
         let r = v.status.pool.as_ref()?;
@@ -71,6 +79,32 @@ impl World {
             .filter(|p| p.metadata.uid == r.uid)
             .map(|p| &p.spec.node)
     }
+}
+
+/// Why `v` cannot be `inst`'s volume `name` now, if it cannot. Messages are for tenants: no node
+/// or pool names.
+fn refusal(v: &Volume, inst: &Instance, boot: Option<&Name>) -> Option<String> {
+    let n = &v.metadata.name;
+    let me = inst.metadata.uid;
+    let owner = v.status.owner.map(|o| o.instance);
+    if boot == Some(n) && owner != Some(me) {
+        return Some(format!(
+            "volume {n} already exists and is not this instance's boot disk"
+        ));
+    }
+    if owner.is_some_and(|o| o != me) {
+        return Some(format!("volume {n} is another instance's boot disk"));
+    }
+    if v.metadata.delete_time.is_some() || v.status.phase == VolumePhase::Deleting {
+        return Some(format!("volume {n} is being deleted"));
+    }
+    if v.status.phase == VolumePhase::Failed {
+        return Some(format!("volume {n} failed"));
+    }
+    if v.status.attached_to.is_some_and(|u| u != me) {
+        return Some(format!("volume {n} is used by another instance"));
+    }
+    None
 }
 
 /// What an instance's volumes ask of its node.
@@ -85,20 +119,15 @@ pub(crate) struct Needs {
 /// What `inst`'s volumes ask of its node, or why it cannot run yet.
 pub(crate) fn needs(w: &World, inst: &Instance) -> Result<Needs, String> {
     let scope = &inst.metadata.scope;
-    let names = inst
-        .spec
-        .volumes(&inst.metadata.name)
-        .map_err(|e| e.to_string())?;
+    let name = &inst.metadata.name;
+    let boot = inst.spec.boot_volume(name).map_err(|e| e.to_string())?;
     let mut out = Needs::default();
-    for n in names {
-        let Some(v) = w.volumes.get(&(scope.clone(), n.clone())) else {
+    for n in inst.spec.volumes(name).map_err(|e| e.to_string())? {
+        let Some(v) = w.volume(scope, &n) else {
             return Err(format!("there is no volume {n}"));
         };
-        if v.metadata.delete_time.is_some() || v.status.phase == VolumePhase::Deleting {
-            return Err(format!("volume {n} is being deleted"));
-        }
-        if v.status.attached_to.is_some_and(|u| u != inst.metadata.uid) {
-            return Err(format!("volume {n} is used by another instance"));
+        if let Some(r) = refusal(v, inst, boot.as_ref()) {
+            return Err(r);
         }
         if v.status.pool.is_none() {
             out.pending.push(v.clone());
@@ -108,11 +137,7 @@ pub(crate) fn needs(w: &World, inst: &Instance) -> Result<Needs, String> {
             return Err(format!("volume {n} is being placed"));
         };
         match &out.node {
-            Some(other) if other != node => {
-                return Err(format!(
-                    "its volumes are on different nodes ({other}, {node})"
-                ));
-            }
+            Some(other) if other != node => return Err("its volumes are on different nodes".into()),
             _ => out.node = Some(node.clone()),
         }
     }
@@ -149,31 +174,61 @@ pub(crate) fn fits(w: &World, node: &Name, pending: &[Volume]) -> bool {
     })
 }
 
-/// Attaches `inst`'s volume `name` on `node`, placing it there first if needed.
+fn err(e: impl std::fmt::Display) -> String {
+    e.to_string()
+}
+
+fn now() -> Option<OffsetDateTime> {
+    Some(OffsetDateTime::now_utc())
+}
+
+/// A pass's count of changes, from a compare-and-swap that may have lost a race (retried next pass).
+fn changed<T>(r: Result<T, PlaceError>) -> Result<usize, ScheduleError> {
+    match r {
+        Ok(_) | Err(PlaceError::Conflict) => Ok(1),
+        Err(PlaceError::Controller(e)) => Err(e),
+        Err(e) => Err(ScheduleError::Store(StoreError::Raft(e.to_string()))),
+    }
+}
+
+/// Attaches `inst`'s volume `name` on `node`, placing it there first if needed. Returns whether it
+/// changed anything; `w` saves the reads when it is already done.
 pub(crate) async fn attach(
     ctl: &Controller,
+    w: &World,
     inst: &Instance,
     name: &Name,
     node: &Name,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let scope = &inst.metadata.scope;
-    let key = keys::volume(scope, name).map_err(|e| e.to_string())?;
     let me = inst.metadata.uid;
+    let boot = inst.spec.boot_volume(&inst.metadata.name).map_err(err)?;
+    if let Some(v) = w.volume(scope, name)
+        && v.status.attached_to == Some(me)
+        && w.node_of(v) == Some(node)
+        && refusal(v, inst, boot.as_ref()).is_none()
+    {
+        return Ok(false);
+    }
+    let key = keys::volume(scope, name).map_err(err)?;
     for _ in 0..4 {
         let Some((v, _)) = get::<Volume>(&ctl.store, &key).await.map_err(err)? else {
             return Err(format!("there is no volume {name}"));
         };
-        if v.metadata.delete_time.is_some() || v.status.phase == VolumePhase::Deleting {
-            return Err(format!("volume {name} is being deleted"));
-        }
-        if v.status.attached_to.is_some_and(|u| u != me) {
-            return Err(format!("volume {name} is used by another instance"));
+        if let Some(r) = refusal(&v, inst, boot.as_ref()) {
+            return Err(r);
         }
         match v.status.phase {
             VolumePhase::Pending => {
                 match place_volume(ctl, scope, name, v.metadata.uid, Some(node)).await {
                     Ok(_) | Err(PlaceError::Conflict | PlaceError::NotPending) => continue,
-                    Err(e) => return Err(format!("volume {name}: {e}")),
+                    Err(PlaceError::NoRoom(_)) => {
+                        return Err(format!("there is no room for volume {name} there"));
+                    }
+                    Err(e) => {
+                        tracing::warn!(volume = %name, error = %e, "cannot place a volume");
+                        return Err(format!("volume {name} cannot be placed yet"));
+                    }
                 }
             }
             VolumePhase::Placing => return Err(format!("volume {name} is being placed")),
@@ -189,11 +244,15 @@ pub(crate) async fn attach(
             return Err(format!("volume {name} is on another node"));
         }
         if v.status.attached_to == Some(me) {
-            return Ok(());
+            return Ok(true);
         }
         let uid = v.metadata.uid;
         modify(&ctl.store, &key, |v: &mut Volume| {
-            if v.metadata.uid != uid || v.status.attached_to.is_some() {
+            // Checked again on what is written: it may have changed since.
+            if v.metadata.uid != uid || refusal(v, inst, boot.as_ref()).is_some() {
+                return false;
+            }
+            if v.status.attached_to.is_some() {
                 return false;
             }
             v.status.attached_to = Some(me);
@@ -201,91 +260,100 @@ pub(crate) async fn attach(
             true
         })
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(err)?;
     }
     Err(format!("volume {name} changed meanwhile"))
 }
 
-fn err(e: impl std::fmt::Display) -> String {
-    e.to_string()
-}
-
-fn now() -> Option<OffsetDateTime> {
-    Some(OffsetDateTime::now_utc())
-}
-
-/// One pass. Returns how many objects it changed.
-pub async fn disks_once(ctl: &Controller) -> Result<usize, ScheduleError> {
-    let Some(w) = World::read(&ctl.store).await? else {
-        tracing::warn!("an object does not decode: instance disks are left as they are");
-        return Ok(0);
-    };
+/// Attaches all of `inst`'s volumes on `node`. If one fails while the instance has no node yet,
+/// those this call attached are released again, so that they do not stay bound to it.
+pub(crate) async fn attach_all(
+    ctl: &Controller,
+    w: &World,
+    inst: &Instance,
+    node: &Name,
+) -> Result<usize, String> {
+    let mut done = Vec::new();
     let mut changed = 0;
-    let by_uid: BTreeMap<Uuid, &Instance> =
-        w.instances.iter().map(|i| (i.metadata.uid, i)).collect();
-
-    for inst in &w.instances {
-        let problem = match boot_disk(ctl, &w, inst).await {
-            Ok(n) => {
-                changed += n;
-                None
+    for n in inst.spec.volumes(&inst.metadata.name).map_err(err)? {
+        match attach(ctl, w, inst, &n, node).await {
+            Ok(c) => {
+                if c {
+                    changed += 1;
+                    done.push(n);
+                }
             }
-            Err(e) => Some(e),
-        };
-        let problem = match (problem, &inst.status.node) {
-            (Some(p), _) => Some(p),
-            (None, None) => None,
-            (None, Some(node)) => attach_all(ctl, inst, node).await.err(),
-        };
-        if let Some(p) = problem {
-            changed += tell(ctl, inst, &p).await?;
-        }
-    }
-
-    // Released when their instance is gone or no longer lists them; boot disks of a gone instance
-    // are deleted.
-    for v in w.volumes.values() {
-        let user = v.status.attached_to.map(|u| by_uid.get(&u));
-        let release = match user {
-            Some(None) => true,
-            Some(Some(i)) => !i
-                .spec
-                .volumes(&i.metadata.name)
-                .is_ok_and(|names| names.contains(&v.metadata.name)),
-            None => false,
-        };
-        if release {
-            changed += release_volume(&ctl.store, v).await?;
-        }
-        if let Some(o) = v.status.owner
-            && o.delete_with_it
-            && !by_uid.contains_key(&o.instance)
-            && !v.spec.delete_protection
-        {
-            changed += delete_volume(&ctl.store, v).await?;
+            Err(e) => {
+                if inst.status.node.is_none() {
+                    for n in done {
+                        let _ =
+                            release(&ctl.store, &inst.metadata.scope, &n, inst.metadata.uid).await;
+                    }
+                }
+                return Err(e);
+            }
         }
     }
     Ok(changed)
 }
 
-async fn attach_all(ctl: &Controller, inst: &Instance, node: &Name) -> Result<(), String> {
-    for n in inst
-        .spec
-        .volumes(&inst.metadata.name)
-        .map_err(|e| e.to_string())?
-    {
-        attach(ctl, inst, &n, node).await?;
+/// One pass. Returns the world it read (for the scheduler) and how many objects it changed.
+pub async fn disks_once(ctl: &Controller) -> Result<(Option<World>, usize), ScheduleError> {
+    let Some(w) = World::read(&ctl.store).await? else {
+        tracing::warn!("an object does not decode: instance disks are left as they are");
+        return Ok((None, 0));
+    };
+    let mut count = 0;
+    let by_uid: BTreeMap<Uuid, &Instance> =
+        w.instances.iter().map(|i| (i.metadata.uid, i)).collect();
+
+    for inst in &w.instances {
+        let r = async {
+            let mut n = boot_disk(ctl, &w, inst).await?;
+            if let Some(node) = &inst.status.node {
+                n += attach_all(ctl, &w, inst, node).await?;
+            }
+            Ok::<_, String>(n)
+        }
+        .await;
+        match r {
+            Ok(n) => count += n,
+            Err(problem) => count += tell(ctl, inst, &problem).await?,
+        }
     }
-    Ok(())
+
+    for v in w.volumes.values().flat_map(BTreeMap::values) {
+        let lists = |i: &&Instance| {
+            i.spec
+                .volumes(&i.metadata.name)
+                .is_ok_and(|names| names.contains(&v.metadata.name))
+        };
+        // Released once its node closed it.
+        if let Some(u) = v.status.attached_to
+            && !by_uid.get(&u).is_some_and(lists)
+            && !v.status.open
+        {
+            count += changed(release(&ctl.store, &v.metadata.scope, &v.metadata.name, u).await)?;
+        }
+        if let Some(o) = v.status.owner
+            && !by_uid.contains_key(&o.instance)
+        {
+            count += if o.delete_with_it && !v.spec.delete_protection {
+                delete_volume(&ctl.store, v).await?
+            } else {
+                // Kept: now a volume like any other.
+                changed(disown(&ctl.store, v).await)?
+            };
+        }
+    }
+    Ok((Some(w), count))
 }
 
 /// Makes the boot volume, or keeps it in line with the instance (size, `keep`).
 async fn boot_disk(ctl: &Controller, w: &World, inst: &Instance) -> Result<usize, String> {
     let (Some(boot), Some(name)) = (
         &inst.spec.boot_disk,
-        inst.spec
-            .boot_volume(&inst.metadata.name)
-            .map_err(|e| e.to_string())?,
+        inst.spec.boot_volume(&inst.metadata.name).map_err(err)?,
     ) else {
         return Ok(0);
     };
@@ -295,7 +363,7 @@ async fn boot_disk(ctl: &Controller, w: &World, inst: &Instance) -> Result<usize
         delete_with_it: !boot.keep,
     };
     let key = keys::volume(scope, &name).map_err(err)?;
-    match w.volumes.get(&(scope.clone(), name.clone())) {
+    match w.volume(scope, &name) {
         None => {
             let v: Volume = Object {
                 metadata: ObjectMeta {
@@ -352,7 +420,7 @@ async fn boot_disk(ctl: &Controller, w: &World, inst: &Instance) -> Result<usize
                 true
             })
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(err)?;
             Ok(1)
         }
         Some(_) => Err(format!(
@@ -372,39 +440,53 @@ pub(crate) async fn tell(
     }
     let key = keys::instance(&inst.metadata.scope, &inst.metadata.name)?;
     let uid = inst.metadata.uid;
-    let r = modify(&ctl.store, &key, |i: &mut Instance| {
-        if i.metadata.uid != uid || i.status.message.as_deref() == Some(problem) {
-            return false;
-        }
-        i.status.message = Some(problem.to_owned());
-        i.metadata.etag = None;
-        true
-    })
-    .await;
-    match r {
-        Ok(_) | Err(PlaceError::Conflict) => Ok(1),
-        Err(PlaceError::Controller(e)) => Err(e),
-        Err(e) => Err(ScheduleError::Store(StoreError::Raft(e.to_string()))),
-    }
+    changed(
+        modify(&ctl.store, &key, |i: &mut Instance| {
+            if i.metadata.uid != uid || i.status.message.as_deref() == Some(problem) {
+                return false;
+            }
+            i.status.message = Some(problem.to_owned());
+            i.metadata.etag = None;
+            true
+        })
+        .await,
+    )
 }
 
-async fn release_volume(store: &Store, v: &Volume) -> Result<usize, ScheduleError> {
-    let key = keys::volume(&v.metadata.scope, &v.metadata.name)?;
-    let (uid, user) = (v.metadata.uid, v.status.attached_to);
-    let r = modify(store, &key, |cur: &mut Volume| {
-        if cur.metadata.uid != uid || cur.status.attached_to != user {
+/// Clears `attached_to` if it is still `user`.
+async fn release(
+    store: &Store,
+    scope: &Scope,
+    name: &Name,
+    user: Uuid,
+) -> Result<Option<Volume>, PlaceError> {
+    modify(store, &keys::volume(scope, name)?, |v: &mut Volume| {
+        if v.status.attached_to != Some(user) {
             return false;
         }
-        cur.status.attached_to = None;
-        cur.metadata.etag = None;
+        v.status.attached_to = None;
+        v.metadata.etag = None;
         true
     })
-    .await;
-    match r {
-        Ok(_) | Err(PlaceError::Conflict) => Ok(1),
-        Err(PlaceError::Controller(e)) => Err(e),
-        Err(e) => Err(ScheduleError::Store(StoreError::Raft(e.to_string()))),
-    }
+    .await
+}
+
+/// A kept boot disk whose instance is gone: no owner any more.
+async fn disown(store: &Store, v: &Volume) -> Result<Option<Volume>, PlaceError> {
+    let (uid, owner) = (v.metadata.uid, v.status.owner);
+    modify(
+        store,
+        &keys::volume(&v.metadata.scope, &v.metadata.name)?,
+        |cur: &mut Volume| {
+            if cur.metadata.uid != uid || cur.status.owner != owner {
+                return false;
+            }
+            cur.status.owner = None;
+            cur.metadata.etag = None;
+            true
+        },
+    )
+    .await
 }
 
 /// Deletes a boot disk whose instance is gone: like the API, its blocks first once it has a pool.
@@ -500,12 +582,18 @@ mod tests {
         );
         let small = vol("small", 1, json!({}));
         let big = vol("big", 2, json!({}));
+        let scope: Scope = serde_json::from_value(project()).unwrap();
         let mut w = World {
             instances: vec![],
-            volumes: [&on_p2, &small, &big]
-                .into_iter()
-                .map(|v| (key_of(v), v.clone()))
-                .collect(),
+            volumes: [(
+                scope.clone(),
+                [&on_p2, &small, &big]
+                    .into_iter()
+                    .map(|v| (v.metadata.name.clone(), v.clone()))
+                    .collect(),
+            )]
+            .into_iter()
+            .collect(),
             pools: [&p1, &p2]
                 .into_iter()
                 .map(|p| (p.metadata.name.clone(), p.clone()))
@@ -540,7 +628,10 @@ mod tests {
         );
         let mut used = small.clone();
         used.status.attached_to = Some(Uuid::now_v7());
-        w.volumes.insert(key_of(&used), used);
+        w.volumes
+            .get_mut(&scope)
+            .unwrap()
+            .insert(used.metadata.name.clone(), used);
         assert!(
             needs(&w, &inst(&["small"]))
                 .unwrap_err()
@@ -548,7 +639,10 @@ mod tests {
         );
         let mut gone = big.clone();
         gone.status.phase = VolumePhase::Deleting;
-        w.volumes.insert(key_of(&gone), gone);
+        w.volumes
+            .get_mut(&scope)
+            .unwrap()
+            .insert(gone.metadata.name.clone(), gone);
         assert!(needs(&w, &inst(&["big"])).unwrap_err().contains("deleted"));
         let mut elsewhere = vol(
             "elsewhere",
@@ -556,7 +650,10 @@ mod tests {
             json!({"phase": "ready", "pool": {"name": "p1", "uid": p1.metadata.uid}}),
         );
         elsewhere.metadata.uid = Uuid::now_v7();
-        w.volumes.insert(key_of(&elsewhere), elsewhere);
+        w.volumes
+            .get_mut(&scope)
+            .unwrap()
+            .insert(elsewhere.metadata.name.clone(), elsewhere);
         assert!(
             needs(&w, &inst(&["placed", "elsewhere"]))
                 .unwrap_err()

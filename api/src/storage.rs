@@ -294,6 +294,10 @@ pub struct VolumeStatus {
     /// uid of the one instance that uses it, set with compare-and-swap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attached_to: Option<Uuid>,
+    /// Open on its node for an instance (reported by the node). It is released from its instance
+    /// only once closed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub open: bool,
     /// The instance whose boot disk it is, if the platform made it as one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<VolumeOwner>,

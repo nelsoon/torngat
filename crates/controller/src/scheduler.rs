@@ -49,16 +49,18 @@ fn node_memory_mib(n: &Node) -> u64 {
         .sum()
 }
 
-/// One scheduling pass. Returns the number of instances placed.
-pub async fn schedule_once(ctl: &Controller) -> Result<usize, ScheduleError> {
+/// One scheduling pass. Returns the number of instances placed. `world` is what the disks pass
+/// read; without it (an object that does not decode), instances with disks wait.
+pub async fn schedule_once(
+    ctl: &Controller,
+    world: Option<&World>,
+) -> Result<usize, ScheduleError> {
     let nodes: Vec<Node> = list_all(&ctl.store, &keys::nodes()?)
         .await?
         .into_iter()
         .filter_map(|(_, v)| serde_json::from_slice(&v.value).ok())
         .collect();
     let instances = list_all(&ctl.store, &keys::all_instances()?).await?;
-    // Only for instances with disks: without it (an object that does not decode) they wait.
-    let world = World::read(&ctl.store).await?;
 
     // Memory already committed per node.
     let mut used: HashMap<Name, u64> = HashMap::new();
@@ -77,10 +79,10 @@ pub async fn schedule_once(ctl: &Controller) -> Result<usize, ScheduleError> {
     let mut placed = 0;
     for (key, rev, mut inst) in pending {
         let no_disks = inst.spec.boot_disk.is_none() && inst.spec.disks.is_empty();
-        let needs = match (&world, no_disks) {
-            (_, true) => disks::Needs::default(),
-            (None, false) => continue,
-            (Some(w), false) => match disks::needs(w, &inst) {
+        let needs = match world {
+            _ if no_disks => disks::Needs::default(),
+            None => continue,
+            Some(w) => match disks::needs(w, &inst) {
                 Ok(n) => n,
                 Err(problem) => {
                     disks::tell(ctl, &inst, &problem).await?;
@@ -97,9 +99,7 @@ pub async fn schedule_once(ctl: &Controller) -> Result<usize, ScheduleError> {
                     && ctl.live.is_live(&n.metadata.name)
                     && needs.node.as_ref().is_none_or(|x| *x == n.metadata.name)
                     && (needs.pending.is_empty()
-                        || world
-                            .as_ref()
-                            .is_some_and(|w| disks::fits(w, &n.metadata.name, &needs.pending)))
+                        || world.is_some_and(|w| disks::fits(w, &n.metadata.name, &needs.pending)))
             })
             .filter_map(|n| {
                 let free = node_memory_mib(n)
@@ -111,18 +111,11 @@ pub async fn schedule_once(ctl: &Controller) -> Result<usize, ScheduleError> {
             continue;
         };
         // Its volumes first: an instance on a node always has them there.
-        if !no_disks {
-            let mut attached = Ok(());
-            for n in inst.spec.volumes(&inst.metadata.name).unwrap_or_default() {
-                attached = disks::attach(ctl, &inst, &n, node).await;
-                if attached.is_err() {
-                    break;
-                }
-            }
-            if let Err(problem) = attached {
-                disks::tell(ctl, &inst, &problem).await?;
-                continue;
-            }
+        if let (Some(w), false) = (world, no_disks)
+            && let Err(problem) = disks::attach_all(ctl, w, &inst, node).await
+        {
+            disks::tell(ctl, &inst, &problem).await?;
+            continue;
         }
         inst.status.node = Some(node.clone());
         inst.status.phase = InstancePhase::Scheduled;

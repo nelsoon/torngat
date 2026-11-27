@@ -50,14 +50,16 @@ To stop it, read its `metadata.etag`, then send a `PATCH`:
           "disks": [{"volume": "data"}]}}
 ```
 
-- `boot_disk` makes the volume `<instance>-boot`, which is deleted with the instance. With `"keep": true` it stays.
-  The instance's name must then be at most 58 characters.
+- `boot_disk` makes the volume `<instance>-boot`, which is deleted with the instance. With `"keep": true` it stays
+  and becomes a volume like any other (another instance can use it in `disks`). The instance's name must then be at most
+  58 characters, and no other volume may have that name.
 - `disks` are volumes of the same project, made before. They are never deleted with the instance. At most 16, each used by
   one instance at a time.
 - An instance goes to the node where its volumes are, or where they fit. While it cannot run, `status.message` says why
   (for example a volume used by another instance).
-- `disks` change only while the instance is stopped. The boot disk can grow at any time; its type cannot change, and it
-  cannot be added or removed.
+- A disk can be added to `disks` while the instance runs; removing one needs it stopped. Any volume, the boot disk too, can
+  grow while it runs. The boot disk's type cannot change, and it cannot be added or removed.
+- When an instance is deleted, or a disk removed from it, the volume is free again once its node has closed it.
 
 ## Volumes
 

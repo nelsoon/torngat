@@ -591,6 +591,8 @@ pub(crate) struct VolumeState {
     pub deleted: bool,
     /// Formatted on the node: never cleared.
     pub formatted: bool,
+    /// Open on the node for an instance.
+    pub open: bool,
     pub message: Option<String>,
 }
 
@@ -659,6 +661,7 @@ pub(crate) async fn report_volume(
             new.phase = VolumePhase::Ready;
         }
         new.formatted |= r.formatted;
+        new.open = r.open;
         // Never more than was granted.
         new.size_bytes = r.size_bytes.min(new.granted_bytes);
         new.message = r.message.clone();
