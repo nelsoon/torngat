@@ -182,7 +182,8 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
                     size,
                 }),
                 None => {
-                    out.waiting.get_or_insert_with(|| format!("waiting for volume {n}"));
+                    out.waiting
+                        .get_or_insert_with(|| format!("waiting for volume {n}"));
                 }
             }
         }
@@ -197,13 +198,14 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
         }
     }
 
-    /// Brings the node's storage in line with `a`. Errors end the session; failures of one pool
-    /// or volume are reported and the others go on.
+    /// Brings the node's storage in line with `a`, and tells whether the open volumes or their
+    /// sizes changed. Errors end the session; failures of one pool or volume are reported and the
+    /// others go on.
     pub async fn reconcile(
         &mut self,
         client: &mut ControlClient<Channel>,
         a: &Assigned,
-    ) -> Result<(), AgentError> {
+    ) -> Result<bool, AgentError> {
         let mut mine = BTreeMap::new();
         for p in &a.pools {
             let r = self.pool_step(p, a).await;
@@ -220,7 +222,7 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             Ok(o) => o,
             Err(e) => {
                 tracing::warn!(error = %e, "cannot list the open volumes");
-                return Ok(());
+                return Ok(false);
             }
         };
         let pool_of = |v: &Volume| v.status.pool.as_ref().and_then(|r| mine.get(&r.uid));
@@ -278,8 +280,9 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             })
             .await?;
         }
+        let changed = self.open != in_use;
         self.open = in_use;
-        Ok(())
+        Ok(changed)
     }
 
     async fn pool_step(&self, p: &StoragePool, a: &Assigned) -> PoolReport {

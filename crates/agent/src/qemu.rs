@@ -24,7 +24,7 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::net::UnixStream;
 
@@ -42,6 +42,11 @@ const SLICE: &str = "torngat-vms.slice";
 
 /// Bound on every QMP exchange.
 const QMP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound on a QMP session with a running QEMU (several commands).
+const QMP_SESSION: Duration = Duration::from_secs(10);
+/// First wait before asking a QEMU that failed again, doubled up to [`MAX_RETRY_WAIT`].
+const RETRY_WAIT: Duration = Duration::from_secs(10);
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(300);
 /// Time allowed for QEMU to come up and answer on QMP.
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 /// Time systemd gives QEMU after SIGTERM before it kills it.
@@ -79,9 +84,15 @@ pub struct QemuRuntime {
     started: Arc<Mutex<HashSet<Uuid>>>,
     /// The last [`Runtime::running`] could not tell about some instance.
     unsettled: Arc<AtomicBool>,
-    /// The disks each running instance was given, with their size then.
+    /// The disks each running instance has, with the size QEMU has for them.
     given: Arc<Mutex<HashMap<Uuid, BTreeMap<Uuid, u64>>>>,
+    /// Instances whose QEMU failed to answer: when to ask again, the wait, the failure. A QEMU may
+    /// be its guest's; one that fails or stalls must not hold back the other instances.
+    failing: Arc<Mutex<HashMap<Uuid, Failing>>>,
 }
+
+/// When to ask a failing QEMU again, the wait, and its failure.
+type Failing = (Instant, Duration, String);
 
 fn given(disks: &[Disk]) -> BTreeMap<Uuid, u64> {
     disks.iter().map(|d| (d.volume, d.size)).collect()
@@ -190,8 +201,8 @@ fn attach_and_run(q: &mut Qmp, disks: &[Disk]) -> std::io::Result<()> {
 fn plugged(q: &mut Qmp) -> std::io::Result<(BTreeSet<usize>, BTreeSet<Uuid>)> {
     let pci = q.execute("query-pci", None)?;
     let (mut ports, mut volumes) = (BTreeSet::new(), BTreeSet::new());
-    let buses = pci.as_array().map(Vec::as_slice).unwrap_or_default();
-    for dev in buses.iter().flat_map(|b| devices(b)) {
+    let buses = list(Some(&pci));
+    for dev in buses.iter().flat_map(devices) {
         let Some(port) = qdev_id(dev)
             .and_then(|i| i.strip_prefix("disk"))
             .and_then(|n| n.parse::<usize>().ok())
@@ -211,11 +222,14 @@ fn plugged(q: &mut Qmp) -> std::io::Result<(BTreeSet<usize>, BTreeSet<Uuid>)> {
     Ok((ports, volumes))
 }
 
-fn devices(bus: &serde_json::Value) -> &[serde_json::Value] {
-    bus.get("devices")
-        .and_then(serde_json::Value::as_array)
+fn list(v: Option<&serde_json::Value>) -> &[serde_json::Value] {
+    v.and_then(serde_json::Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default()
+}
+
+fn devices(bus: &serde_json::Value) -> &[serde_json::Value] {
+    list(bus.get("devices"))
 }
 
 fn qdev_id(dev: &serde_json::Value) -> Option<&str> {
@@ -225,10 +239,7 @@ fn qdev_id(dev: &serde_json::Value) -> Option<&str> {
 /// The size QEMU gives each of our disks, by block node.
 fn sizes(q: &mut Qmp) -> std::io::Result<HashMap<String, u64>> {
     let nodes = q.execute("query-named-block-nodes", Some(json!({ "flat": true })))?;
-    Ok(nodes
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default()
+    Ok(list(Some(&nodes))
         .iter()
         .filter_map(|n| {
             let name = n.get("node-name")?.as_str()?;
@@ -238,28 +249,62 @@ fn sizes(q: &mut Qmp) -> std::io::Result<HashMap<String, u64>> {
         .collect())
 }
 
-/// Gives the running guest behind `q` those of `disks` it does not have, on free ports, and grows
-/// those whose device grew.
-fn update_disks(q: &mut Qmp, disks: &[Disk]) -> std::io::Result<()> {
+/// Gives the running guest behind `q` those of `disks` it does not have, on free ports, then
+/// grows those whose device grew. One disk that fails does not hold back the others. Returns the
+/// size QEMU has for each disk it has, and the first failure.
+fn update_disks(
+    q: &mut Qmp,
+    disks: &[Disk],
+) -> std::io::Result<(BTreeMap<Uuid, u64>, Option<std::io::Error>)> {
     let (mut used, have) = plugged(q)?;
     let sizes = sizes(q)?;
-    for d in disks {
-        if have.contains(&d.volume) {
-            let (node, _, _) = disk_names(d.volume);
-            let mut f = std::fs::File::open(&d.path)?;
-            let actual = f.seek(SeekFrom::End(0))?;
-            if sizes.get(&node).is_some_and(|s| *s < actual) {
-                q.execute("block_resize", Some(json!({ "node-name": node, "size": actual })))?;
+    let mut now = BTreeMap::new();
+    let mut failure = None;
+    for d in disks.iter().filter(|d| !have.contains(&d.volume)) {
+        let Some(port) = (0..DISK_PORTS).find(|p| !used.contains(p)) else {
+            failure.get_or_insert(other("no free disk slot"));
+            break;
+        };
+        match add_disk(q, port, d) {
+            Ok(()) => {
+                used.insert(port);
+                now.insert(d.volume, d.size);
             }
-            continue;
+            Err(e) => {
+                failure.get_or_insert(e);
+            }
         }
-        let port = (0..DISK_PORTS)
-            .find(|p| !used.contains(p))
-            .ok_or_else(|| other("no free disk slot"))?;
-        add_disk(q, port, d)?;
-        used.insert(port);
     }
-    Ok(())
+    for d in disks.iter().filter(|d| have.contains(&d.volume)) {
+        let (node, _, _) = disk_names(d.volume);
+        let Some(&had) = sizes.get(&node) else {
+            failure.get_or_insert(other("QEMU does not say how large a disk is"));
+            continue;
+        };
+        let mut grown = || -> std::io::Result<u64> {
+            if had >= d.size {
+                return Ok(had);
+            }
+            let actual = std::fs::File::open(&d.path)?.seek(SeekFrom::End(0))?;
+            if actual <= had {
+                return Ok(had);
+            }
+            q.execute(
+                "block_resize",
+                Some(json!({ "node-name": node, "size": actual })),
+            )?;
+            Ok(actual)
+        };
+        match grown() {
+            Ok(size) => {
+                now.insert(d.volume, size);
+            }
+            Err(e) => {
+                failure.get_or_insert(e);
+            }
+        }
+    }
+    Ok((now, failure))
 }
 
 /// The unit's settings. Pure function of validated fields, for testing.
@@ -400,6 +445,7 @@ impl QemuRuntime {
             started: Arc::default(),
             unsettled: Arc::default(),
             given: Arc::default(),
+            failing: Arc::default(),
         }
     }
 
@@ -430,6 +476,28 @@ impl QemuRuntime {
 
     fn started_set(&self) -> std::sync::MutexGuard<'_, HashSet<Uuid>> {
         self.started.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn failing_map(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, Failing>> {
+        self.failing.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The last failure, if QEMU is not to be asked again yet.
+    fn held_off(&self, uid: Uuid) -> Result<(), String> {
+        match self.failing_map().get(&uid) {
+            Some((until, _, e)) if Instant::now() < *until => Err(e.clone()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Records that QEMU failed: it is asked again after a wait that doubles each time.
+    fn failed(&self, uid: Uuid, e: String) -> String {
+        let mut m = self.failing_map();
+        let wait = m
+            .get(&uid)
+            .map_or(RETRY_WAIT, |(_, w, _)| (*w * 2).min(MAX_RETRY_WAIT));
+        m.insert(uid, (Instant::now() + wait, wait, e.clone()));
+        e
     }
 
     fn given_map(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, BTreeMap<Uuid, u64>>> {
@@ -550,6 +618,7 @@ impl Runtime for QemuRuntime {
         let _ = self.output(SYSTEMCTL, &["reset-failed", &unit(uid)]).await;
         self.started_set().remove(&uid);
         self.given_map().remove(&uid);
+        self.failing_map().remove(&uid);
         let mut run: Vec<String> = vec![
             format!("--unit={}", unit(uid)),
             format!("--slice={SLICE}"),
@@ -606,26 +675,34 @@ impl Runtime for QemuRuntime {
     }
 
     async fn attach(&self, uid: Uuid, disks: &[Disk]) -> Result<(), String> {
-        let want = given(disks);
         // Nothing new since they were given (unknown after the agent restarted: QEMU is asked).
         let known = self.given_map().get(&uid).is_some_and(|had| {
-            want.iter()
-                .all(|(v, size)| had.get(v).is_some_and(|s| s >= size))
+            disks
+                .iter()
+                .all(|d| had.get(&d.volume).is_some_and(|s| *s >= d.size))
         });
         if known {
             return Ok(());
         }
+        self.held_off(uid)?;
         let list = disks.to_vec();
-        self.qmp(uid, START_TIMEOUT, move |q| update_disks(q, &list))
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut m = self.given_map();
-        let had = m.entry(uid).or_default();
-        for (v, size) in want {
-            let s = had.entry(v).or_default();
-            *s = (*s).max(size);
+        let r = self
+            .qmp(uid, QMP_SESSION, move |q| update_disks(q, &list))
+            .await;
+        let failure = match r {
+            Ok((sizes, failure)) => {
+                self.given_map().entry(uid).or_default().extend(sizes);
+                failure
+            }
+            Err(e) => Some(e),
+        };
+        match failure {
+            None => {
+                self.failing_map().remove(&uid);
+                Ok(())
+            }
+            Some(e) => Err(self.failed(uid, e.to_string())),
         }
-        Ok(())
     }
 
     async fn stop(&self, uid: Uuid) -> Result<(), String> {
@@ -672,6 +749,7 @@ impl Runtime for QemuRuntime {
         let units = parse_units(&out);
         self.started_set().retain(|u| units.contains(u));
         self.given_map().retain(|u, _| units.contains(u));
+        self.failing_map().retain(|u, _| units.contains(u));
         let mut running = Vec::with_capacity(units.len());
         let mut unsettled = false;
         for uid in units {
@@ -679,7 +757,22 @@ impl Runtime for QemuRuntime {
                 running.push(uid);
                 continue;
             }
-            match self.status(uid).await.as_deref() {
+            // QEMU did not answer a short while ago: not asked again yet.
+            if self.held_off(uid).is_err() {
+                unsettled = true;
+                running.push(uid);
+                continue;
+            }
+            let status = self.status(uid).await;
+            match &status {
+                Ok(_) => {
+                    self.failing_map().remove(&uid);
+                }
+                Err(e) => {
+                    self.failed(uid, e.to_string());
+                }
+            }
+            match status.as_deref() {
                 // Its start was interrupted: it never ran, so it is started again.
                 Ok("prelaunch") => {
                     tracing::warn!(%uid, "instance left paused before it ran: stopping it");

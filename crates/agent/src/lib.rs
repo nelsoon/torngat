@@ -27,8 +27,8 @@ use torngat_proto::v1::*;
 use uuid::Uuid;
 
 pub use runtime::{Disk, FakeRuntime, Runtime};
-pub use storage::{Disks, Storage};
 use storage::{Crypt, Drivers};
+pub use storage::{Disks, Storage};
 
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(2);
 /// Storage steps that failed or wait are tried again this often, also without a change.
@@ -356,10 +356,12 @@ pub async fn session<R: Runtime, D: Drivers, C: Crypt>(
                 _ = retry.tick(), if assigned.is_some() || waiting => {}
             }
             // Storage first: it opens the disks that instances start with.
+            // A volume opened or grown since: running instances get it.
+            let mut disks_changed = false;
             if let Some(a) = &assigned {
-                storage.reconcile(&mut client, a).await?;
+                disks_changed = storage.reconcile(&mut client, a).await?;
             }
-            if changed || waiting {
+            if changed || waiting || disks_changed {
                 let disks = |i: &Instance| storage.disks(assigned.as_ref(), i);
                 waiting = reconcile(&mut client, runtime, &instances, disks, &mut reported).await?;
             }

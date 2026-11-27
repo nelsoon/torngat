@@ -32,11 +32,7 @@ pub trait Runtime: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), String>> + Send;
     /// Gives a running instance any of `disks` it does not have yet, and the new size of those
     /// that grew. Idempotent.
-    fn attach(
-        &self,
-        uid: Uuid,
-        disks: &[Disk],
-    ) -> impl Future<Output = Result<(), String>> + Send;
+    fn attach(&self, uid: Uuid, disks: &[Disk]) -> impl Future<Output = Result<(), String>> + Send;
     /// Stops the instance if it is running. Idempotent.
     fn stop(&self, uid: Uuid) -> impl Future<Output = Result<(), String>> + Send;
     /// Uids of instances currently running.

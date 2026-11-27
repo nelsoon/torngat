@@ -212,7 +212,13 @@ impl Loop {
             .unwrap()
             .set_len(size)
             .unwrap();
-        assert!(Command::new("losetup").args(["-c", &self.0]).status().unwrap().success());
+        assert!(
+            Command::new("losetup")
+                .args(["-c", &self.0])
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 }
 
@@ -264,7 +270,10 @@ async fn instances_boot_from_their_disks() {
     r.attach(ua, &[boot.disk(true), data.disk(false), extra.disk(false)])
         .await
         .unwrap();
-    assert!(open_in(&pid).contains(std::path::Path::new(&extra.0)), "not added");
+    assert!(
+        open_in(&pid).contains(std::path::Path::new(&extra.0)),
+        "not added"
+    );
     data.grow(2 << 20);
     r.attach(ua, &[boot.disk(true), data.disk(false), extra.disk(false)])
         .await
@@ -349,8 +358,8 @@ fn open_in(pid: &str) -> BTreeSet<std::path::PathBuf> {
 /// The size QEMU gives `volume`'s disk.
 fn qemu_size(uid: Uuid, pid: &str, volume: Uuid) -> u64 {
     use std::time::Duration;
-    let s = std::os::unix::net::UnixStream::connect(format!("/run/torngat-vm/{uid}/qmp.sock"))
-        .unwrap();
+    let s =
+        std::os::unix::net::UnixStream::connect(format!("/run/torngat-vm/{uid}/qmp.sock")).unwrap();
     let mut q = torngat_agent::qmp::Qmp::new(
         s,
         pid.parse().unwrap(),
@@ -359,7 +368,10 @@ fn qemu_size(uid: Uuid, pid: &str, volume: Uuid) -> u64 {
     )
     .unwrap();
     let nodes = q
-        .execute("query-named-block-nodes", Some(serde_json::json!({ "flat": true })))
+        .execute(
+            "query-named-block-nodes",
+            Some(serde_json::json!({ "flat": true })),
+        )
         .unwrap();
     let node = format!("v{}", &volume.simple().to_string()[2..]);
     nodes
