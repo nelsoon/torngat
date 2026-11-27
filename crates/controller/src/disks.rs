@@ -104,6 +104,10 @@ fn refusal(v: &Volume, inst: &Instance, boot: Option<&Name>) -> Option<String> {
     if v.status.attached_to.is_some_and(|u| u != me) {
         return Some(format!("volume {n} is used by another instance"));
     }
+    // Released, but its node has not closed it yet.
+    if v.status.open && v.status.attached_to.is_none() {
+        return Some(format!("volume {n} is still open on its node"));
+    }
     None
 }
 
@@ -461,7 +465,8 @@ async fn release(
     user: Uuid,
 ) -> Result<Option<Volume>, PlaceError> {
     modify(store, &keys::volume(scope, name)?, |v: &mut Volume| {
-        if v.status.attached_to != Some(user) {
+        // Opened meanwhile by a node that still had the instance listing it.
+        if v.status.attached_to != Some(user) || v.status.open {
             return false;
         }
         v.status.attached_to = None;

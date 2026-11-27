@@ -81,7 +81,9 @@ impl Controller {
         let mut last_housekeeping: Option<Instant> = None;
         loop {
             let world = match disks::disks_once(&self).await {
-                Ok((w, _)) => w,
+                Ok((w, 0)) => w,
+                // What it changed (such as a boot disk it made) is read again.
+                Ok(_) => disks::World::read(&self.store).await.unwrap_or(None),
                 Err(e) => {
                     tracing::warn!(error = %e, "disks pass failed");
                     None
