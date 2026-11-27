@@ -196,7 +196,6 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             .await?;
         }
 
-        self.open.clear();
         let opened = match self.crypt.opened().await {
             Ok(o) => o,
             Err(e) => {
@@ -239,6 +238,7 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             }
         }
 
+        let mut in_use = BTreeSet::new();
         for v in &a.volumes {
             let Some((pool, kind)) = pool_of(v) else {
                 continue;
@@ -249,7 +249,7 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
                 continue;
             };
             if use_.is_some() && r.open {
-                self.open.insert(v.metadata.uid);
+                in_use.insert(v.metadata.uid);
             }
             // Still open: the controller does not give it to another instance yet.
             r.open |= busy.contains(&name);
@@ -258,6 +258,7 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             })
             .await?;
         }
+        self.open = in_use;
         Ok(())
     }
 

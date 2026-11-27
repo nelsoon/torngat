@@ -1,6 +1,10 @@
 //! Instances as systemd units, with real QEMU and KVM. Needs root, systemd, QEMU and /dev/kvm:
 //!
-//!   cargo test -p torngat-agent --test qemu_units --no-run    # then run the binary with sudo, --ignored
+//!   cargo test -p torngat-agent --test qemu_units --no-run
+//!   sudo <binary> --ignored --test-threads=1
+//!
+//! One test at a time: a runtime stops every instance it finds paused before its guest ran, the
+//! other test's too.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -238,8 +242,7 @@ async fn instances_boot_from_their_disks() {
         );
     }
 
-    // An agent that restarts finds it again, also without its own record of it.
-    std::fs::remove_file(format!("/run/torngat-vm-started/{ua}")).unwrap();
+    // An agent that restarts finds it again: it ran, so it is not started again.
     assert!(rt().running().await.contains(&ua));
     assert_eq!(show(ua, "MainPID"), pid);
 
@@ -294,5 +297,4 @@ async fn instances_boot_from_their_disks() {
 
     r.stop(ua).await.unwrap();
     assert!(!r.running().await.contains(&ua));
-    assert!(!std::path::Path::new(&format!("/run/torngat-vm-started/{ua}")).exists());
 }

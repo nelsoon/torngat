@@ -16,12 +16,16 @@
 //!   instance's decrypted volumes and hands QEMU the open files over QMP (`add-fd`), adds them as
 //!   virtio disks (the boot disk first in the boot order), then lets the guest run. An instance
 //!   whose start was interrupted (still paused, e.g. the agent restarted) is stopped and started
-//!   again.
+//!   again: the agent asks each instance it finds once whether its guest ran.
 
+use std::collections::HashSet;
 use std::os::fd::AsFd;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
+
+use tokio::net::UnixStream;
 
 use serde_json::json;
 use torngat_api::compute::{Capability, Instance, MAX_DISKS, Runtime as RuntimeKind};
@@ -33,8 +37,6 @@ use crate::runtime::{Disk, Runtime};
 pub const UNIT_PREFIX: &str = "torngat-vm-";
 const STATE_ROOT: &str = "/var/lib/torngat-vm";
 const RUNTIME_ROOT: &str = "/run/torngat-vm";
-/// The agent's own: `<uid>` once that instance's guest was let run.
-const STARTED_ROOT: &str = "/run/torngat-vm-started";
 const SLICE: &str = "torngat-vms.slice";
 
 /// Bound on every QMP exchange.
@@ -72,6 +74,10 @@ impl Default for QemuConfig {
 #[derive(Debug, Clone)]
 pub struct QemuRuntime {
     cfg: QemuConfig,
+    /// Instances whose guest this agent saw running (not paused before it ran).
+    started: Arc<Mutex<HashSet<Uuid>>>,
+    /// The last [`Runtime::running`] could not tell about some instance.
+    unsettled: Arc<AtomicBool>,
 }
 
 /// The instance's unit.
@@ -88,18 +94,15 @@ fn qmp_socket(uid: Uuid) -> String {
     format!("{RUNTIME_ROOT}/{uid}/qmp.sock")
 }
 
-fn started(uid: Uuid) -> PathBuf {
-    Path::new(STARTED_ROOT).join(uid.to_string())
-}
-
 /// QEMU's names for a volume's disk: block node (at most 31 characters), device, and the serial
 /// number the guest sees (at most 20: `/dev/disk/by-id/virtio-<serial>`).
 fn disk_names(volume: Uuid) -> (String, String, String) {
     let hex = volume.simple().to_string();
+    // The end of a uid is its random part.
     (
-        format!("v{}", &hex[..30]),
+        format!("v{}", &hex[2..]),
         format!("disk-{volume}"),
-        hex[..20].to_owned(),
+        hex[12..].to_owned(),
     )
 }
 
@@ -109,12 +112,17 @@ fn attach_and_run(q: &mut Qmp, disks: &[Disk]) -> std::io::Result<()> {
         return Err(std::io::Error::other("too many disks"));
     }
     for (i, d) in disks.iter().enumerate() {
+        // Checked before opening it too: O_DIRECT fails on some other kinds of files.
+        let block = |m: std::fs::Metadata| m.file_type().is_block_device();
+        if !block(std::fs::metadata(&d.path)?) {
+            return Err(std::io::Error::other("a disk is not a block device"));
+        }
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(rustix::fs::OFlags::DIRECT.bits() as i32)
             .open(&d.path)?;
-        if !file.metadata()?.file_type().is_block_device() {
+        if !block(file.metadata()?) {
             return Err(std::io::Error::other("a disk is not a block device"));
         }
         q.execute_with_fd("add-fd", Some(json!({ "fdset-id": i })), file.as_fd())?;
@@ -280,7 +288,11 @@ fn running_state(s: &str) -> bool {
 
 impl QemuRuntime {
     pub fn new(cfg: QemuConfig) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            started: Arc::default(),
+            unsettled: Arc::default(),
+        }
     }
 
     async fn output(&self, cmd: &str, args: &[&str]) -> Result<String, String> {
@@ -308,6 +320,10 @@ impl QemuRuntime {
         Ok(out.trim().to_owned())
     }
 
+    fn started_set(&self) -> std::sync::MutexGuard<'_, HashSet<Uuid>> {
+        self.started.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     async fn is_running(&self, uid: Uuid) -> Result<bool, String> {
         Ok(running_state(&self.show(uid, "ActiveState").await?))
     }
@@ -329,9 +345,12 @@ impl QemuRuntime {
             .map_err(std::io::Error::other)?
             .parse()
             .map_err(|_| std::io::Error::other("no main process"))?;
-        let sock = qmp_socket(uid);
+        let stream = tokio::time::timeout(QMP_TIMEOUT, UnixStream::connect(qmp_socket(uid)))
+            .await
+            .map_err(|_| std::io::Error::other("qmp: cannot connect"))??
+            .into_std()?;
         let session = tokio::task::spawn_blocking(move || {
-            let mut q = Qmp::connect(Path::new(&sock), main, QMP_TIMEOUT)?;
+            let mut q = Qmp::new(stream, main, QMP_TIMEOUT, timeout)?;
             f(&mut q)
         });
         tokio::time::timeout(timeout, session)
@@ -417,7 +436,7 @@ impl Runtime for QemuRuntime {
         }
         // A unit that failed before is kept until this.
         let _ = self.output(SYSTEMCTL, &["reset-failed", &unit(uid)]).await;
-        let _ = std::fs::remove_file(started(uid));
+        self.started_set().remove(&uid);
         let mut run: Vec<String> = vec![
             format!("--unit={}", unit(uid)),
             format!("--slice={SLICE}"),
@@ -448,9 +467,7 @@ impl Runtime for QemuRuntime {
                     .await
                 {
                     Ok(()) => {
-                        std::fs::create_dir_all(STARTED_ROOT)
-                            .and_then(|()| std::fs::write(started(uid), b""))
-                            .map_err(|e| format!("{STARTED_ROOT}: {e}"))?;
+                        self.started_set().insert(uid);
                         return Ok(());
                     }
                     Err(e) => {
@@ -515,9 +532,11 @@ impl Runtime for QemuRuntime {
             }
         };
         let units = parse_units(&out);
+        self.started_set().retain(|u| units.contains(u));
         let mut running = Vec::with_capacity(units.len());
+        let mut unsettled = false;
         for uid in units {
-            if started(uid).exists() {
+            if self.started_set().contains(&uid) {
                 running.push(uid);
                 continue;
             }
@@ -531,28 +550,22 @@ impl Runtime for QemuRuntime {
                     }
                 }
                 Ok(_) => {
-                    let _ = std::fs::create_dir_all(STARTED_ROOT)
-                        .and_then(|()| std::fs::write(started(uid), b""));
+                    self.started_set().insert(uid);
                     running.push(uid);
                 }
-                // Not answering (yet): looked at again next time.
-                Err(_) => running.push(uid),
-            }
-        }
-        // Markers of instances that are gone.
-        if let Ok(dir) = std::fs::read_dir(STARTED_ROOT) {
-            for e in dir.flatten() {
-                let gone = e
-                    .file_name()
-                    .to_str()
-                    .and_then(|n| Uuid::parse_str(n).ok())
-                    .is_none_or(|u| !running.contains(&u));
-                if gone {
-                    let _ = std::fs::remove_file(e.path());
+                // Not answering (yet): looked at again soon.
+                Err(_) => {
+                    unsettled = true;
+                    running.push(uid);
                 }
             }
         }
+        self.unsettled.store(unsettled, Ordering::Relaxed);
         running
+    }
+
+    fn unsettled(&self) -> bool {
+        self.unsettled.load(Ordering::Relaxed)
     }
 }
 

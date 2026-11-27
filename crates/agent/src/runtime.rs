@@ -32,6 +32,10 @@ pub trait Runtime: Send + Sync + 'static {
     fn stop(&self, uid: Uuid) -> impl Future<Output = Result<(), String>> + Send;
     /// Uids of instances currently running.
     fn running(&self) -> impl Future<Output = Vec<Uuid>> + Send;
+    /// The last [`running`](Self::running) could not tell about some instance: ask again soon.
+    fn unsettled(&self) -> bool {
+        false
+    }
 }
 
 /// In-memory runtime for tests: the running instances and the disks each started with.

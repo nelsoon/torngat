@@ -32,7 +32,7 @@ use storage::{Crypt, Drivers};
 
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(2);
 /// Storage steps that failed or wait are tried again this often, also without a change.
-/// Instances waiting for their disks are looked at again as often.
+/// Instances waiting for their disks, or that failed to start, are looked at again as often.
 pub const STORAGE_RETRY: Duration = Duration::from_secs(10);
 
 /// The cluster's uid, which marks its pools: from the CA certificate (the first in `ca_pem`), the
@@ -283,8 +283,9 @@ pub async fn run<R: Runtime, D: Drivers, C: Crypt>(
     }
 }
 
-/// What the agent last told the controller about an instance, to avoid repeating itself.
-type Reported = BTreeMap<Uuid, (String, u64)>;
+/// What the agent last told the controller about an instance (phase, generation, message), to
+/// avoid repeating itself.
+type Reported = BTreeMap<Uuid, (String, u64, String)>;
 
 /// One connected session: register, heartbeat, follow assignments.
 pub async fn session<R: Runtime, D: Drivers, C: Crypt>(
@@ -324,7 +325,7 @@ pub async fn session<R: Runtime, D: Drivers, C: Crypt>(
     // What the controller last assigned: instances, and storage (`None` if it could not be read).
     let mut instances: Vec<Instance> = vec![];
     let mut assigned: Option<storage::Assigned> = None;
-    // Some instance waits for its disks.
+    // Some instance waits for its disks or failed to start: tried again.
     let mut waiting = false;
     let result = async {
         loop {
@@ -368,7 +369,8 @@ pub async fn session<R: Runtime, D: Drivers, C: Crypt>(
 }
 
 /// Brings the runtime in line with the assigned set and reports changes. An instance starts once
-/// `disks` has them all; returns whether one still waits.
+/// `disks` has them all; returns whether one should be looked at again soon (it waits for its
+/// disks, failed to start, or the runtime could not tell whether it runs).
 pub async fn reconcile<R: Runtime>(
     client: &mut ControlClient<Channel>,
     runtime: &R,
@@ -378,6 +380,7 @@ pub async fn reconcile<R: Runtime>(
 ) -> Result<bool, AgentError> {
     let mut waiting = false;
     let running: BTreeSet<Uuid> = runtime.running().await.into_iter().collect();
+    waiting |= runtime.unsettled();
     let wanted: BTreeSet<Uuid> = assigned.iter().map(|i| i.metadata.uid).collect();
 
     // Anything running that is no longer assigned here is stopped.
@@ -402,6 +405,7 @@ pub async fn reconcile<R: Runtime>(
                     Ok(()) => ("running", String::new()),
                     Err(e) => {
                         tracing::warn!(%uid, error = %e, "instance failed to start");
+                        waiting = true;
                         ("failed", e)
                     }
                 },
@@ -414,9 +418,12 @@ pub async fn reconcile<R: Runtime>(
                 }
             },
         };
-        if reported.get(&uid) == Some(&(phase.to_owned(), gen_)) {
+        let message = sanitize(&message);
+        let now = (phase.to_owned(), gen_, message);
+        if reported.get(&uid) == Some(&now) {
             continue;
         }
+        let (_, _, message) = &now;
         let Scope::Project { org, project } = &inst.metadata.scope else {
             continue;
         };
@@ -434,12 +441,12 @@ pub async fn reconcile<R: Runtime>(
                 phase: phase.into(),
                 observed_generation: gen_,
                 runtime: runtime_name.into(),
-                message: sanitize(&message),
+                message: message.clone(),
             })
             .await;
         match report {
             Ok(_) => {
-                reported.insert(uid, (phase.to_owned(), gen_));
+                reported.insert(uid, now);
             }
             // A rejected report concerns this instance only (e.g. just reassigned or deleted):
             // keep reconciling the others.

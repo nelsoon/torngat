@@ -43,21 +43,34 @@ echo "== boot disk"
 call POST "/v1/platform/volumeTypes?volume_type_id=fast" '{"spec": {"pools": ["n1-data"]}}' >/dev/null
 base=/v1/orgs/acme/projects/web
 call POST "$base/instances?instance_id=vm" \
-  '{"spec": {"vcpus": 1, "memory_mib": 128, "power_state": "stopped",
-             "boot_disk": {"volume_type": "fast", "size_gib": 1}}}' >/dev/null
+  '{"spec": {"vcpus": 1, "memory_mib": 128, "boot_disk": {"volume_type": "fast", "size_gib": 1}}}' >/dev/null
 vol() { call GET "$base/volumes/vm-boot"; }
 vm() { call GET "$base/instances/vm"; }
 opened() { [ "$(vol 2>/dev/null | jq -r .status.open)" = true ]; }
-until_true "boot disk open" 120 opened
+for _ in $(seq 120); do opened && break; sleep 1; done
+opened || {
+  vol | jq -c .status >&2
+  vm | jq -c .status >&2
+  guest journalctl -u torngatd --no-pager -b | tail -n 30 >&2
+  fail "boot disk not open"
+}
 vuid=$(vol | jq -r .metadata.uid)
 iuid=$(vm | jq -r .metadata.uid)
+phase_is() { [ "$(vm | jq -r .status.phase)" = "$1" ]; }
+power() { # STATE
+  call PATCH "$base/instances/vm" "$(vm | jq -c --arg p "$1" '{etag: .metadata.etag, spec: (.spec + {power_state: $p})}')" >/dev/null
+}
+# Its disk is blank: it boots nothing. Stopped, it keeps its disk open on the node.
+until_true "running" 60 phase_is running
+power stopped
+until_true "stopped" 60 phase_is stopped
 # What an image would hold: a boot sector that writes to the serial port (see
 # crates/agent/tests/qemu_units.rs).
 sector='\061\300\216\330\374\276\027\174\272\370\003\254\204\300\164\003\356\353\370\372\364\353\375TORNGAT-BOOT-OK\r\n\000'
 guest "printf '$sector' | dd of=/dev/mapper/torngat-vol-$vuid bs=512 conv=notrunc,fsync status=none &&
   printf '\125\252' | dd of=/dev/mapper/torngat-vol-$vuid bs=1 seek=510 conv=notrunc,fsync status=none"
-run=$(vm | jq -c '{etag: .metadata.etag, spec: (.spec + {power_state: "running"})}')
-call PATCH "$base/instances/vm" "$run" >/dev/null
+opened || fail "the boot disk was closed"
+power running
 booted() { guest grep -q TORNGAT-BOOT-OK "/var/lib/torngat-vm/$iuid/console.log" 2>/dev/null; }
 until_true "boots from its disk" 60 booted
 [ "$(vm | jq -r .status.phase)" = running ] || fail "instance: $(vm | jq -c .status)"
