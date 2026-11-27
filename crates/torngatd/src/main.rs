@@ -127,9 +127,6 @@ enum Cmd {
     Run {
         #[arg(long, default_value = "/var/lib/torngat")]
         data: PathBuf,
-        /// Unprivileged user QEMU runs as. Required when running as root.
-        #[arg(long)]
-        qemu_user: Option<String>,
         /// API server address (plain HTTP: loopback only until the API gets TLS).
         #[arg(long, default_value = "127.0.0.1:8080")]
         api: SocketAddr,
@@ -583,7 +580,6 @@ fn storage_driver(fake: Option<PathBuf>, gib: u64) -> torngat_agent::storage::An
 
 async fn run(
     data: PathBuf,
-    qemu_user: Option<String>,
     api: SocketAddr,
     control: SocketAddr,
     join_addr: SocketAddr,
@@ -599,11 +595,7 @@ async fn run(
     private_dir(&ident)?;
     let read = |p: PathBuf| std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()));
 
-    let runtime = torngat_agent::qemu::QemuRuntime::new(torngat_agent::qemu::QemuConfig {
-        state_dir: data.join("instances"),
-        run_as: qemu_user,
-        ..Default::default()
-    })?;
+    let runtime = torngat_agent::qemu::QemuRuntime::new(Default::default());
     let controller_url = match (&cfg.role, &cfg.controller) {
         // The local agent dials the control endpoint where it listens (loopback if on all).
         (Role::Controller, _) if control.ip().is_unspecified() => {
@@ -791,7 +783,6 @@ async fn main_async() -> Res<()> {
         }
         Cmd::Run {
             data,
-            qemu_user,
             api,
             control,
             join,
@@ -799,7 +790,7 @@ async fn main_async() -> Res<()> {
             fake_storage_gib,
         } => {
             let driver = storage_driver(fake_storage, fake_storage_gib);
-            run(data, qemu_user, api, control, join, driver).await
+            run(data, api, control, join, driver).await
         }
     }
 }

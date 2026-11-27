@@ -9,15 +9,11 @@ Wants=network-online.target
 After=network-online.target systemd-sysext.service
 
 [Service]
-# systemd-sysusers.service ran before the extension was merged (and only after an OS update),
-# so create the QEMU account here. "+": outside the sandbox below (writes /etc/passwd).
-ExecStartPre=+/usr/bin/systemd-sysusers torngat.conf
-ExecStart=/usr/bin/torngatd run --qemu-user torngat-qemu
+ExecStart=/usr/bin/torngatd run
 Restart=on-failure
 RestartSec=2s
-# Instances are QEMU processes in their own session: stopping or restarting the daemon (an update,
-# a crash) must not kill them. The agent finds them again on start.
-KillMode=process
+# Instances run in units of their own (torngat-vm-<uid>.service): stopping or restarting the daemon
+# (an update, a crash) does not touch them.
 # It holds keys.
 LimitCORE=0
 ProtectSystem=full

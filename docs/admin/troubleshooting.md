@@ -35,6 +35,8 @@
 | a pool: `volume(s) on the storage that the platform does not know` | left by a deleted cluster, a restore, or by hand | look at them; Torngat never deletes them |
 | a volume: `the encryption header is gone` or `unknown data where the encryption header goes` | the start of the device was overwritten | the data cannot be read; delete the volume |
 | a volume: `key refused` | the node is not active, or no instance on it uses the volume | [nodes](nodes.md) |
+| an instance: `instances need the agent to run as root` | `torngatd` was started by hand as another user | run it as root, or through its service |
+| an instance: `qemu failed to start: ...` | QEMU's last messages follow | `journalctl -u torngat-vm-<uid>` |
 | `/dev/kvm` missing | virtualization is off | turn it on in the firmware |
 
 To look at a node: `journalctl -b`, `systemctl --failed`, `bootctl status`, `systemd-cryptenroll <root
