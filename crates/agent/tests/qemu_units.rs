@@ -1,4 +1,5 @@
-//! Instances as systemd units, with real QEMU and KVM. Needs root, systemd, QEMU and /dev/kvm:
+//! Instances as systemd units, with real QEMU and KVM. Needs root, systemd, QEMU, OVMF, mtools,
+//! systemd-boot-efi and /dev/kvm:
 //!
 //!   cargo test -p torngat-agent --test qemu_units --no-run
 //!   sudo <binary> --ignored --test-threads=1
@@ -146,37 +147,39 @@ async fn instances_are_units_of_their_own() {
     assert!(!r.running().await.iter().any(|u| *u == ua || *u == ub));
 }
 
-/// A boot sector that writes `TORNGAT-BOOT-OK` to the first serial port and halts.
-fn boot_sector() -> Vec<u8> {
-    let mut b = vec![
-        0x31, 0xc0, // xor ax, ax
-        0x8e, 0xd8, // mov ds, ax
-        0xfc, // cld
-        0xbe, 0x17, 0x7c, // mov si, 0x7c17 (the text)
-        0xba, 0xf8, 0x03, // mov dx, 0x3f8
-        0xac, // lodsb
-        0x84, 0xc0, // test al, al
-        0x74, 0x03, // jz +3
-        0xee, // out dx, al
-        0xeb, 0xf8, // jmp lodsb
-        0xfa, // cli
-        0xf4, // hlt
-        0xeb, 0xfd, // jmp hlt
-    ];
-    b.extend_from_slice(b"TORNGAT-BOOT-OK\r\n\0");
-    b.resize(510, 0);
-    b.extend_from_slice(&[0x55, 0xaa]);
-    b
+/// The loader a UEFI guest boots: systemd-boot (package systemd-boot-efi).
+const LOADER: &str = "/usr/lib/systemd/boot/efi/systemd-bootx64.efi";
+
+/// A disk a UEFI guest boots from: a FAT file system (no partition table) with the loader as
+/// `\EFI\BOOT\BOOTX64.EFI`, made with mtools.
+fn esp(dir: &std::path::Path) -> Vec<u8> {
+    let f = dir.join("esp");
+    std::fs::write(&f, vec![0u8; 8 << 20]).unwrap();
+    let img = f.to_str().unwrap();
+    for args in [
+        vec!["mformat", "-i", img, "::"],
+        vec!["mmd", "-i", img, "::/EFI", "::/EFI/BOOT"],
+        vec!["mcopy", "-i", img, LOADER, "::/EFI/BOOT/BOOTX64.EFI"],
+    ] {
+        let ok = Command::new(args[0])
+            .args(&args[1..])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "{args:?}");
+    }
+    std::fs::read(&f).unwrap()
 }
 
-/// A loop device over a new 1 MiB file that starts with `head`, standing for a volume.
+/// A loop device over a new file of at least 1 MiB that starts with `head`, standing for a
+/// volume.
 struct Loop(String, std::path::PathBuf, Uuid);
 
 impl Loop {
     fn new(dir: &std::path::Path, name: &str, head: &[u8]) -> Self {
         let f = dir.join(name);
         let mut data = head.to_vec();
-        data.resize(1 << 20, 0);
+        data.resize(data.len().max(1 << 20), 0);
         std::fs::write(&f, data).unwrap();
         let out = Command::new("losetup")
             .args(["--find", "--show"])
@@ -245,7 +248,7 @@ async fn instances_boot_from_their_disks() {
         .prefix("torngat-disks")
         .tempdir_in("/var/tmp")
         .unwrap();
-    let boot = Loop::new(dir.path(), "boot", &boot_sector());
+    let boot = Loop::new(dir.path(), "boot", &esp(dir.path()));
     let data = Loop::new(dir.path(), "data", &[]);
     let r = rt();
 
@@ -255,7 +258,11 @@ async fn instances_boot_from_their_disks() {
     r.start(&a, &[boot.disk(true), data.disk(false)])
         .await
         .unwrap();
-    assert!(console_has(ua, "TORNGAT-BOOT-OK").await, "did not boot");
+    // The firmware starts the loader from the boot disk (a PCI device), not one of its own.
+    assert!(
+        console_has(ua, "BdsDxe: starting Boot0001").await && console_has(ua, "from PciRoot").await,
+        "did not boot from its disk"
+    );
     let pid = show(ua, "MainPID");
     let open = open_in(&pid);
     for d in [&boot.0, &data.0] {
@@ -318,13 +325,13 @@ async fn instances_boot_from_their_disks() {
         "--service-type=exec".into(),
     ];
     run.extend(
-        qemu::properties(&c)
+        qemu::properties(&c, &QemuConfig::default())
             .into_iter()
             .map(|p| format!("--property={p}")),
     );
     run.push("--".into());
     run.push(QemuConfig::default().qemu);
-    run.extend(qemu::args(&c));
+    run.extend(qemu::args(&c, &QemuConfig::default()));
     assert!(
         Command::new("systemd-run")
             .args(&run)

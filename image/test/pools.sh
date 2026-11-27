@@ -2,7 +2,7 @@
 # Storage pools on the host image, through the API: torngatd marks an LVM volume group made by the
 # operator, reports its size, and removes its mark when the pool is deleted, from inside its
 # service's sandbox. An instance boots from a volume of it (its boot disk, encrypted, handed to
-# QEMU by torngatd).
+# QEMU by torngatd), with UEFI. The host also needs mtools and systemd-boot-efi.
 #
 #   SSH_KEY=KEY image/test/pools.sh IMAGE
 #
@@ -64,14 +64,17 @@ power() { # STATE
 until_true "running" 60 phase_is running
 power stopped
 until_true "stopped" 60 phase_is stopped
-# What an image would hold: a boot sector that writes to the serial port (see
-# crates/agent/tests/qemu_units.rs).
-sector='\061\300\216\330\374\276\027\174\272\370\003\254\204\300\164\003\356\353\370\372\364\353\375TORNGAT-BOOT-OK\r\n\000'
-guest "printf '$sector' | dd of=/dev/mapper/torngat-vol-$vuid bs=512 conv=notrunc,fsync status=none &&
-  printf '\125\252' | dd of=/dev/mapper/torngat-vol-$vuid bs=1 seek=510 conv=notrunc,fsync status=none"
+# What an image would hold: an EFI system partition with a loader (systemd-boot), made here.
+esp=$work/esp.img
+truncate -s 8M "$esp"
+mformat -i "$esp" ::
+mmd -i "$esp" ::/EFI ::/EFI/BOOT
+mcopy -i "$esp" /usr/lib/systemd/boot/efi/systemd-bootx64.efi ::/EFI/BOOT/BOOTX64.EFI
+guest "dd of=/dev/mapper/torngat-vol-$vuid bs=1M conv=notrunc,fsync status=none" <"$esp"
 opened || fail "the boot disk was closed"
 power running
-booted() { guest grep -q TORNGAT-BOOT-OK "/var/lib/torngat-vm/$iuid/console.log" 2>/dev/null; }
+# The firmware starts the loader from the disk (a PCI device).
+booted() { guest grep -aq 'BdsDxe: starting Boot0001.*PciRoot' "/var/lib/torngat-vm/$iuid/console.log" 2>/dev/null; }
 until_true "boots from its disk" 60 booted
 [ "$(vm | jq -r .status.phase)" = running ] || fail "instance: $(vm | jq -c .status)"
 echo "ok: booted from its encrypted boot disk"

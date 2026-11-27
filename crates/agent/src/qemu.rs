@@ -64,6 +64,9 @@ const JOURNALCTL: &str = "/usr/bin/journalctl";
 #[derive(Debug, Clone)]
 pub struct QemuConfig {
     pub qemu: String,
+    /// UEFI firmware (OVMF), read-only, and the template of each instance's UEFI variables.
+    pub firmware: String,
+    pub firmware_vars: String,
     /// Time allowed for a guest to power off before it is stopped.
     pub stop_timeout: Duration,
 }
@@ -72,6 +75,8 @@ impl Default for QemuConfig {
     fn default() -> Self {
         Self {
             qemu: "/usr/bin/qemu-system-x86_64".into(),
+            firmware: "/usr/share/OVMF/OVMF_CODE_4M.fd".into(),
+            firmware_vars: "/usr/share/OVMF/OVMF_VARS_4M.fd".into(),
             stop_timeout: Duration::from_secs(10),
         }
     }
@@ -94,13 +99,14 @@ pub struct QemuRuntime {
 /// When to ask a failing QEMU again, the wait, and its failure.
 type Failing = (Instant, Duration, String);
 
-fn given(disks: &[Disk]) -> BTreeMap<Uuid, u64> {
-    disks.iter().map(|d| (d.volume, d.size)).collect()
-}
-
 /// The instance's unit.
 pub fn unit(uid: Uuid) -> String {
     format!("{UNIT_PREFIX}{uid}.service")
+}
+
+/// The instance's UEFI variables (boot entries), kept while it exists.
+fn uefi_vars(uid: Uuid) -> String {
+    format!("{STATE_ROOT}/{uid}/uefi-vars.fd")
 }
 
 /// The instance's console log, on the host.
@@ -148,8 +154,7 @@ fn open_disk(d: &Disk) -> std::io::Result<std::fs::File> {
 
 /// Adds `d` as a virtio disk on PCIe port `port`, its file passed in fd set `port`. Undone if it
 /// fails, so that it can be tried again.
-fn add_disk(q: &mut Qmp, port: usize, d: &Disk) -> std::io::Result<()> {
-    let file = open_disk(d)?;
+fn add_disk(q: &mut Qmp, port: usize, d: &Disk, file: &std::fs::File) -> std::io::Result<()> {
     let (node, id, serial) = disk_names(d.volume);
     // A set left by an earlier attempt could hold another volume's file.
     let _ = q.execute("remove-fd", Some(json!({ "fdset-id": port })));
@@ -184,16 +189,27 @@ fn add_disk(q: &mut Qmp, port: usize, d: &Disk) -> std::io::Result<()> {
     r.map(|_| ())
 }
 
-/// Hands `disks` to the paused QEMU behind `q`, then lets the guest run.
-fn attach_and_run(q: &mut Qmp, disks: &[Disk]) -> std::io::Result<()> {
+/// Hands `disks` to the paused QEMU behind `q`, then lets the guest run. Returns the size QEMU
+/// has for each.
+fn attach_and_run(q: &mut Qmp, disks: &[Disk]) -> std::io::Result<BTreeMap<Uuid, u64>> {
     if disks.len() > DISK_PORTS {
         return Err(other("too many disks"));
     }
     for (i, d) in disks.iter().enumerate() {
-        add_disk(q, i, d)?;
+        add_disk(q, i, d, &open_disk(d)?)?;
     }
+    let sizes = disk_sizes(q, disks)?;
     q.execute("cont", None)?;
-    Ok(())
+    Ok(sizes)
+}
+
+/// The size QEMU has for each of `disks` it has.
+fn disk_sizes(q: &mut Qmp, disks: &[Disk]) -> std::io::Result<BTreeMap<Uuid, u64>> {
+    let sizes = sizes(q)?;
+    Ok(disks
+        .iter()
+        .filter_map(|d| Some((d.volume, *sizes.get(&disk_names(d.volume).0)?)))
+        .collect())
 }
 
 /// What QEMU says it has: the disk ports in use, and the volumes it has as disks. QEMU may be its
@@ -249,66 +265,84 @@ fn sizes(q: &mut Qmp) -> std::io::Result<HashMap<String, u64>> {
         .collect())
 }
 
+/// A failure to update a running instance's disks, and whether it was QEMU's (then QEMU is not
+/// asked again for a while) or the node's.
+struct Failure {
+    error: std::io::Error,
+    qemu: bool,
+}
+
 /// Gives the running guest behind `q` those of `disks` it does not have, on free ports, then
-/// grows those whose device grew. One disk that fails does not hold back the others. Returns the
-/// size QEMU has for each disk it has, and the first failure.
+/// grows those whose device grew. One disk that fails does not hold back the others. Returns, for
+/// each disk, the size it is known to have (QEMU's, or the node's when the device is no larger
+/// than what QEMU has), and the first failure.
 fn update_disks(
     q: &mut Qmp,
     disks: &[Disk],
-) -> std::io::Result<(BTreeMap<Uuid, u64>, Option<std::io::Error>)> {
+) -> std::io::Result<(BTreeMap<Uuid, u64>, Option<Failure>)> {
     let (mut used, have) = plugged(q)?;
     let sizes = sizes(q)?;
-    let mut now = BTreeMap::new();
+    let mut known = BTreeMap::new();
     let mut failure = None;
+    let mut fail = |error, qemu| {
+        failure.get_or_insert(Failure { error, qemu });
+    };
     for d in disks.iter().filter(|d| !have.contains(&d.volume)) {
+        let file = match open_disk(d) {
+            Ok(f) => f,
+            Err(e) => {
+                fail(e, false);
+                continue;
+            }
+        };
         let Some(port) = (0..DISK_PORTS).find(|p| !used.contains(p)) else {
-            failure.get_or_insert(other("no free disk slot"));
+            fail(other("no free disk slot"), true);
             break;
         };
-        match add_disk(q, port, d) {
+        match add_disk(q, port, d, &file) {
             Ok(()) => {
                 used.insert(port);
-                now.insert(d.volume, d.size);
             }
-            Err(e) => {
-                failure.get_or_insert(e);
-            }
+            Err(e) => fail(e, true),
         }
     }
     for d in disks.iter().filter(|d| have.contains(&d.volume)) {
         let (node, _, _) = disk_names(d.volume);
         let Some(&had) = sizes.get(&node) else {
-            failure.get_or_insert(other("QEMU does not say how large a disk is"));
+            fail(other("QEMU does not say how large a disk is"), true);
             continue;
         };
-        let mut grown = || -> std::io::Result<u64> {
-            if had >= d.size {
-                return Ok(had);
-            }
-            let actual = std::fs::File::open(&d.path)?.seek(SeekFrom::End(0))?;
-            if actual <= had {
-                return Ok(had);
-            }
-            q.execute(
-                "block_resize",
-                Some(json!({ "node-name": node, "size": actual })),
-            )?;
-            Ok(actual)
-        };
-        match grown() {
-            Ok(size) => {
-                now.insert(d.volume, size);
-            }
+        if had >= d.size {
+            continue;
+        }
+        let actual = match std::fs::File::open(&d.path).and_then(|mut f| f.seek(SeekFrom::End(0))) {
+            Ok(a) => a,
             Err(e) => {
-                failure.get_or_insert(e);
+                fail(e, false);
+                continue;
             }
+        };
+        if actual <= had {
+            // The device is not larger yet: nothing to give until the node reports more.
+            known.insert(d.volume, d.size);
+            continue;
+        }
+        if let Err(e) = q.execute(
+            "block_resize",
+            Some(json!({ "node-name": node, "size": actual })),
+        ) {
+            fail(e, true);
         }
     }
-    Ok((now, failure))
+    for (v, size) in disk_sizes(q, disks)? {
+        let k = known.entry(v).or_default();
+        *k = (*k).max(size);
+    }
+    Ok((known, failure))
 }
 
-/// The unit's settings. Pure function of validated fields, for testing.
-pub fn properties(inst: &Instance) -> Vec<String> {
+/// The unit's settings. Pure function of validated fields and the configuration, for testing.
+pub fn properties(inst: &Instance, cfg: &QemuConfig) -> Vec<String> {
     let uid = inst.metadata.uid;
     let guest = inst.spec.memory_mib.saturating_mul(MIB);
     // QEMU itself: page tables, device emulation, buffers.
@@ -323,6 +357,13 @@ pub fn properties(inst: &Instance) -> Vec<String> {
         format!("RuntimeDirectory=torngat-vm/{uid}"),
         "RuntimeDirectoryMode=0700".into(),
         "UMask=0077".into(),
+        // Its UEFI variables, made from the template at its first start, by its own user (the agent
+        // writes nothing in the instance's directories).
+        format!(
+            "ExecStartPre=/usr/bin/cp --update=none {} {}",
+            cfg.firmware_vars,
+            uefi_vars(uid)
+        ),
         // Resources.
         format!("MemoryMax={memory}"),
         "MemorySwapMax=0".into(),
@@ -379,8 +420,9 @@ fn disk_port(i: usize) -> String {
     format!("disk{i}")
 }
 
-/// QEMU command line for an instance. Pure function of validated fields, for testing.
-pub fn args(inst: &Instance) -> Vec<String> {
+/// QEMU command line for an instance. Pure function of validated fields and the configuration,
+/// for testing.
+pub fn args(inst: &Instance, cfg: &QemuConfig) -> Vec<String> {
     let uid = inst.metadata.uid;
     let mut args: Vec<String> = vec![
         "-name".into(),
@@ -397,6 +439,14 @@ pub fn args(inst: &Instance) -> Vec<String> {
         format!("{}M", inst.spec.memory_mib),
         "-nodefaults".into(),
         "-no-user-config".into(),
+        // UEFI only.
+        "-drive".into(),
+        format!(
+            "if=pflash,format=raw,unit=0,readonly=on,file={}",
+            cfg.firmware
+        ),
+        "-drive".into(),
+        format!("if=pflash,format=raw,unit=1,file={}", uefi_vars(uid)),
         "-display".into(),
         "none".into(),
         "-chardev".into(),
@@ -493,10 +543,13 @@ impl QemuRuntime {
     /// Records that QEMU failed: it is asked again after a wait that doubles each time.
     fn failed(&self, uid: Uuid, e: String) -> String {
         let mut m = self.failing_map();
-        let wait = m
-            .get(&uid)
-            .map_or(RETRY_WAIT, |(_, w, _)| (*w * 2).min(MAX_RETRY_WAIT));
-        m.insert(uid, (Instant::now() + wait, wait, e.clone()));
+        let now = Instant::now();
+        // Doubled while it keeps failing; from the start again after a long quiet time.
+        let wait = match m.get(&uid) {
+            Some((until, w, _)) if now < *until + MAX_RETRY_WAIT => (*w * 2).min(MAX_RETRY_WAIT),
+            _ => RETRY_WAIT,
+        };
+        m.insert(uid, (now + wait, wait, e.clone()));
         e
     }
 
@@ -627,19 +680,18 @@ impl Runtime for QemuRuntime {
             "--service-type=exec".into(),
         ];
         run.extend(
-            properties(inst)
+            properties(inst, &self.cfg)
                 .into_iter()
                 .map(|p| format!("--property={p}")),
         );
         run.push("--".into());
         run.push(self.cfg.qemu.clone());
-        run.extend(args(inst));
+        run.extend(args(inst, &self.cfg));
         let run: Vec<&str> = run.iter().map(String::as_str).collect();
         self.output(SYSTEMD_RUN, &run).await?;
 
         // QEMU answers on QMP (it can still exit after starting, e.g. when memory or KVM
         // initialisation fails), then gets its disks and runs the guest.
-        let record = given(disks);
         let deadline = tokio::time::Instant::now() + START_TIMEOUT;
         let mut failure = None;
         while tokio::time::Instant::now() < deadline {
@@ -649,9 +701,9 @@ impl Runtime for QemuRuntime {
                     .qmp(uid, START_TIMEOUT, move |q| attach_and_run(q, &disks))
                     .await
                 {
-                    Ok(()) => {
+                    Ok(sizes) => {
                         self.started_set().insert(uid);
-                        self.given_map().insert(uid, record);
+                        self.given_map().insert(uid, sizes);
                         return Ok(());
                     }
                     Err(e) => {
@@ -682,6 +734,7 @@ impl Runtime for QemuRuntime {
                 .all(|d| had.get(&d.volume).is_some_and(|s| *s >= d.size))
         });
         if known {
+            self.failing_map().remove(&uid);
             return Ok(());
         }
         self.held_off(uid)?;
@@ -694,14 +747,16 @@ impl Runtime for QemuRuntime {
                 self.given_map().entry(uid).or_default().extend(sizes);
                 failure
             }
-            Err(e) => Some(e),
+            Err(error) => Some(Failure { error, qemu: true }),
         };
         match failure {
             None => {
                 self.failing_map().remove(&uid);
                 Ok(())
             }
-            Some(e) => Err(self.failed(uid, e.to_string())),
+            // QEMU is asked again only after a while; the node's own failures are retried as usual.
+            Some(f) if f.qemu => Err(self.failed(uid, f.error.to_string())),
+            Some(f) => Err(f.error.to_string()),
         }
     }
 
@@ -859,20 +914,24 @@ mod tests {
     #[test]
     fn args_use_only_validated_fields_and_sandbox() {
         let i = inst("vm-1", 2, 512, &[]);
-        let a = args(&i);
+        let a = args(&i, &QemuConfig::default());
         assert!(a.windows(2).any(|w| w[0] == "-smp" && w[1] == "2"));
         assert!(a.windows(2).any(|w| w[0] == "-m" && w[1] == "512M"));
         assert!(a.iter().any(|x| x.starts_with("on,obsolete=deny")));
         assert!(a.contains(&"-nodefaults".to_string()));
         // The user-chosen instance name never reaches the command line.
         assert!(!a.iter().any(|x| x.contains("vm-1")));
-        assert!(!properties(&i).iter().any(|x| x.contains("vm-1")));
+        assert!(
+            !properties(&i, &QemuConfig::default())
+                .iter()
+                .any(|x| x.contains("vm-1"))
+        );
     }
 
     #[test]
     fn units_are_confined_and_limited() {
         let i = inst("vm-1", 2, 1024, &[]);
-        let p = properties(&i);
+        let p = properties(&i, &QemuConfig::default());
         for want in [
             "DynamicUser=yes",
             "LimitCORE=0",
