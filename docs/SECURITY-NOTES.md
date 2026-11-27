@@ -22,6 +22,11 @@ Items found in reviews that a later chunk must enforce.
   - The CA key sits on the controller's disk (0600). Move it to an HSM/TPM-sealed store before multi-controller.
   - Certificates live one year and there is no rotation yet; add renewal (same key) before production.
   - `node.json`, `identity/` and `pki/` are trusted local state: anyone who can write them owns the node.
+- **compute:**
+  - Each instance is a transient unit `torngat-vm-<uid>.service` (`crates/agent/src/qemu.rs`): its own `DynamicUser`, group `kvm` only, no capabilities, `NoNewPrivileges`, `DevicePolicy=closed` with `/dev/kvm` only, `PrivateNetwork`, `AF_UNIX` only, read-only system, memory and task limits, no core dumps, and QEMU's own seccomp sandbox. Checked on a lab VM (`crates/agent/tests/qemu_units.rs`) and in the image (`image/test/instances.sh`).
+  - A user id freed by systemd can go to another instance later; `/var/lib/torngat-vm/<uid>/` is chowned again at each start, and the console log of an instance is readable only by its current user and root.
+  - Networks will need a socket family filter and device list per unit that allow only what they hand over (tap or vhost file descriptors), not `PrivateNetwork=no`.
+  - Console logs of deleted instances are not removed yet, and are not limited in size: before tenants get access.
 - **storage:**
   - Pool sizes and capabilities come from agents: only the pool's own node may report them. Reservations are written by the controller only, with compare-and-swap, before a volume is placed.
   - A driver must refuse a volume group or ZFS pool that carries another pool's or cluster's mark.
