@@ -306,13 +306,9 @@ impl Driver for LvmDriver {
 
     async fn release_pool(&self, r: ReleasePoolRequest) -> Result<ReleasePoolResponse, Status> {
         let (name, mark) = target(&r.pool)?;
-        let vg = match vg(&name).await {
-            Ok(v) => v,
-            // Gone with its mark.
-            Err(s) if s.code() == tonic::Code::NotFound => return Ok(ReleasePoolResponse {}),
-            Err(s) => return Err(s),
-        };
-        match marked(&vg, &mark) {
+        // A group that is not found may only be out of sight (its disk missing for a while), with
+        // its mark and volumes: never taken as released.
+        match marked(&vg(&name).await?, &mark) {
             Marked::Not => {}
             Marked::Other => {
                 return Err(Status::failed_precondition(

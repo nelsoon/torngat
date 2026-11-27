@@ -65,8 +65,8 @@ POST /v1/platform/volumeTypes?volume_type_id=fast
 - A pool that holds volumes or is in a type, and a type that volumes use, cannot be deleted. A pool holds at most 1024
   volumes.
 - Space is never promised twice: a volume takes its full size from the pool, plus 16 MiB for encryption.
-- Deleting a pool waits until its node removed its mark from the storage, and until no volume type lists it. If the node is lost, the
-  pool stays in deletion: there is no way to force it yet.
+- Deleting a pool waits until its node removed its mark from the storage, and until no volume type lists it. If the node is lost,
+  or no longer sees the volume group (its disks missing), the pool stays in deletion: there is no way to force it yet.
 - A volume gets its node when an instance first uses it.
 
 What a pool's `status` says:

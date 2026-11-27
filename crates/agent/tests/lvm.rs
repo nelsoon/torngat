@@ -159,10 +159,9 @@ async fn volumes_in_a_volume_group() {
         })
         .await;
     assert_eq!(err.map_err(code).unwrap_err(), Code::NotFound);
-    // A group that is gone took its mark with it.
-    d.release_pool(ReleasePoolRequest { pool: missing })
-        .await
-        .unwrap();
+    // A group out of sight is not taken as released.
+    let err = d.release_pool(ReleasePoolRequest { pool: missing }).await;
+    assert_eq!(err.map_err(code).unwrap_err(), Code::NotFound);
 
     // What others use is not counted.
     let info = d
