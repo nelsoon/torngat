@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+mod disks;
 pub mod identity;
 pub mod join;
 pub mod keys;
@@ -27,6 +28,7 @@ use torngat_api::Name;
 use torngat_keys::PlatformKey;
 use torngat_store::Store;
 
+pub use disks::disks_once;
 pub use join::{JoinService, expire_join_tokens_once, serve_join};
 pub use ops::complete_operations_once;
 pub use scheduler::schedule_once;
@@ -78,7 +80,19 @@ impl Controller {
         const HOUSEKEEPING_EVERY: Duration = Duration::from_secs(60);
         let mut last_housekeeping: Option<Instant> = None;
         loop {
-            if let Err(e) = schedule_once(&self).await {
+            let world = match disks::disks_once(&self).await {
+                Ok((w, 0)) => w,
+                // What it changed (such as a boot disk it made) is read again.
+                Ok(_) => disks::World::read(&self.store).await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "cannot read instances and volumes");
+                    None
+                }),
+                Err(e) => {
+                    tracing::warn!(error = %e, "disks pass failed");
+                    None
+                }
+            };
+            if let Err(e) = schedule_once(&self, world.as_ref()).await {
                 tracing::warn!(error = %e, "scheduling pass failed");
             }
             if let Err(e) = storage::storage_once(&self).await {

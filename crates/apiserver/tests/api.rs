@@ -933,3 +933,76 @@ async fn updates_survive_status_changes() {
     platform.await.unwrap();
     e.store.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn instance_disks() {
+    let e = storage_env().await;
+    let post = async |id: &str, spec: Value| {
+        let uri = format!("{BASE}?instance_id={id}");
+        call(&e.app, "POST", &uri, Some(json!({ "spec": spec })), true).await
+    };
+    let boot = |t: &str| json!({"vcpus": 1, "memory_mib": 512, "boot_disk": {"volume_type": t, "size_gib": 10}});
+    // An unknown type, a name too long for "<name>-boot", a disk twice.
+    let (s, v) = post("a", boot("nope")).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("volume type")
+    );
+    let (s, _) = post(&"a".repeat(60), boot("fast")).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let twice = json!({"vcpus": 1, "memory_mib": 512, "disks": [{"volume": "d"}, {"volume": "d"}]});
+    assert_eq!(post("a", twice).await.0, StatusCode::BAD_REQUEST);
+    let (s, v) = post("web", boot("fast")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    // On a node and running: disks do not change, the boot disk only grows.
+    edit(
+        &e.store,
+        &["orgs", "acme", "projects", "web", "instances", "web"],
+        "compute",
+        |v| {
+            v["status"]["node"] = json!("n1");
+            v["status"]["phase"] = json!("running");
+        },
+    )
+    .await;
+    let one = format!("{BASE}/web");
+    let patch =
+        async |spec: Value| call(&e.app, "PATCH", &one, Some(json!({ "spec": spec })), true).await;
+    // Added while it runs; removed only while stopped.
+    let mut with_disk = boot("fast");
+    with_disk["disks"] = json!([{"volume": "data"}]);
+    let (s, v) = patch(with_disk.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = patch(boot("fast")).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"]["status"], "FAILED_PRECONDITION");
+    let mut smaller = boot("fast");
+    smaller["boot_disk"]["size_gib"] = json!(5);
+    assert_eq!(patch(smaller).await.0, StatusCode::BAD_REQUEST);
+    let mut bigger = with_disk.clone();
+    bigger["boot_disk"]["size_gib"] = json!(20);
+    bigger["boot_disk"]["keep"] = json!(true);
+    let (s, v) = patch(bigger.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["spec"]["boot_disk"]["keep"], true);
+
+    // Stopped: they can.
+    let mut stopped = bigger.clone();
+    stopped["power_state"] = json!("stopped");
+    assert_eq!(patch(stopped.clone()).await.0, StatusCode::OK);
+    edit(
+        &e.store,
+        &["orgs", "acme", "projects", "web", "instances", "web"],
+        "compute",
+        |v| v["status"]["phase"] = json!("stopped"),
+    )
+    .await;
+    stopped["disks"] = json!([]);
+    let (s, v) = patch(stopped).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    e.store.shutdown().await.unwrap();
+}

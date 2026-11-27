@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use tonic::transport::Channel;
-use torngat_api::Scope;
 use torngat_api::storage::{LUKS_HEADER_BYTES, StorageDriver, StoragePool, Volume, VolumePhase};
+use torngat_api::{Name, Scope};
 use torngat_proto::storage::v1 as drv;
 use torngat_proto::v1::control_client::ControlClient;
 use torngat_proto::v1::{PoolReport, ReportResponse, VolumeKeyRequest, VolumeReport};
@@ -42,8 +42,27 @@ const MAX_KEY_WAIT: Duration = Duration::from_secs(300);
 pub struct Assigned {
     pub pools: Vec<StoragePool>,
     pub volumes: Vec<Volume>,
-    /// Instances on this node.
-    pub instances: BTreeSet<Uuid>,
+    /// Instances on this node, with the volumes each lists (in its project).
+    pub instances: BTreeMap<Uuid, (Scope, BTreeSet<Name>)>,
+}
+
+impl Assigned {
+    /// The instances' volumes, by instance uid.
+    pub fn instances(
+        list: &[torngat_api::compute::Instance],
+    ) -> BTreeMap<Uuid, (Scope, BTreeSet<Name>)> {
+        list.iter()
+            .map(|i| {
+                let names = i
+                    .spec
+                    .volumes(&i.metadata.name)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                (i.metadata.uid, (i.metadata.scope.clone(), names))
+            })
+            .collect()
+    }
 }
 
 impl Assigned {
@@ -53,7 +72,7 @@ impl Assigned {
         pools: &[Vec<u8>],
         volumes: &[Vec<u8>],
         unavailable: bool,
-        instances: BTreeSet<Uuid>,
+        instances: BTreeMap<Uuid, (Scope, BTreeSet<Name>)>,
     ) -> Option<Self> {
         if unavailable {
             return None;
@@ -147,7 +166,7 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             }
         };
         let pool_of = |v: &Volume| v.status.pool.as_ref().and_then(|r| mine.get(&r.uid));
-        // In use by an instance on this node: the only mappings that stay open.
+        // In use by an instance on this node that lists it: the only mappings that stay open.
         let keep: BTreeSet<String> = a
             .volumes
             .iter()
@@ -155,15 +174,18 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
                 pool_of(v).is_some()
                     && v.metadata.delete_time.is_none()
                     && v.status.phase != VolumePhase::Deleting
-                    && v.status
-                        .attached_to
-                        .is_some_and(|i| a.instances.contains(&i))
+                    && v.status.attached_to.is_some_and(|i| {
+                        a.instances.get(&i).is_some_and(|(scope, names)| {
+                            *scope == v.metadata.scope && names.contains(&v.metadata.name)
+                        })
+                    })
             })
             .map(|v| mapping(v.metadata.uid))
             .collect();
         // Closed first: no longer used, or left open by an agent that stopped. One that does not
         // close (busy) keeps its device attached, so that its deletion fails and is retried.
         let mut open = BTreeMap::new();
+        let mut busy = BTreeSet::new();
         for (name, size) in opened {
             if keep.contains(&name) {
                 open.insert(name, size);
@@ -171,7 +193,10 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             }
             match self.crypt.close(&name).await {
                 Ok(()) => tracing::info!(mapping = %name, "volume closed"),
-                Err(e) => tracing::warn!(mapping = %name, error = %e, "cannot close a volume"),
+                Err(e) => {
+                    tracing::warn!(mapping = %name, error = %e, "cannot close a volume");
+                    busy.insert(name);
+                }
             }
         }
 
@@ -181,9 +206,11 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             };
             let name = mapping(v.metadata.uid);
             let use_ = keep.contains(&name).then(|| open.get(&name).copied());
-            let Some(r) = self.volume_step(client, v, pool, *kind, use_).await else {
+            let Some(mut r) = self.volume_step(client, v, pool, *kind, use_).await else {
                 continue;
             };
+            // Still open: the controller does not give it to another instance yet.
+            r.open |= busy.contains(&name);
             report(&mut self.volumes_reported, v.metadata.uid, r, |r| {
                 client.report_volume(r)
             })
@@ -385,6 +412,7 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
         if let Some(open) = open {
             // Open, so formatted; the instance sees the mapping's size until it follows.
             report.formatted = true;
+            report.open = true;
             report.size_bytes = open.min(usable);
             if open < usable {
                 let key = self.key(client, v).await?;
@@ -434,6 +462,7 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
                 );
             }
         }
+        report.open = true;
         tracing::info!(volume = %uid, "volume opened");
         Ok(())
     }

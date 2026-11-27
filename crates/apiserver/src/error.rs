@@ -55,6 +55,17 @@ impl From<StoreError> for ApiError {
     }
 }
 
+impl From<torngat_api::compute::InstanceError> for ApiError {
+    fn from(e: torngat_api::compute::InstanceError) -> Self {
+        match e {
+            torngat_api::compute::InstanceError::DisksWhileRunning => {
+                ApiError::FailedPrecondition(e.to_string())
+            }
+            e => ApiError::InvalidArgument(e.to_string()),
+        }
+    }
+}
+
 impl From<serde_json::Error> for ApiError {
     fn from(e: serde_json::Error) -> Self {
         ApiError::Internal(format!("encoding: {e}"))

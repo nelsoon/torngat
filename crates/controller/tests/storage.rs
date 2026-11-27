@@ -787,6 +787,7 @@ async fn interrupted_placement_growth_and_deletion() {
         deleted,
         message: String::new(),
         formatted: false,
+        open: false,
     };
     let code = |r: Result<tonic::Response<_>, tonic::Status>| r.map(|_| ()).map_err(|s| s.code());
     assert_eq!(
@@ -866,12 +867,13 @@ async fn change_volume(e: &Env, name: &str, f: impl Fn(&mut Volume)) {
     change(e, keys::volume(&scope(), &n(name)).unwrap(), f).await;
 }
 
-/// An instance placed on `node`.
-async fn instance(e: &Env, name: &str, node: &str) -> Uuid {
+/// An instance placed on `node`, with these data disks.
+async fn instance(e: &Env, name: &str, node: &str, disks: &[&str]) -> Uuid {
+    let disks: Vec<_> = disks.iter().map(|d| json!({"volume": d})).collect();
     let o = object(
         name,
         &scope(),
-        json!({"vcpus": 1, "memory_mib": 256}),
+        json!({"vcpus": 1, "memory_mib": 256, "disks": disks}),
         json!({"phase": "scheduled", "node": node}),
     );
     put(&e.store, keys::instance(&scope(), &n(name)).unwrap(), &o).await;
@@ -927,13 +929,32 @@ async fn the_agent_looks_after_its_storage() {
     assert!(crypt.state().open.is_empty() && crypt.state().formatted.is_empty());
 
     // Used by an instance on this node: formatted once, then opened.
-    let i1 = instance(&e, "i1", "n1").await;
-    change_volume(&e, "v1", |v| v.status.attached_to = Some(i1)).await;
+    let i1 = instance(&e, "i1", "n1", &["v1"]).await;
+    let disks = |list: &'static [&'static str]| {
+        let e = &e;
+        async move {
+            change(
+                e,
+                keys::instance(&scope(), &n("i1")).unwrap(),
+                |i: &mut torngat_api::compute::Instance| {
+                    i.spec.disks = list
+                        .iter()
+                        .map(|d| torngat_api::compute::DiskRef { volume: n(d) })
+                        .collect();
+                },
+            )
+            .await;
+        }
+    };
     until("opened", || async {
         crypt.state().open.contains_key(&mapping(uid))
     })
     .await;
     assert!(crypt.state().formatted.contains_key(&file));
+    assert_eq!(
+        volume_now(&e, "v1").await.unwrap().status.attached_to,
+        Some(i1)
+    );
     until("formatted reported", || async {
         volume_now(&e, "v1").await.unwrap().status.formatted
     })
@@ -950,12 +971,21 @@ async fn the_agent_looks_after_its_storage() {
     // Closed when no longer used, and when left open by an agent that stopped.
     let other = mapping(Uuid::now_v7());
     crypt.state().open.insert(other.clone(), file.clone());
-    change_volume(&e, "v1", |v| v.status.attached_to = None).await;
+    disks(&[]).await;
     until("closed", || async { crypt.state().open.is_empty() }).await;
+    until("released", || async {
+        volume_now(&e, "v1")
+            .await
+            .unwrap()
+            .status
+            .attached_to
+            .is_none()
+    })
+    .await;
 
     // A header that is gone is not made again.
     let key = crypt.state().formatted.remove(&file).unwrap();
-    change_volume(&e, "v1", |v| v.status.attached_to = Some(i1)).await;
+    disks(&["v1"]).await;
     until("refused to format again", || async {
         let m = volume_now(&e, "v1").await.unwrap().status.message;
         m.is_some_and(|m| m.contains("not formatted again"))
@@ -965,8 +995,17 @@ async fn the_agent_looks_after_its_storage() {
     crypt.state().formatted.insert(file.clone(), key);
 
     // Deleted: blocks, then the object; the stray file stays.
+    disks(&[]).await;
+    until("released", || async {
+        volume_now(&e, "v1")
+            .await
+            .unwrap()
+            .status
+            .attached_to
+            .is_none()
+    })
+    .await;
     change_volume(&e, "v1", |v| {
-        v.status.attached_to = None;
         v.status.phase = VolumePhase::Deleting;
         v.metadata.delete_time = Some(time::OffsetDateTime::now_utc());
     })
@@ -1002,4 +1041,147 @@ async fn the_agent_looks_after_its_storage() {
     })
     .await;
     assert!(!dir.join(".torngat-pool").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn instances_get_their_disks() {
+    use torngat_agent::storage::{FakeCrypt, FileDriver, mapping};
+    use torngat_api::compute::Instance;
+    let e = env(Vec::new(), false).await;
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(root.path().join("data")).unwrap();
+    let crypt = FakeCrypt::default();
+    tokio::spawn(torngat_agent::run(
+        node_cfg(&e, "n1", "active").await,
+        torngat_agent::FakeRuntime::default(),
+        FileDriver::new(root.path(), 8 * GIB, false),
+        crypt.clone(),
+    ));
+    pool(&e, "data", "n1").await;
+    until("pool ready", || async {
+        pool_now(&e, "data").await.unwrap().status.ready
+    })
+    .await;
+    volume_type(&e, "fast", &["data"]).await;
+    let data = pending(&e, "data-1", 1).await;
+
+    // A boot disk made for it, and a data volume: both placed on its node, attached and opened.
+    let o = object(
+        "web",
+        &scope(),
+        json!({"vcpus": 1, "memory_mib": 64,
+               "boot_disk": {"volume_type": "fast", "size_gib": 2},
+               "disks": [{"volume": "data-1"}]}),
+        json!({}),
+    );
+    put(&e.store, keys::instance(&scope(), &n("web")).unwrap(), &o).await;
+    let web: Instance = serde_json::from_value(o).unwrap();
+    let inst =
+        || async { read::<Instance>(&e, keys::instance(&scope(), &n("web")).unwrap()).await };
+    until("scheduled", || async {
+        inst().await.unwrap().status.node == Some(n("n1"))
+    })
+    .await;
+    let boot = volume_now(&e, "web-boot").await.unwrap();
+    let owner = boot.status.owner.unwrap();
+    assert!(owner.instance == web.metadata.uid && owner.delete_with_it);
+    assert_eq!(boot.spec.size_gib, 2);
+    for v in ["web-boot", "data-1"] {
+        until("attached", || async {
+            let v = volume_now(&e, v).await.unwrap();
+            v.status.attached_to == Some(web.metadata.uid) && v.status.phase == VolumePhase::Ready
+        })
+        .await;
+    }
+    until("both open", || async {
+        let open = crypt.state().open.clone();
+        open.contains_key(&mapping(boot.metadata.uid))
+            && open.contains_key(&mapping(data.metadata.uid))
+    })
+    .await;
+
+    until("open reported", || async {
+        volume_now(&e, "data-1").await.unwrap().status.open
+    })
+    .await;
+
+    // Added while it runs: placed on its node, attached and opened.
+    let data2 = pending(&e, "data-2", 1).await;
+    change(
+        &e,
+        keys::instance(&scope(), &n("web")).unwrap(),
+        |i: &mut Instance| {
+            i.spec.disks.push(torngat_api::compute::DiskRef {
+                volume: n("data-2"),
+            });
+        },
+    )
+    .await;
+    until("added", || async {
+        crypt
+            .state()
+            .open
+            .contains_key(&mapping(data2.metadata.uid))
+    })
+    .await;
+
+    // Another instance cannot have a volume in use, nor another's boot disk; neither is taken.
+    let other = async |disk: &str| {
+        let o = object(
+            "other",
+            &scope(),
+            json!({"vcpus": 1, "memory_mib": 64, "disks": [{"volume": disk}]}),
+            json!({}),
+        );
+        put(&e.store, keys::instance(&scope(), &n("other")).unwrap(), &o).await;
+    };
+    let told = async |what: &str| {
+        read::<Instance>(&e, keys::instance(&scope(), &n("other")).unwrap())
+            .await
+            .unwrap()
+            .status
+            .message
+            .is_some_and(|m| m.contains(what))
+    };
+    other("data-1").await;
+    until("told: in use", || told("used by another instance")).await;
+    other("web-boot").await;
+    until("told: boot disk", || told("another instance's boot disk")).await;
+    assert_eq!(
+        volume_now(&e, "web-boot").await.unwrap().status.attached_to,
+        Some(web.metadata.uid)
+    );
+    e.store
+        .delete(
+            keys::instance(&scope(), &n("other")).unwrap(),
+            Precondition::None,
+        )
+        .await
+        .unwrap();
+
+    // Gone: its boot disk is deleted, the data volume released and kept; both closed.
+    e.store
+        .delete(
+            keys::instance(&scope(), &n("web")).unwrap(),
+            Precondition::None,
+        )
+        .await
+        .unwrap();
+    until("boot disk deleted", || async {
+        volume_now(&e, "web-boot").await.is_none()
+    })
+    .await;
+    // Released only once closed on the node.
+    until("data volumes released", || async {
+        let a = volume_now(&e, "data-1").await.unwrap();
+        let b = volume_now(&e, "data-2").await.unwrap();
+        a.status.attached_to.is_none() && b.status.attached_to.is_none()
+    })
+    .await;
+    assert!(crypt.state().open.is_empty());
+    assert!(!volume_now(&e, "data-1").await.unwrap().status.open);
+    assert_eq!(
+        volume_now(&e, "data-1").await.unwrap().status.phase,
+        VolumePhase::Ready
+    );
 }

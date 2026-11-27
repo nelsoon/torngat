@@ -256,6 +256,15 @@ pub enum VolumePhase {
     Failed,
 }
 
+/// The instance a volume was made for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeOwner {
+    /// The instance's uid.
+    pub instance: Uuid,
+    /// Deleted when the instance is (unless `boot_disk.keep`).
+    pub delete_with_it: bool,
+}
+
 /// A pool, and not one made later with the same name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolRef {
@@ -285,6 +294,13 @@ pub struct VolumeStatus {
     /// uid of the one instance that uses it, set with compare-and-swap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attached_to: Option<Uuid>,
+    /// Open on its node for an instance (reported by the node). It is released from its instance
+    /// only once closed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub open: bool,
+    /// The instance whose boot disk it is, if the platform made it as one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<VolumeOwner>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
