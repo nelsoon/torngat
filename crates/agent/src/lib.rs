@@ -38,15 +38,11 @@ pub const STORAGE_RETRY: Duration = Duration::from_secs(10);
 pub fn cluster_uid(ca_pem: &[u8]) -> Result<Uuid, AgentError> {
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::pem::PemObject;
-    use sha2::Digest;
     let ca = CertificateDer::pem_slice_iter(ca_pem)
         .next()
         .ok_or_else(|| tls_err("no CA certificate"))?
         .map_err(tls_err)?;
-    let hash = sha2::Sha256::digest(ca.as_ref());
-    let mut b = [0u8; 16];
-    b.copy_from_slice(&hash[..16]);
-    Ok(uuid::Builder::from_custom_bytes(b).into_uuid())
+    Ok(Uuid::new_v5(&Uuid::NAMESPACE_OID, ca.as_ref()))
 }
 
 /// Runs slow synchronous work (TPM operations) so the runtime can move other tasks, such as

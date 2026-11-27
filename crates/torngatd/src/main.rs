@@ -629,7 +629,7 @@ async fn run(
     if cfg.role == Role::Agent {
         tracing::info!(node = %cfg.name, "torngatd running (agent)");
         tokio::select! {
-            () = torngat_agent::run(agent_cfg, runtime, driver, Cryptsetup::default()) => {
+            () = torngat_agent::run(agent_cfg, runtime, driver, Cryptsetup) => {
                 return Err("agent stopped".into());
             }
             _ = tokio::signal::ctrl_c() => {
@@ -674,12 +674,7 @@ async fn run(
         tls.key_pem.clone(),
     ));
     let scheduler = tokio::spawn(ctl.run_scheduler(Duration::from_millis(500)));
-    let agent = tokio::spawn(torngat_agent::run(
-        agent_cfg,
-        runtime,
-        driver,
-        Cryptsetup::default(),
-    ));
+    let agent = tokio::spawn(torngat_agent::run(agent_cfg, runtime, driver, Cryptsetup));
     let state = torngat_apiserver::AppState {
         store: store.clone(),
         token,

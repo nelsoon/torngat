@@ -95,7 +95,7 @@ async fn volumes_on_loop_devices() {
     let root = tempfile::TempDir::new_in("/var/tmp").unwrap();
     std::fs::create_dir(root.path().join("data")).unwrap();
     let d = FileDriver::new(root.path(), 1 << 30, true);
-    let c = Cryptsetup::default();
+    let c = Cryptsetup;
     let pool = pool();
     d.claim_pool(ClaimPoolRequest { pool: pool.clone() })
         .await

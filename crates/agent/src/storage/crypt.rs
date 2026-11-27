@@ -48,19 +48,10 @@ pub trait Crypt: Send + Sync + 'static {
 }
 
 /// `cryptsetup` on block devices.
-#[derive(Debug, Clone)]
-pub struct Cryptsetup {
-    /// `/sys/block`, elsewhere in tests.
-    sys_block: PathBuf,
-}
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Cryptsetup;
 
-impl Default for Cryptsetup {
-    fn default() -> Self {
-        Self {
-            sys_block: PathBuf::from("/sys/block"),
-        }
-    }
-}
+const SYS_BLOCK: &str = "/sys/block";
 
 /// Refuses anything but a block device: a driver could answer with a path to any file.
 async fn block_device(dev: &Path) -> Result<(), String> {
@@ -211,9 +202,9 @@ impl Crypt for Cryptsetup {
     }
 
     async fn opened(&self) -> Result<BTreeMap<String, u64>, String> {
-        let err = |e: std::io::Error| format!("{}: {e}", self.sys_block.display());
+        let err = |e: std::io::Error| format!("{SYS_BLOCK}: {e}");
         let mut out = BTreeMap::new();
-        let mut entries = tokio::fs::read_dir(&self.sys_block).await.map_err(err)?;
+        let mut entries = tokio::fs::read_dir(SYS_BLOCK).await.map_err(err)?;
         while let Some(e) = entries.next_entry().await.map_err(err)? {
             if !e.file_name().to_string_lossy().starts_with("dm-") {
                 continue;

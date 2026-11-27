@@ -13,7 +13,7 @@ repository = "https://github.com/nelsoon/torngat"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 
 [workspace.lints.rust]

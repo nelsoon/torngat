@@ -10,12 +10,12 @@ publish = false
 
 [features]
 # TPM-held node keys and attestation (needs the tpm2-tss libraries).
-tpm = ["dep:tss-esapi", "dep:p256", "dep:torngat-attest"]
+tpm = ["dep:tss-esapi", "dep:p256", "dep:sha2", "dep:torngat-attest"]
 
 [dependencies]
 p256 = { version = "0.14", default-features = false, features = ["ecdsa"], optional = true }
 pem = "4"
-sha2 = "0.11"
+sha2 = { version = "0.11", optional = true }
 tss-esapi = { version = "7.7", optional = true }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { version = "0.5", features = ["util"] }
