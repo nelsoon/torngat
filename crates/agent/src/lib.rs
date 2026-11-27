@@ -391,6 +391,7 @@ pub async fn reconcile<R: Runtime>(
     for uid in running.difference(&wanted) {
         if let Err(e) = runtime.stop(*uid).await {
             tracing::warn!(%uid, error = %e, "failed to stop unassigned instance");
+            waiting = true;
         }
         reported.remove(uid);
     }

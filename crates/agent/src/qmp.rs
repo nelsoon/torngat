@@ -137,7 +137,15 @@ impl Qmp {
             )?;
             rest = &rest[sent..];
         }
-        self.reader.get_ref().write_all(rest)?;
+        while !rest.is_empty() {
+            self.timeouts()?;
+            match self.reader.get_ref().write(rest) {
+                Ok(0) => return Err(err("QMP: connection closed")),
+                Ok(n) => rest = &rest[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
         loop {
             let reply = self.line()?;
             // Events can come before the answer.
