@@ -43,18 +43,7 @@ impl FileDriver {
 
     /// The pool's directory. `NOT_FOUND` if it is missing: the operator makes it.
     async fn dir(&self, pool: &Option<Pool>) -> Result<(PathBuf, String), Status> {
-        let pool = pool
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("no pool"))?;
-        let ok = !pool.source.is_empty()
-            && pool
-                .source
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
-            && !pool.source.starts_with(['-', '_']);
-        if !ok {
-            return Err(Status::invalid_argument("invalid pool source"));
-        }
+        let pool = super::driver::pool_of(pool)?;
         let dir = self.root.join(&pool.source);
         if !tokio::fs::metadata(&dir).await.is_ok_and(|m| m.is_dir()) {
             return Err(Status::not_found("no such pool"));
@@ -100,8 +89,7 @@ impl FileDriver {
     }
 
     fn file(dir: &Path, uid: &str) -> Result<PathBuf, Status> {
-        let uid =
-            Uuid::parse_str(uid).map_err(|_| Status::invalid_argument("invalid volume uid"))?;
+        let uid = super::driver::volume_uid(uid)?;
         Ok(dir.join(format!("{uid}{SUFFIX}")))
     }
 
@@ -287,14 +275,9 @@ impl Driver for FileDriver {
             .await
             .map_err(io)?;
         let len = f.metadata().await.map_err(io)?.len().min(LUKS_HEADER_BYTES);
-        let zeros = vec![0u8; 1 << 20];
-        let mut left = len;
-        while left > 0 {
-            let n = left.min(zeros.len() as u64);
-            f.write_all(&zeros[..n as usize]).await.map_err(io)?;
-            left -= n;
-        }
-        f.sync_all().await.map_err(io)?;
+        super::driver::write_zeros(&mut f, 0, len)
+            .await
+            .map_err(io)?;
         tokio::fs::remove_file(&file).await.map_err(io)?;
         Ok(DeleteVolumeResponse {})
     }

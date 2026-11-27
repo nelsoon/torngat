@@ -8,54 +8,12 @@
 # with KEY authorized. Environment:
 #   SSH_KEY   private key whose public half is the image's root authorized key (required)
 #   SSH_PORT  guest SSH on localhost (default 2222)      API_PORT  local end of the API forward (18080)
-#
-# The admin token is read from the guest into a shell variable and handed to curl through a pipe,
-# never a file or the command line; it is not printed.
 set -euo pipefail
 
 img=$(realpath "${1:?usage: instances.sh IMAGE}")
 : "${SSH_KEY:?set SSH_KEY to the private key of the image root user}"
-ssh_port=${SSH_PORT:-2222}
-api_port=${API_PORT:-18080}
-here=$(cd "$(dirname "$0")" && pwd)
-work=$(mktemp -d "${TMPDIR:-/var/tmp}/torngat-instances.XXXXXX")
-boot_pid= fwd_pid= token= ok=0
-
-ssh_opts=(-i "$SSH_KEY" -p "$ssh_port" -o BatchMode=yes -o ConnectTimeout=3
-  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
-guest() { ssh "${ssh_opts[@]}" root@127.0.0.1 "$@"; }
-fail() { echo "FAIL: $*" >&2; exit 1; }
-cleanup() {
-  set +e
-  [ -n "$fwd_pid" ] && kill "$fwd_pid" 2>/dev/null
-  kill "$(cat "$work/qemu.pid" 2>/dev/null)" 2>/dev/null
-  [ -n "$boot_pid" ] && wait "$boot_pid" 2>/dev/null
-  if [ "$ok" = 1 ]; then rm -rf "$work"; else echo "workdir kept: $work" >&2; fi
-}
-trap cleanup EXIT
-
-if (exec 3<>"/dev/tcp/127.0.0.1/$ssh_port") 2>/dev/null; then fail "port $ssh_port is in use"; fi
-
-# The bearer header goes through a process substitution (a pipe).
-api() { # METHOD PATH [JSON]; prints the body, then the status code on its own line
-  local m=$1 p=$2
-  shift 2
-  curl -s -m 10 -X "$m" -w '\n%{http_code}' --config <(printf 'header = "Authorization: Bearer %s"\n' "$token") \
-    ${1:+-H 'Content-Type: application/json' --data "$1"} "http://127.0.0.1:$api_port$p"
-}
-body() { printf '%s' "${1%$'\n'*}"; }
-code() { printf '%s' "${1##*$'\n'}"; }
-
-until_true() { # WHAT SECONDS COMMAND...
-  local what=$1 n=$2
-  shift 2
-  for _ in $(seq "$n"); do
-    if "$@"; then return 0; fi
-    sleep 1
-  done
-  fail "never: $what"
-}
-
+NAME=instances
+. "$(dirname "$0")/api.sh"
 base=/v1/orgs/acme/projects/web/instances
 phase() { # NAME
   local out
@@ -69,23 +27,7 @@ unit_state() { guest systemctl show --property=ActiveState --value "torngat-vm-$
 main_pid() { guest systemctl show --property=MainPID --value "torngat-vm-$1.service"; }
 unit_gone() { [ "$(guest systemctl show --property=LoadState --value "torngat-vm-$1.service")" = not-found ]; }
 
-echo "== boot"
-SERIAL="$work/serial.log" SSH_PORT=$ssh_port "$here/../boot.sh" "$img" "$work" -- -pidfile "$work/qemu.pid" \
-  >"$work/boot.log" 2>&1 &
-boot_pid=$!
-up() { guest true 2>/dev/null; }
-until_true "SSH" 120 up
-guest torngatd init --allow-unsealed-root --name n1 >"$work/init.log" 2>&1 ||
-  { tail -n 10 "$work/init.log" >&2; fail "torngatd init"; }
-guest systemctl start torngatd
-ssh "${ssh_opts[@]}" -N -L "127.0.0.1:$api_port:127.0.0.1:8080" -o ExitOnForwardFailure=yes root@127.0.0.1 \
-  2>>"$work/forward.log" &
-fwd_pid=$!
-token=$(guest cat /var/lib/torngat/admin-token)
-api_up() { [ "$(code "$(api GET /v1/platform/nodes/n1 2>/dev/null)")" = 200 ]; }
-until_true "API" 60 api_up
-node_active() { [ "$(jq -r .status.phase <<<"$(body "$(api GET /v1/platform/nodes/n1)")")" = active ]; }
-until_true "node active" 60 node_active
+boot_node
 
 echo "== two instances"
 for n in vm-a vm-b; do

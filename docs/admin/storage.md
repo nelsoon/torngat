@@ -1,8 +1,8 @@
 # Storage for instances
 
-The image contains the tools. Pools, volume types and volumes can be described in the API, and nodes look
-after them ([on the node](#on-the-node)), but **there is no LVM or ZFS driver yet**: pools show `no storage
-driver on this node`.
+The image contains the tools. Pools, volume types and volumes are described in the API, and nodes look
+after them ([on the node](#on-the-node)). LVM pools work; **ZFS pools have no driver yet** and show `no storage
+driver on this node`. Instances cannot use volumes yet.
 
 | | LVM | ZFS |
 |---|---|---|
@@ -65,8 +65,8 @@ POST /v1/platform/volumeTypes?volume_type_id=fast
 - A pool that holds volumes or is in a type, and a type that volumes use, cannot be deleted. A pool holds at most 1024
   volumes.
 - Space is never promised twice: a volume takes its full size from the pool, plus 16 MiB for encryption.
-- Deleting a pool waits until its node removed its mark from the storage, and until no volume type lists it. If the node is lost, the
-  pool stays in deletion: there is no way to force it yet.
+- Deleting a pool waits until its node removed its mark from the storage, and until no volume type lists it. If the node is lost,
+  or no longer sees the volume group (its disks missing), the pool stays in deletion: there is no way to force it yet.
 - A volume gets its node when an instance first uses it.
 
 What a pool's `status` says:
@@ -95,6 +95,18 @@ Growing a volume first reserves the space; if there is none, it waits.
   asked for again after 5 s, then up to 5 min.
 - Volumes on the storage that the platform does not know are never deleted: the pool's `message` counts them. Look
   at them by hand.
+
+### LVM
+
+- Make the volume group by hand (`vgcreate data /dev/disk/by-id/...`) and give its name as the pool's `source`.
+- The node marks it with the tag `torngat:<cluster>:<pool>` (`vgs -o vg_tags`). Its volumes are thick logical volumes
+  named `torngat-<uid>`, with the same tag. Torngat never changes anything else in the group: other logical
+  volumes may stay there, and their size is left out of the pool's capacity.
+- The allocation unit is the group's extent size; volume sizes are rounded up to it.
+- A new volume has its first and last 16 MiB zeroed; the rest may hold old data, which the instance only sees
+  encrypted. `torngat-zeroing` marks one whose creation is not finished yet: the node finishes it.
+- A volume is active only while it is in use. Deleting it overwrites its first 16 MiB, discards its blocks where
+  the disks can, then removes it. Deactivating, and so deleting, fails while something has it open.
 
 `torngatd run --fake-storage DIR` is for tests only: every pool is a directory under `DIR`, volumes are files
 attached as loop devices, and nothing keeps the file system from filling up.

@@ -566,16 +566,13 @@ fn tpm_anchors(dir: &Path) -> Res<Vec<Vec<u8>>> {
     Ok(out)
 }
 
-/// Where volumes are kept: `--fake-storage`, or nowhere yet (the LVM driver comes later).
-fn storage_driver(fake: Option<PathBuf>, gib: u64) -> torngat_agent::storage::AnyDriver {
-    use torngat_agent::storage::{AnyDriver, FileDriver, NoDriver};
-    match fake {
-        Some(dir) => {
-            tracing::warn!(dir = %dir.display(), "fake storage: for tests only");
-            AnyDriver::Files(FileDriver::new(dir, gib.saturating_mul(1 << 30), true))
-        }
-        None => AnyDriver::None(NoDriver),
-    }
+/// The storage drivers: LVM (ZFS later), or `--fake-storage` for every pool.
+fn storage_drivers(fake: Option<PathBuf>, gib: u64) -> torngat_agent::storage::Builtin {
+    use torngat_agent::storage::{Builtin, FileDriver};
+    Builtin::new(fake.map(|dir| {
+        tracing::warn!(dir = %dir.display(), "fake storage: for tests only");
+        FileDriver::new(dir, gib.saturating_mul(1 << 30), true)
+    }))
 }
 
 async fn run(
@@ -583,7 +580,7 @@ async fn run(
     api: SocketAddr,
     control: SocketAddr,
     join_addr: SocketAddr,
-    driver: torngat_agent::storage::AnyDriver,
+    driver: torngat_agent::storage::Builtin,
 ) -> Res<()> {
     let cfg: NodeConfig = serde_json::from_slice(
         &std::fs::read(data.join("node.json"))
@@ -789,7 +786,7 @@ async fn main_async() -> Res<()> {
             fake_storage,
             fake_storage_gib,
         } => {
-            let driver = storage_driver(fake_storage, fake_storage_gib);
+            let driver = storage_drivers(fake_storage, fake_storage_gib);
             run(data, api, control, join, driver).await
         }
     }
