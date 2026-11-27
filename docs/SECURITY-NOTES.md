@@ -32,6 +32,7 @@ Items found in reviews that a later chunk must enforce.
 - **storage:**
   - Pool sizes and capabilities come from agents: only the pool's own node may report them. Reservations are written by the controller only, with compare-and-swap, before a volume is placed.
   - A driver must refuse a volume group or ZFS pool that carries another pool's or cluster's mark.
+  - LVM (`crates/agent/src/storage/lvm.rs`, checked on a lab VM by `crates/agent/tests/lvm.rs`): changes only logical volumes named `torngat-<uid>` with the pool's tag; a creation is answered only once the first and last 16 MiB are zeros (`torngat-zeroing` until then); deleting deactivates first, so that a volume in use is never wiped. A tag is no proof: anyone who can run `lvm` on the node can forge one.
   - Decrypted volumes are named `torngat-vol-<uid>`; `59-torngat-volumes.rules` keeps udev from probing, linking or activating them (`crates/agent/tests/luks.rs` checks it, with a control). Tools run by hand still can.
   - The agent (`crates/agent/src/storage`) opens a volume only while an instance assigned to its node uses it, and closes every other `torngat-vol-*` mapping, also ones left by an agent that stopped. When storage cannot be read or an entry does not decode, it changes nothing.
   - A driver's device must be a block device at an absolute path; other kinds are refused.

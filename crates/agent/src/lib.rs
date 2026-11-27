@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 pub use runtime::{FakeRuntime, Runtime};
 pub use storage::Storage;
-use storage::{Crypt, Driver};
+use storage::{Crypt, Drivers};
 
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(2);
 /// Storage steps that failed or wait are tried again this often, also without a change.
@@ -249,10 +249,10 @@ pub async fn connect(cfg: &AgentConfig) -> Result<ControlClient<Channel>, AgentE
 }
 
 /// Runs the agent forever, reconnecting on errors.
-pub async fn run<R: Runtime, D: Driver, C: Crypt>(
+pub async fn run<R: Runtime, D: Drivers, C: Crypt>(
     cfg: AgentConfig,
     runtime: R,
-    driver: D,
+    drivers: D,
     crypt: C,
 ) {
     let setup = Connector::new(&cfg).and_then(|c| Ok((c, cluster_uid(&cfg.ca_pem)?)));
@@ -264,7 +264,7 @@ pub async fn run<R: Runtime, D: Driver, C: Crypt>(
             return;
         }
     };
-    let mut storage = Storage::new(driver, crypt, cluster);
+    let mut storage = Storage::new(drivers, crypt, cluster);
     const MIN: Duration = Duration::from_millis(200);
     let mut backoff = MIN;
     loop {
@@ -285,7 +285,7 @@ pub async fn run<R: Runtime, D: Driver, C: Crypt>(
 type Reported = BTreeMap<Uuid, (String, u64)>;
 
 /// One connected session: register, heartbeat, follow assignments.
-pub async fn session<R: Runtime, D: Driver, C: Crypt>(
+pub async fn session<R: Runtime, D: Drivers, C: Crypt>(
     connector: &Connector,
     runtime: &R,
     storage: &mut Storage<D, C>,

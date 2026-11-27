@@ -11,6 +11,7 @@
 pub mod crypt;
 pub mod driver;
 pub mod files;
+pub mod lvm;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -18,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use tonic::transport::Channel;
 use torngat_api::Scope;
-use torngat_api::storage::{LUKS_HEADER_BYTES, StoragePool, Volume, VolumePhase};
+use torngat_api::storage::{LUKS_HEADER_BYTES, StorageDriver, StoragePool, Volume, VolumePhase};
 use torngat_proto::storage::v1 as drv;
 use torngat_proto::v1::control_client::ControlClient;
 use torngat_proto::v1::{PoolReport, ReportResponse, VolumeKeyRequest, VolumeReport};
@@ -26,8 +27,9 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 pub use crypt::{Crypt, Cryptsetup, FakeCrypt, mapping};
-pub use driver::{AnyDriver, Driver, NoDriver};
+pub use driver::{AnyDriver, Builtin, Driver, Drivers, NoDriver};
 pub use files::FileDriver;
+pub use lvm::LvmDriver;
 
 use crate::{AgentError, sanitize};
 
@@ -82,7 +84,7 @@ impl Assigned {
 /// The node's storage and what it last told the controller.
 #[derive(Debug)]
 pub struct Storage<D, C> {
-    driver: D,
+    drivers: D,
     crypt: C,
     cluster: Uuid,
     /// Volumes whose key was refused: when to ask again, and the next wait.
@@ -91,11 +93,11 @@ pub struct Storage<D, C> {
     volumes_reported: HashMap<Uuid, VolumeReport>,
 }
 
-impl<D: Driver, C: Crypt> Storage<D, C> {
+impl<D: Drivers, C: Crypt> Storage<D, C> {
     /// `cluster` marks the pools as this cluster's: see [`cluster_uid`](crate::cluster_uid).
-    pub fn new(driver: D, crypt: C, cluster: Uuid) -> Self {
+    pub fn new(drivers: D, crypt: C, cluster: Uuid) -> Self {
         Self {
-            driver,
+            drivers,
             crypt,
             cluster,
             refused: HashMap::new(),
@@ -129,7 +131,7 @@ impl<D: Driver, C: Crypt> Storage<D, C> {
         for p in &a.pools {
             let r = self.pool_step(p, a).await;
             if !r.released {
-                mine.insert(p.metadata.uid, self.pool(p));
+                mine.insert(p.metadata.uid, (self.pool(p), p.spec.driver));
             }
             report(&mut self.pools_reported, p.metadata.uid, r, |r| {
                 client.report_pool(r)
@@ -174,12 +176,12 @@ impl<D: Driver, C: Crypt> Storage<D, C> {
         }
 
         for v in &a.volumes {
-            let Some(pool) = pool_of(v) else {
+            let Some((pool, kind)) = pool_of(v) else {
                 continue;
             };
             let name = mapping(v.metadata.uid);
             let use_ = keep.contains(&name).then(|| open.get(&name).copied());
-            let Some(r) = self.volume_step(client, v, pool, use_).await else {
+            let Some(r) = self.volume_step(client, v, pool, *kind, use_).await else {
                 continue;
             };
             report(&mut self.volumes_reported, v.metadata.uid, r, |r| {
@@ -198,13 +200,15 @@ impl<D: Driver, C: Crypt> Storage<D, C> {
         };
         let uid = p.metadata.uid;
         let pool = Some(self.pool(p));
+        let kind = p.spec.driver;
         if p.metadata.delete_time.is_some() {
             if a.volumes.iter().any(|v| on_pool(v, uid)) {
                 report.message = "waits for its volumes to be deleted".into();
                 return report;
             }
             match self
-                .driver
+                .drivers
+                .get(kind)
                 .release_pool(drv::ReleasePoolRequest { pool })
                 .await
             {
@@ -214,15 +218,18 @@ impl<D: Driver, C: Crypt> Storage<D, C> {
             return report;
         }
         let r = async {
-            self.driver
+            self.drivers
+                .get(kind)
                 .claim_pool(drv::ClaimPoolRequest { pool: pool.clone() })
                 .await?;
             let info = self
-                .driver
+                .drivers
+                .get(kind)
                 .get_pool(drv::GetPoolRequest { pool: pool.clone() })
                 .await?;
             let found = self
-                .driver
+                .drivers
+                .get(kind)
                 .list_volumes(drv::ListVolumesRequest { pool })
                 .await?
                 .volumes;
@@ -268,6 +275,7 @@ impl<D: Driver, C: Crypt> Storage<D, C> {
         client: &mut ControlClient<Channel>,
         v: &Volume,
         pool: &drv::Pool,
+        kind: StorageDriver,
         use_: Option<Option<u64>>,
     ) -> Option<VolumeReport> {
         let Scope::Project { org, project } = &v.metadata.scope else {
@@ -281,9 +289,9 @@ impl<D: Driver, C: Crypt> Storage<D, C> {
             ..Default::default()
         };
         let r = match v.status.phase {
-            VolumePhase::Deleting => self.delete(v, pool, &mut report).await,
+            VolumePhase::Deleting => self.delete(v, pool, kind, &mut report).await,
             VolumePhase::Placed | VolumePhase::Ready if v.status.granted_bytes > 0 => {
-                self.make(client, v, pool, use_, &mut report).await
+                self.make(client, v, pool, kind, use_, &mut report).await
             }
             _ => return None,
         };
@@ -299,17 +307,20 @@ impl<D: Driver, C: Crypt> Storage<D, C> {
         &self,
         v: &Volume,
         pool: &drv::Pool,
+        kind: StorageDriver,
         report: &mut VolumeReport,
     ) -> Result<(), String> {
         let (pool, uid) = (Some(pool.clone()), v.metadata.uid.to_string());
-        self.driver
+        self.drivers
+            .get(kind)
             .detach_volume(drv::DetachVolumeRequest {
                 pool: pool.clone(),
                 uid: uid.clone(),
             })
             .await
             .map_err(msg)?;
-        self.driver
+        self.drivers
+            .get(kind)
             .delete_volume(drv::DeleteVolumeRequest { pool, uid })
             .await
             .map_err(msg)?;
@@ -323,13 +334,15 @@ impl<D: Driver, C: Crypt> Storage<D, C> {
         client: &mut ControlClient<Channel>,
         v: &Volume,
         pool: &drv::Pool,
+        kind: StorageDriver,
         use_: Option<Option<u64>>,
         report: &mut VolumeReport,
     ) -> Result<(), String> {
         let (pool, uid) = (Some(pool.clone()), v.metadata.uid);
         let want = v.status.granted_bytes.saturating_add(LUKS_HEADER_BYTES);
         let mut size = self
-            .driver
+            .drivers
+            .get(kind)
             .create_volume(drv::CreateVolumeRequest {
                 pool: pool.clone(),
                 uid: uid.to_string(),
@@ -340,7 +353,8 @@ impl<D: Driver, C: Crypt> Storage<D, C> {
             .size_bytes;
         if size < want {
             size = self
-                .driver
+                .drivers
+                .get(kind)
                 .grow_volume(drv::GrowVolumeRequest {
                     pool: pool.clone(),
                     uid: uid.to_string(),
@@ -357,7 +371,8 @@ impl<D: Driver, C: Crypt> Storage<D, C> {
 
         let Some(open) = use_ else {
             // Its mapping was closed before.
-            self.driver
+            self.drivers
+                .get(kind)
                 .detach_volume(drv::DetachVolumeRequest {
                     pool,
                     uid: uid.to_string(),
@@ -379,7 +394,8 @@ impl<D: Driver, C: Crypt> Storage<D, C> {
             return Ok(());
         }
         let attached = self
-            .driver
+            .drivers
+            .get(kind)
             .attach_volume(drv::AttachVolumeRequest {
                 pool,
                 uid: uid.to_string(),

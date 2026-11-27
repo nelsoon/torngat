@@ -287,14 +287,9 @@ impl Driver for FileDriver {
             .await
             .map_err(io)?;
         let len = f.metadata().await.map_err(io)?.len().min(LUKS_HEADER_BYTES);
-        let zeros = vec![0u8; 1 << 20];
-        let mut left = len;
-        while left > 0 {
-            let n = left.min(zeros.len() as u64);
-            f.write_all(&zeros[..n as usize]).await.map_err(io)?;
-            left -= n;
-        }
-        f.sync_all().await.map_err(io)?;
+        super::driver::write_zeros(&mut f, 0, len)
+            .await
+            .map_err(io)?;
         tokio::fs::remove_file(&file).await.map_err(io)?;
         Ok(DeleteVolumeResponse {})
     }

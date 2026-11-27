@@ -1,8 +1,10 @@
 //! The storage driver contract (`proto/storage.proto`) as an in-process trait.
 
 use std::future::Future;
+use std::sync::Arc;
 
 use tonic::Status;
+use torngat_api::storage::StorageDriver;
 use torngat_proto::storage::v1::*;
 
 /// A storage driver. See `proto/storage.proto` for what each call must do; the requests and answers
@@ -84,11 +86,68 @@ impl Driver for NoDriver {
     }
 }
 
-/// One of the drivers built in, chosen at start.
-#[derive(Debug)]
+/// The drivers of a node, by the kind that pools name.
+pub trait Drivers: Send + Sync + 'static {
+    type Driver: Driver;
+    fn get(&self, kind: StorageDriver) -> &Self::Driver;
+}
+
+impl Drivers for NoDriver {
+    type Driver = Self;
+    fn get(&self, _: StorageDriver) -> &Self {
+        self
+    }
+}
+
+/// Tests: one driver for every kind.
+impl Drivers for super::files::FileDriver {
+    type Driver = Self;
+    fn get(&self, _: StorageDriver) -> &Self {
+        self
+    }
+}
+
+/// One of the drivers built in.
+#[derive(Debug, Clone)]
 pub enum AnyDriver {
     None(NoDriver),
-    Files(super::files::FileDriver),
+    Files(Arc<super::files::FileDriver>),
+    Lvm(super::lvm::LvmDriver),
+}
+
+/// The drivers built in: LVM; ZFS later. With `fake`, every pool uses it instead (tests only).
+#[derive(Debug)]
+pub struct Builtin {
+    lvm: AnyDriver,
+    zfs: AnyDriver,
+}
+
+impl Builtin {
+    pub fn new(fake: Option<super::files::FileDriver>) -> Self {
+        match fake {
+            Some(f) => {
+                let f = AnyDriver::Files(Arc::new(f));
+                Self {
+                    lvm: f.clone(),
+                    zfs: f,
+                }
+            }
+            None => Self {
+                lvm: AnyDriver::Lvm(super::lvm::LvmDriver),
+                zfs: AnyDriver::None(NoDriver),
+            },
+        }
+    }
+}
+
+impl Drivers for Builtin {
+    type Driver = AnyDriver;
+    fn get(&self, kind: StorageDriver) -> &AnyDriver {
+        match kind {
+            StorageDriver::Lvm => &self.lvm,
+            StorageDriver::Zfs => &self.zfs,
+        }
+    }
 }
 
 macro_rules! delegate {
@@ -98,6 +157,7 @@ macro_rules! delegate {
                 match self {
                     AnyDriver::None(d) => d.$f(r).await,
                     AnyDriver::Files(d) => d.$f(r).await,
+                    AnyDriver::Lvm(d) => d.$f(r).await,
                 }
             })*
         }
@@ -114,4 +174,22 @@ delegate! {
     delete_volume(DeleteVolumeRequest) -> DeleteVolumeResponse;
     attach_volume(AttachVolumeRequest) -> AttachVolumeResponse;
     detach_volume(DetachVolumeRequest) -> DetachVolumeResponse;
+}
+
+/// Writes `len` zero bytes at `offset` of `f`, and flushes them to the device.
+pub(crate) async fn write_zeros(
+    f: &mut tokio::fs::File,
+    offset: u64,
+    len: u64,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+    f.seek(std::io::SeekFrom::Start(offset)).await?;
+    let zeros = vec![0u8; 1 << 20];
+    let mut left = len;
+    while left > 0 {
+        let n = left.min(zeros.len() as u64);
+        f.write_all(&zeros[..n as usize]).await?;
+        left -= n;
+    }
+    f.sync_all().await
 }

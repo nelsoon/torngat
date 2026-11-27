@@ -31,7 +31,10 @@
 | `vgs` shows nothing | the disk is not in LVM's list, on purpose | [storage](storage.md#nothing-is-opened-by-itself) |
 | `modprobe zfs`: "Key was rejected" | the module was not signed by this image's key, or the key is not enrolled | rebuild the image; enroll the key |
 | `zpool import`: "in use from another system" | another machine had the pool, or the root was made anew | [storage](storage.md#nothing-is-opened-by-itself) |
-| a pool: `no storage driver on this node` | no LVM or ZFS driver yet | |
+| a pool: `no storage driver on this node` | a ZFS pool: no driver yet | |
+| a pool: `no such volume group` | `source` names no volume group that the node sees | `vgs`; a disk made elsewhere needs `lvmdevices --adddev` ([storage](storage.md#nothing-is-opened-by-itself)) |
+| a pool: `carries another mark` | the volume group is another pool's, or another cluster's | `vgs -o vg_tags`; remove the old tag with `vgchange --deltag` only if nothing uses it any more |
+| a volume: `the volume is in use` | something has it open | `dmsetup info`, `fuser`; nothing outside Torngat should open it |
 | a pool: `volume(s) on the storage that the platform does not know` | left by a deleted cluster, a restore, or by hand | look at them; Torngat never deletes them |
 | a volume: `the encryption header is gone` or `unknown data where the encryption header goes` | the start of the device was overwritten | the data cannot be read; delete the volume |
 | a volume: `key refused` | the node is not active, or no instance on it uses the volume | [nodes](nodes.md) |
