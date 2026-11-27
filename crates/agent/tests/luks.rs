@@ -21,8 +21,7 @@ fn run(cmd: &str, args: &[&str]) -> String {
     let out = Command::new(cmd).args(args).output().unwrap();
     assert!(
         out.status.success(),
-        "{cmd} {}: {}",
-        args.first().copied().unwrap_or_default(),
+        "{cmd}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
