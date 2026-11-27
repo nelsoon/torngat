@@ -18,7 +18,8 @@
 //!   whose start was interrupted (still paused, e.g. the agent restarted) is stopped and started
 //!   again: the agent asks each instance it finds once whether its guest ran.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::io::{Seek, SeekFrom};
 use std::os::fd::AsFd;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,6 +79,12 @@ pub struct QemuRuntime {
     started: Arc<Mutex<HashSet<Uuid>>>,
     /// The last [`Runtime::running`] could not tell about some instance.
     unsettled: Arc<AtomicBool>,
+    /// The disks each running instance was given, with their size then.
+    given: Arc<Mutex<HashMap<Uuid, BTreeMap<Uuid, u64>>>>,
+}
+
+fn given(disks: &[Disk]) -> BTreeMap<Uuid, u64> {
+    disks.iter().map(|d| (d.volume, d.size)).collect()
 }
 
 /// The instance's unit.
@@ -106,52 +113,152 @@ fn disk_names(volume: Uuid) -> (String, String, String) {
     )
 }
 
+fn other(m: &str) -> std::io::Error {
+    std::io::Error::other(m.to_owned())
+}
+
+/// Opens `d` for QEMU: read-write, bypassing the host's page cache.
+fn open_disk(d: &Disk) -> std::io::Result<std::fs::File> {
+    // Checked before opening it too: O_DIRECT fails on some other kinds of files.
+    let block = |m: std::fs::Metadata| m.file_type().is_block_device();
+    if !block(std::fs::metadata(&d.path)?) {
+        return Err(other("a disk is not a block device"));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(rustix::fs::OFlags::DIRECT.bits() as i32)
+        .open(&d.path)?;
+    if !block(file.metadata()?) {
+        return Err(other("a disk is not a block device"));
+    }
+    Ok(file)
+}
+
+/// Adds `d` as a virtio disk on PCIe port `port`, its file passed in fd set `port`. Undone if it
+/// fails, so that it can be tried again.
+fn add_disk(q: &mut Qmp, port: usize, d: &Disk) -> std::io::Result<()> {
+    let file = open_disk(d)?;
+    let (node, id, serial) = disk_names(d.volume);
+    // A set left by an earlier attempt could hold another volume's file.
+    let _ = q.execute("remove-fd", Some(json!({ "fdset-id": port })));
+    q.execute_with_fd("add-fd", Some(json!({ "fdset-id": port })), file.as_fd())?;
+    let added = q.execute(
+        "blockdev-add",
+        Some(json!({
+            "driver": "raw",
+            "node-name": node,
+            "file": {
+                "driver": "host_device",
+                "filename": format!("/dev/fdset/{port}"),
+                "cache": { "direct": true },
+            },
+        })),
+    );
+    let mut dev = json!({
+        "driver": "virtio-blk-pci",
+        "bus": disk_port(port),
+        "drive": node,
+        "id": id,
+        "serial": serial,
+    });
+    if d.boot {
+        dev["bootindex"] = json!(0);
+    }
+    let r = added.and_then(|_| q.execute("device_add", Some(dev)));
+    if r.is_err() {
+        let _ = q.execute("blockdev-del", Some(json!({ "node-name": node })));
+        let _ = q.execute("remove-fd", Some(json!({ "fdset-id": port })));
+    }
+    r.map(|_| ())
+}
+
 /// Hands `disks` to the paused QEMU behind `q`, then lets the guest run.
 fn attach_and_run(q: &mut Qmp, disks: &[Disk]) -> std::io::Result<()> {
     if disks.len() > DISK_PORTS {
-        return Err(std::io::Error::other("too many disks"));
+        return Err(other("too many disks"));
     }
     for (i, d) in disks.iter().enumerate() {
-        // Checked before opening it too: O_DIRECT fails on some other kinds of files.
-        let block = |m: std::fs::Metadata| m.file_type().is_block_device();
-        if !block(std::fs::metadata(&d.path)?) {
-            return Err(std::io::Error::other("a disk is not a block device"));
-        }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(rustix::fs::OFlags::DIRECT.bits() as i32)
-            .open(&d.path)?;
-        if !block(file.metadata()?) {
-            return Err(std::io::Error::other("a disk is not a block device"));
-        }
-        q.execute_with_fd("add-fd", Some(json!({ "fdset-id": i })), file.as_fd())?;
-        let (node, id, serial) = disk_names(d.volume);
-        q.execute(
-            "blockdev-add",
-            Some(json!({
-                "driver": "raw",
-                "node-name": node,
-                "file": {
-                    "driver": "host_device",
-                    "filename": format!("/dev/fdset/{i}"),
-                    "cache": { "direct": true },
-                },
-            })),
-        )?;
-        let mut dev = json!({
-            "driver": "virtio-blk-pci",
-            "bus": disk_port(i),
-            "drive": node,
-            "id": id,
-            "serial": serial,
-        });
-        if d.boot {
-            dev["bootindex"] = json!(0);
-        }
-        q.execute("device_add", Some(dev))?;
+        add_disk(q, i, d)?;
     }
     q.execute("cont", None)?;
+    Ok(())
+}
+
+/// What QEMU says it has: the disk ports in use, and the volumes it has as disks. QEMU may be its
+/// guest's: this only tells the agent where to try, every step is checked by QEMU itself.
+fn plugged(q: &mut Qmp) -> std::io::Result<(BTreeSet<usize>, BTreeSet<Uuid>)> {
+    let pci = q.execute("query-pci", None)?;
+    let (mut ports, mut volumes) = (BTreeSet::new(), BTreeSet::new());
+    let buses = pci.as_array().map(Vec::as_slice).unwrap_or_default();
+    for dev in buses.iter().flat_map(|b| devices(b)) {
+        let Some(port) = qdev_id(dev)
+            .and_then(|i| i.strip_prefix("disk"))
+            .and_then(|n| n.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        for inner in dev.get("pci_bridge").map(devices).unwrap_or_default() {
+            ports.insert(port);
+            if let Some(v) = qdev_id(inner)
+                .and_then(|i| i.strip_prefix("disk-"))
+                .and_then(|u| Uuid::parse_str(u).ok())
+            {
+                volumes.insert(v);
+            }
+        }
+    }
+    Ok((ports, volumes))
+}
+
+fn devices(bus: &serde_json::Value) -> &[serde_json::Value] {
+    bus.get("devices")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+fn qdev_id(dev: &serde_json::Value) -> Option<&str> {
+    dev.get("qdev_id").and_then(serde_json::Value::as_str)
+}
+
+/// The size QEMU gives each of our disks, by block node.
+fn sizes(q: &mut Qmp) -> std::io::Result<HashMap<String, u64>> {
+    let nodes = q.execute("query-named-block-nodes", Some(json!({ "flat": true })))?;
+    Ok(nodes
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|n| {
+            let name = n.get("node-name")?.as_str()?;
+            let size = n.pointer("/image/virtual-size")?.as_u64()?;
+            Some((name.to_owned(), size))
+        })
+        .collect())
+}
+
+/// Gives the running guest behind `q` those of `disks` it does not have, on free ports, and grows
+/// those whose device grew.
+fn update_disks(q: &mut Qmp, disks: &[Disk]) -> std::io::Result<()> {
+    let (mut used, have) = plugged(q)?;
+    let sizes = sizes(q)?;
+    for d in disks {
+        if have.contains(&d.volume) {
+            let (node, _, _) = disk_names(d.volume);
+            let mut f = std::fs::File::open(&d.path)?;
+            let actual = f.seek(SeekFrom::End(0))?;
+            if sizes.get(&node).is_some_and(|s| *s < actual) {
+                q.execute("block_resize", Some(json!({ "node-name": node, "size": actual })))?;
+            }
+            continue;
+        }
+        let port = (0..DISK_PORTS)
+            .find(|p| !used.contains(p))
+            .ok_or_else(|| other("no free disk slot"))?;
+        add_disk(q, port, d)?;
+        used.insert(port);
+    }
     Ok(())
 }
 
@@ -292,6 +399,7 @@ impl QemuRuntime {
             cfg,
             started: Arc::default(),
             unsettled: Arc::default(),
+            given: Arc::default(),
         }
     }
 
@@ -322,6 +430,10 @@ impl QemuRuntime {
 
     fn started_set(&self) -> std::sync::MutexGuard<'_, HashSet<Uuid>> {
         self.started.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn given_map(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, BTreeMap<Uuid, u64>>> {
+        self.given.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     async fn is_running(&self, uid: Uuid) -> Result<bool, String> {
@@ -437,6 +549,7 @@ impl Runtime for QemuRuntime {
         // A unit that failed before is kept until this.
         let _ = self.output(SYSTEMCTL, &["reset-failed", &unit(uid)]).await;
         self.started_set().remove(&uid);
+        self.given_map().remove(&uid);
         let mut run: Vec<String> = vec![
             format!("--unit={}", unit(uid)),
             format!("--slice={SLICE}"),
@@ -457,6 +570,7 @@ impl Runtime for QemuRuntime {
 
         // QEMU answers on QMP (it can still exit after starting, e.g. when memory or KVM
         // initialisation fails), then gets its disks and runs the guest.
+        let record = given(disks);
         let deadline = tokio::time::Instant::now() + START_TIMEOUT;
         let mut failure = None;
         while tokio::time::Instant::now() < deadline {
@@ -468,6 +582,7 @@ impl Runtime for QemuRuntime {
                 {
                     Ok(()) => {
                         self.started_set().insert(uid);
+                        self.given_map().insert(uid, record);
                         return Ok(());
                     }
                     Err(e) => {
@@ -488,6 +603,29 @@ impl Runtime for QemuRuntime {
             Some(e) => format!("cannot give the instance its disks: {e}"),
             None => format!("qemu failed to start: {}", self.log_tail(uid).await),
         })
+    }
+
+    async fn attach(&self, uid: Uuid, disks: &[Disk]) -> Result<(), String> {
+        let want = given(disks);
+        // Nothing new since they were given (unknown after the agent restarted: QEMU is asked).
+        let known = self.given_map().get(&uid).is_some_and(|had| {
+            want.iter()
+                .all(|(v, size)| had.get(v).is_some_and(|s| s >= size))
+        });
+        if known {
+            return Ok(());
+        }
+        let list = disks.to_vec();
+        self.qmp(uid, START_TIMEOUT, move |q| update_disks(q, &list))
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut m = self.given_map();
+        let had = m.entry(uid).or_default();
+        for (v, size) in want {
+            let s = had.entry(v).or_default();
+            *s = (*s).max(size);
+        }
+        Ok(())
     }
 
     async fn stop(&self, uid: Uuid) -> Result<(), String> {
@@ -533,6 +671,7 @@ impl Runtime for QemuRuntime {
         };
         let units = parse_units(&out);
         self.started_set().retain(|u| units.contains(u));
+        self.given_map().retain(|u, _| units.contains(u));
         let mut running = Vec::with_capacity(units.len());
         let mut unsettled = false;
         for uid in units {

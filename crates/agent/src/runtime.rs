@@ -16,6 +16,8 @@ pub struct Disk {
     pub path: PathBuf,
     /// The instance boots from it.
     pub boot: bool,
+    /// Its size in bytes, as the node last saw it.
+    pub size: u64,
 }
 
 /// Runs instances on this node. Instances are identified by `metadata.uid`.
@@ -26,6 +28,13 @@ pub trait Runtime: Send + Sync + 'static {
     fn start(
         &self,
         inst: &Instance,
+        disks: &[Disk],
+    ) -> impl Future<Output = Result<(), String>> + Send;
+    /// Gives a running instance any of `disks` it does not have yet, and the new size of those
+    /// that grew. Idempotent.
+    fn attach(
+        &self,
+        uid: Uuid,
         disks: &[Disk],
     ) -> impl Future<Output = Result<(), String>> + Send;
     /// Stops the instance if it is running. Idempotent.
@@ -68,6 +77,18 @@ impl Runtime for FakeRuntime {
             .unwrap_or_else(PoisonError::into_inner)
             .entry(inst.metadata.uid)
             .or_insert_with(|| disks.to_vec());
+        Ok(())
+    }
+
+    async fn attach(&self, uid: Uuid, disks: &[Disk]) -> Result<(), String> {
+        let mut m = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let have = m.get_mut(&uid).ok_or("not running")?;
+        for d in disks {
+            match have.iter_mut().find(|h| h.volume == d.volume) {
+                Some(h) => h.size = h.size.max(d.size),
+                None => have.push(d.clone()),
+            }
+        }
         Ok(())
     }
 

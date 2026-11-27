@@ -1137,6 +1137,25 @@ async fn instances_get_their_disks() {
             .contains_key(&mapping(data2.metadata.uid))
     })
     .await;
+    // The running instance gets it.
+    until("given to the instance", || async {
+        runtime
+            .disks(web.metadata.uid)
+            .is_some_and(|d| d.iter().any(|d| d.volume == data2.metadata.uid))
+    })
+    .await;
+    // Grown while it runs: the instance gets the new size.
+    let before = runtime.disks(web.metadata.uid).unwrap()[1].size;
+    change(
+        &e,
+        keys::volume(&scope(), &n("data-1")).unwrap(),
+        |v: &mut torngat_api::storage::Volume| v.spec.size_gib = 2,
+    )
+    .await;
+    until("grown in the instance", || async {
+        runtime.disks(web.metadata.uid).unwrap()[1].size > before
+    })
+    .await;
 
     // Another instance cannot have a volume in use, nor another's boot disk; neither is taken.
     let other = async |disk: &str| {

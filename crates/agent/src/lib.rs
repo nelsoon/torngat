@@ -27,7 +27,7 @@ use torngat_proto::v1::*;
 use uuid::Uuid;
 
 pub use runtime::{Disk, FakeRuntime, Runtime};
-pub use storage::Storage;
+pub use storage::{Disks, Storage};
 use storage::{Crypt, Drivers};
 
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(2);
@@ -373,13 +373,13 @@ pub async fn session<R: Runtime, D: Drivers, C: Crypt>(
 }
 
 /// Brings the runtime in line with the assigned set and reports changes. An instance starts once
-/// `disks` has them all; returns whether one should be looked at again soon (it waits for its
+/// `disks` has them all, and a running one gets those added or grown since; returns whether one should be looked at again soon (it waits for its
 /// disks, failed to start, or the runtime could not tell whether it runs).
 pub async fn reconcile<R: Runtime>(
     client: &mut ControlClient<Channel>,
     runtime: &R,
     assigned: &[Instance],
-    disks: impl Fn(&Instance) -> Result<Vec<Disk>, String>,
+    disks: impl Fn(&Instance) -> Disks,
     reported: &mut Reported,
 ) -> Result<bool, AgentError> {
     let mut waiting = false;
@@ -400,13 +400,29 @@ pub async fn reconcile<R: Runtime>(
         let uid = inst.metadata.uid;
         let gen_ = inst.metadata.generation;
         let (phase, message) = match inst.spec.power_state {
-            PowerState::Running if running.contains(&uid) => ("running", String::new()),
+            // Disks added or grown while it runs.
+            PowerState::Running if running.contains(&uid) => {
+                let d = disks(inst);
+                match runtime.attach(uid, &d.ready).await {
+                    Err(e) => {
+                        tracing::warn!(%uid, error = %e, "cannot update the instance's disks");
+                        waiting = true;
+                        ("running", format!("cannot update its disks: {e}"))
+                    }
+                    Ok(()) => {
+                        waiting |= d.waiting.is_some();
+                        ("running", d.waiting.unwrap_or_default())
+                    }
+                }
+            }
             PowerState::Running => match disks(inst) {
-                Err(e) => {
+                Disks {
+                    waiting: Some(e), ..
+                } => {
                     waiting = true;
                     ("starting", e)
                 }
-                Ok(d) => match runtime.start(inst, &d).await {
+                Disks { ready: d, .. } => match runtime.start(inst, &d).await {
                     Ok(()) => ("running", String::new()),
                     Err(e) => {
                         tracing::warn!(%uid, error = %e, "instance failed to start");
