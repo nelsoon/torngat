@@ -21,6 +21,7 @@ Items found in reviews that a later chunk must enforce.
   - TPM keys (SRK and node key) use no authorization value and are created `noDA`, so they never count towards dictionary-attack lockout; access to the TPM device is the boundary. Without `noDA`, each power loss after the key was used counted as a failed authorization, and a few power cuts in a row locked the node out of its key (found by `image/test/power-loss.sh`). Keys created before this change need re-enrollment. PCR-bound policies come later.
   - The CA key sits on the controller's disk (0600). Move it to an HSM/TPM-sealed store before multi-controller.
   - Certificates live one year and there is no rotation yet; add renewal (same key) before production.
+  - The TPM device's descriptor (opened by tpm2-tss without close-on-exec) is inherited by the tools `torngatd` runs (lvm, cryptsetup, losetup, systemctl): root tools that could open the TPM themselves. QEMU is started by systemd, not by `torngatd`, and does not get it. Close it on exec when that can be done without unsafe code.
   - `node.json`, `identity/` and `pki/` are trusted local state: anyone who can write them owns the node.
 - **compute:**
   - Each instance is a transient unit `torngat-vm-<uid>.service` (`crates/agent/src/qemu.rs`): its own `DynamicUser`, group `kvm` only, no capabilities, `NoNewPrivileges`, a private `/dev` with `/dev/kvm` only, private IPC and network, `AF_UNIX` only, no D-Bus, `MemoryDenyWriteExecute`, read-only system, memory and task limits, no core dumps, and QEMU's own seccomp sandbox.

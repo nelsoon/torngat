@@ -23,7 +23,12 @@ call POST "/v1/platform/storagePools?storage_pool_id=n1-data" \
   '{"spec": {"node": "n1", "driver": "lvm", "source": "data"}}' >/dev/null
 pool() { call GET /v1/platform/storagePools/n1-data; }
 ready() { [ "$(pool | jq -r .status.ready)" = true ]; }
-until_true "pool ready" 60 ready
+for _ in $(seq 60); do ready && break; sleep 1; done
+ready || {
+  pool | jq -c .status >&2
+  guest journalctl -u torngatd --no-pager -b | grep -iE "lvm|pool|storage" | tail -n 20 >&2
+  fail "pool not ready"
+}
 p=$(pool)
 uid=$(jq -r .metadata.uid <<<"$p")
 [ "$(jq -r .status.allocation_unit_bytes <<<"$p")" = $((4 << 20)) ] || fail "allocation unit: $p"

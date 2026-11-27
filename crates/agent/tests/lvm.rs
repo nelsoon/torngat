@@ -153,8 +153,16 @@ async fn volumes_in_a_volume_group() {
         source: "tgnosuchgroup".into(),
         ..p.clone().unwrap()
     });
-    let err = d.claim_pool(ClaimPoolRequest { pool: missing }).await;
+    let err = d
+        .claim_pool(ClaimPoolRequest {
+            pool: missing.clone(),
+        })
+        .await;
     assert_eq!(err.map_err(code).unwrap_err(), Code::NotFound);
+    // A group that is gone took its mark with it.
+    d.release_pool(ReleasePoolRequest { pool: missing })
+        .await
+        .unwrap();
 
     // What others use is not counted.
     let info = d

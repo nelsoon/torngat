@@ -17,6 +17,8 @@ RestartSec=2s
 # It holds keys.
 LimitCORE=0
 ProtectSystem=full
+# LVM keeps copies of the volume groups' metadata there (backup/, archive/).
+ReadWritePaths=/etc/lvm
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes

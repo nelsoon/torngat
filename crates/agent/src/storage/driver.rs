@@ -176,6 +176,27 @@ delegate! {
     detach_volume(DetachVolumeRequest) -> DetachVolumeResponse;
 }
 
+/// The request's pool, if its source is a plain name: lowercase letters, digits, `-` and `_`, not
+/// starting with `-` or `_` (never an option or a path).
+pub(crate) fn pool_of(pool: &Option<Pool>) -> Result<&Pool, Status> {
+    let p = pool
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("no pool"))?;
+    let ok = !p.source.is_empty()
+        && p.source
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+        && !p.source.starts_with(['-', '_']);
+    if !ok {
+        return Err(Status::invalid_argument("invalid pool source"));
+    }
+    Ok(p)
+}
+
+pub(crate) fn volume_uid(uid: &str) -> Result<uuid::Uuid, Status> {
+    uuid::Uuid::parse_str(uid).map_err(|_| Status::invalid_argument("invalid volume uid"))
+}
+
 /// Writes `len` zero bytes at `offset` of `f`, and flushes them to the device.
 pub(crate) async fn write_zeros(
     f: &mut tokio::fs::File,
