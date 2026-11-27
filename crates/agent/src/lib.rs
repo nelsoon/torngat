@@ -9,6 +9,7 @@
 pub mod inventory;
 pub mod join;
 pub mod qemu;
+pub mod qmp;
 pub mod runtime;
 pub mod storage;
 #[cfg(feature = "tpm")]
@@ -25,12 +26,13 @@ use torngat_proto::v1::control_client::ControlClient;
 use torngat_proto::v1::*;
 use uuid::Uuid;
 
-pub use runtime::{FakeRuntime, Runtime};
+pub use runtime::{Disk, FakeRuntime, Runtime};
 pub use storage::Storage;
 use storage::{Crypt, Drivers};
 
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(2);
 /// Storage steps that failed or wait are tried again this often, also without a change.
+/// Instances waiting for their disks are looked at again as often.
 pub const STORAGE_RETRY: Duration = Duration::from_secs(10);
 
 /// The cluster's uid, which marks its pools: from the CA certificate (the first in `ca_pem`), the
@@ -319,10 +321,14 @@ pub async fn session<R: Runtime, D: Drivers, C: Crypt>(
     let mut retry =
         tokio::time::interval_at(tokio::time::Instant::now() + STORAGE_RETRY, STORAGE_RETRY);
     retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // What the controller last assigned to storage.
+    // What the controller last assigned: instances, and storage (`None` if it could not be read).
+    let mut instances: Vec<Instance> = vec![];
     let mut assigned: Option<storage::Assigned> = None;
+    // Some instance waits for its disks.
+    let mut waiting = false;
     let result = async {
         loop {
+            let mut changed = false;
             tokio::select! {
                 set = stream.message() => {
                     let Some(set) = set? else { return Ok(()) };
@@ -331,12 +337,12 @@ pub async fn session<R: Runtime, D: Drivers, C: Crypt>(
                     }
                     // An undecodable entry (e.g. a newer controller) must not look "unassigned", or
                     // its workload would be stopped: give up on this session instead.
-                    let instances = set
+                    instances = set
                         .instances_json
                         .iter()
                         .map(|b| serde_json::from_slice::<Instance>(b))
                         .collect::<Result<Vec<_>, _>>()?;
-                    reconcile(&mut client, runtime, &instances, &mut reported).await?;
+                    changed = true;
                     assigned = storage::Assigned::decode(
                         &set.pools_json,
                         &set.volumes_json,
@@ -344,10 +350,15 @@ pub async fn session<R: Runtime, D: Drivers, C: Crypt>(
                         storage::Assigned::instances(&instances),
                     );
                 }
-                _ = retry.tick(), if assigned.is_some() => {}
+                _ = retry.tick(), if assigned.is_some() || waiting => {}
             }
+            // Storage first: it opens the disks that instances start with.
             if let Some(a) = &assigned {
                 storage.reconcile(&mut client, a).await?;
+            }
+            if changed || waiting {
+                let disks = |i: &Instance| storage.disks(assigned.as_ref(), i);
+                waiting = reconcile(&mut client, runtime, &instances, disks, &mut reported).await?;
             }
         }
     }
@@ -356,13 +367,16 @@ pub async fn session<R: Runtime, D: Drivers, C: Crypt>(
     result
 }
 
-/// Brings the runtime in line with the assigned set and reports changes.
+/// Brings the runtime in line with the assigned set and reports changes. An instance starts once
+/// `disks` has them all; returns whether one still waits.
 pub async fn reconcile<R: Runtime>(
     client: &mut ControlClient<Channel>,
     runtime: &R,
     assigned: &[Instance],
+    disks: impl Fn(&Instance) -> Result<Vec<Disk>, String>,
     reported: &mut Reported,
-) -> Result<(), AgentError> {
+) -> Result<bool, AgentError> {
+    let mut waiting = false;
     let running: BTreeSet<Uuid> = runtime.running().await.into_iter().collect();
     let wanted: BTreeSet<Uuid> = assigned.iter().map(|i| i.metadata.uid).collect();
 
@@ -379,12 +393,18 @@ pub async fn reconcile<R: Runtime>(
         let gen_ = inst.metadata.generation;
         let (phase, message) = match inst.spec.power_state {
             PowerState::Running if running.contains(&uid) => ("running", String::new()),
-            PowerState::Running => match runtime.start(inst).await {
-                Ok(()) => ("running", String::new()),
+            PowerState::Running => match disks(inst) {
                 Err(e) => {
-                    tracing::warn!(%uid, error = %e, "instance failed to start");
-                    ("failed", e)
+                    waiting = true;
+                    ("starting", e)
                 }
+                Ok(d) => match runtime.start(inst, &d).await {
+                    Ok(()) => ("running", String::new()),
+                    Err(e) => {
+                        tracing::warn!(%uid, error = %e, "instance failed to start");
+                        ("failed", e)
+                    }
+                },
             },
             PowerState::Stopped => match runtime.stop(uid).await {
                 Ok(()) => ("stopped", String::new()),
@@ -436,7 +456,7 @@ pub async fn reconcile<R: Runtime>(
             Err(s) => return Err(s.into()),
         }
     }
-    Ok(())
+    Ok(waiting)
 }
 
 /// Longest message the controller accepts.

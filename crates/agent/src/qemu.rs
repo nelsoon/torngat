@@ -12,19 +12,29 @@
 //! - QEMU arguments are built only from validated, bounded fields (uid, vcpus, memory), never from
 //!   tenant strings; QEMU runs with its seccomp sandbox and without default devices or user
 //!   config.
+//! - Disks: QEMU cannot open any device but `/dev/kvm`. It starts paused; the agent opens the
+//!   instance's decrypted volumes and hands QEMU the open files over QMP (`add-fd`), adds them as
+//!   virtio disks (the boot disk first in the boot order), then lets the guest run. An instance
+//!   whose start was interrupted (still paused, e.g. the agent restarted) is stopped and started
+//!   again.
 
+use std::os::fd::AsFd;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
-use torngat_api::compute::{Capability, Instance, Runtime as RuntimeKind};
+use serde_json::json;
+use torngat_api::compute::{Capability, Instance, MAX_DISKS, Runtime as RuntimeKind};
 use uuid::Uuid;
 
-use crate::Runtime;
+use crate::qmp::Qmp;
+use crate::runtime::{Disk, Runtime};
 
 pub const UNIT_PREFIX: &str = "torngat-vm-";
 const STATE_ROOT: &str = "/var/lib/torngat-vm";
 const RUNTIME_ROOT: &str = "/run/torngat-vm";
+/// The agent's own: `<uid>` once that instance's guest was let run.
+const STARTED_ROOT: &str = "/run/torngat-vm-started";
 const SLICE: &str = "torngat-vms.slice";
 
 /// Bound on every QMP exchange.
@@ -76,6 +86,65 @@ pub fn console_log(uid: Uuid) -> String {
 
 fn qmp_socket(uid: Uuid) -> String {
     format!("{RUNTIME_ROOT}/{uid}/qmp.sock")
+}
+
+fn started(uid: Uuid) -> PathBuf {
+    Path::new(STARTED_ROOT).join(uid.to_string())
+}
+
+/// QEMU's names for a volume's disk: block node (at most 31 characters), device, and the serial
+/// number the guest sees (at most 20: `/dev/disk/by-id/virtio-<serial>`).
+fn disk_names(volume: Uuid) -> (String, String, String) {
+    let hex = volume.simple().to_string();
+    (
+        format!("v{}", &hex[..30]),
+        format!("disk-{volume}"),
+        hex[..20].to_owned(),
+    )
+}
+
+/// Hands `disks` to the paused QEMU behind `q`, then lets the guest run.
+fn attach_and_run(q: &mut Qmp, disks: &[Disk]) -> std::io::Result<()> {
+    if disks.len() > DISK_PORTS {
+        return Err(std::io::Error::other("too many disks"));
+    }
+    for (i, d) in disks.iter().enumerate() {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(rustix::fs::OFlags::DIRECT.bits() as i32)
+            .open(&d.path)?;
+        if !file.metadata()?.file_type().is_block_device() {
+            return Err(std::io::Error::other("a disk is not a block device"));
+        }
+        q.execute_with_fd("add-fd", Some(json!({ "fdset-id": i })), file.as_fd())?;
+        let (node, id, serial) = disk_names(d.volume);
+        q.execute(
+            "blockdev-add",
+            Some(json!({
+                "driver": "raw",
+                "node-name": node,
+                "file": {
+                    "driver": "host_device",
+                    "filename": format!("/dev/fdset/{i}"),
+                    "cache": { "direct": true },
+                },
+            })),
+        )?;
+        let mut dev = json!({
+            "driver": "virtio-blk-pci",
+            "bus": disk_port(i),
+            "drive": node,
+            "id": id,
+            "serial": serial,
+        });
+        if d.boot {
+            dev["bootindex"] = json!(0);
+        }
+        q.execute("device_add", Some(dev))?;
+    }
+    q.execute("cont", None)?;
+    Ok(())
 }
 
 /// The unit's settings. Pure function of validated fields, for testing.
@@ -141,10 +210,19 @@ pub fn properties(inst: &Instance) -> Vec<String> {
     ]
 }
 
+/// Disk slots: one per disk an instance can have (its data disks and boot disk), so that disks can
+/// be added to a running guest.
+const DISK_PORTS: usize = MAX_DISKS + 1;
+
+/// The PCIe port of the `i`th disk slot.
+fn disk_port(i: usize) -> String {
+    format!("disk{i}")
+}
+
 /// QEMU command line for an instance. Pure function of validated fields, for testing.
 pub fn args(inst: &Instance) -> Vec<String> {
     let uid = inst.metadata.uid;
-    vec![
+    let mut args: Vec<String> = vec![
         "-name".into(),
         format!("guest={uid},debug-threads=on"),
         "-uuid".into(),
@@ -167,9 +245,22 @@ pub fn args(inst: &Instance) -> Vec<String> {
         "chardev:console".into(),
         "-qmp".into(),
         format!("unix:{},server=on,wait=off", qmp_socket(uid)),
+        // Paused until the agent has given it its disks.
+        "-S".into(),
+        "-boot".into(),
+        "strict=on".into(),
         "-sandbox".into(),
         "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny".into(),
-    ]
+    ];
+    for i in 0..DISK_PORTS {
+        args.push("-device".into());
+        args.push(format!(
+            "pcie-root-port,id={},chassis={}",
+            disk_port(i),
+            i + 1
+        ));
+    }
+    args
 }
 
 /// Effective uid of this process, from /proc (no unsafe code).
@@ -221,42 +312,44 @@ impl QemuRuntime {
         Ok(running_state(&self.show(uid, "ActiveState").await?))
     }
 
-    /// Runs one QMP command (one of our constants, never user input) with a timeout.
+    /// Runs `f` on a QMP session with the instance's QEMU, within `timeout`.
     ///
     /// The socket's directory belongs to the instance's user: a QEMU taken over by its guest could
     /// put another instance's socket there. Nothing is sent unless the other end is this unit's
     /// main process.
-    async fn qmp(&self, uid: Uuid, command: &'static str) -> std::io::Result<()> {
-        let sock = qmp_socket(uid);
+    async fn qmp<T: Send + 'static>(
+        &self,
+        uid: Uuid,
+        timeout: Duration,
+        f: impl FnOnce(&mut Qmp) -> std::io::Result<T> + Send + 'static,
+    ) -> std::io::Result<T> {
         let main: i32 = self
             .show(uid, "MainPID")
             .await
             .map_err(std::io::Error::other)?
             .parse()
             .map_err(|_| std::io::Error::other("no main process"))?;
-        tokio::time::timeout(QMP_TIMEOUT, async move {
-            let s = UnixStream::connect(sock).await?;
-            let peer = s.peer_cred()?;
-            if main <= 0 || peer.pid() != Some(main) || peer.uid() == 0 {
-                return Err(std::io::Error::other(
-                    "the QMP socket is not the instance's own",
-                ));
-            }
-            let (r, mut w) = s.into_split();
-            let mut lines = BufReader::new(r).lines();
-            let _greeting = lines.next_line().await?;
-            w.write_all(b"{\"execute\":\"qmp_capabilities\"}\n").await?;
-            let _ = lines.next_line().await?;
-            w.write_all(format!("{{\"execute\":\"{command}\"}}\n").as_bytes())
-                .await?;
-            let reply = lines.next_line().await?.unwrap_or_default();
-            if reply.contains("\"error\"") {
-                return Err(std::io::Error::other(format!("qmp {command} failed")));
-            }
-            Ok(())
+        let sock = qmp_socket(uid);
+        let session = tokio::task::spawn_blocking(move || {
+            let mut q = Qmp::connect(Path::new(&sock), main, QMP_TIMEOUT)?;
+            f(&mut q)
+        });
+        tokio::time::timeout(timeout, session)
+            .await
+            .map_err(|_| std::io::Error::other("qmp timed out"))?
+            .map_err(std::io::Error::other)?
+    }
+
+    /// QEMU's run state (e.g. `prelaunch` before the guest was let run, `running`).
+    async fn status(&self, uid: Uuid) -> std::io::Result<String> {
+        self.qmp(uid, QMP_TIMEOUT, |q| {
+            let r = q.execute("query-status", None)?;
+            Ok(r.get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned())
         })
         .await
-        .map_err(|_| std::io::Error::other("qmp timed out"))?
     }
 
     async fn wait_gone(&self, uid: Uuid, timeout: Duration) -> Result<bool, String> {
@@ -303,7 +396,7 @@ impl Runtime for QemuRuntime {
         Some(RuntimeKind::Qemu)
     }
 
-    async fn start(&self, inst: &Instance) -> Result<(), String> {
+    async fn start(&self, inst: &Instance, disks: &[Disk]) -> Result<(), String> {
         let uid = inst.metadata.uid;
         if let Some(c) = inst
             .spec
@@ -324,6 +417,7 @@ impl Runtime for QemuRuntime {
         }
         // A unit that failed before is kept until this.
         let _ = self.output(SYSTEMCTL, &["reset-failed", &unit(uid)]).await;
+        let _ = std::fs::remove_file(started(uid));
         let mut run: Vec<String> = vec![
             format!("--unit={}", unit(uid)),
             format!("--slice={SLICE}"),
@@ -342,12 +436,28 @@ impl Runtime for QemuRuntime {
         let run: Vec<&str> = run.iter().map(String::as_str).collect();
         self.output(SYSTEMD_RUN, &run).await?;
 
-        // Running = the unit runs and QEMU answers on QMP (it can still exit after starting, e.g.
-        // when memory or KVM initialisation fails).
+        // QEMU answers on QMP (it can still exit after starting, e.g. when memory or KVM
+        // initialisation fails), then gets its disks and runs the guest.
         let deadline = tokio::time::Instant::now() + START_TIMEOUT;
+        let mut failure = None;
         while tokio::time::Instant::now() < deadline {
-            if self.qmp(uid, "query-status").await.is_ok() {
-                return Ok(());
+            if self.status(uid).await.is_ok() {
+                let disks = disks.to_vec();
+                match self
+                    .qmp(uid, START_TIMEOUT, move |q| attach_and_run(q, &disks))
+                    .await
+                {
+                    Ok(()) => {
+                        std::fs::create_dir_all(STARTED_ROOT)
+                            .and_then(|()| std::fs::write(started(uid), b""))
+                            .map_err(|e| format!("{STARTED_ROOT}: {e}"))?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        failure = Some(e.to_string());
+                        break;
+                    }
+                }
             }
             // The cleanup below also runs when systemctl fails.
             if !matches!(self.is_running(uid).await, Ok(true)) {
@@ -357,10 +467,10 @@ impl Runtime for QemuRuntime {
         }
         // Do not leave a half-started VM behind.
         let _ = self.stop_unit(uid).await;
-        Err(format!(
-            "qemu failed to start: {}",
-            self.log_tail(uid).await
-        ))
+        Err(match failure {
+            Some(e) => format!("cannot give the instance its disks: {e}"),
+            None => format!("qemu failed to start: {}", self.log_tail(uid).await),
+        })
     }
 
     async fn stop(&self, uid: Uuid) -> Result<(), String> {
@@ -368,7 +478,9 @@ impl Runtime for QemuRuntime {
             return Ok(());
         }
         // Ask the guest, then systemd (which waits until it is stopped).
-        let _ = self.qmp(uid, "system_powerdown").await;
+        let _ = self
+            .qmp(uid, QMP_TIMEOUT, |q| q.execute("system_powerdown", None))
+            .await;
         if self.wait_gone(uid, self.cfg.stop_timeout).await? {
             return Ok(());
         }
@@ -402,7 +514,45 @@ impl Runtime for QemuRuntime {
                 return vec![];
             }
         };
-        parse_units(&out)
+        let units = parse_units(&out);
+        let mut running = Vec::with_capacity(units.len());
+        for uid in units {
+            if started(uid).exists() {
+                running.push(uid);
+                continue;
+            }
+            match self.status(uid).await.as_deref() {
+                // Its start was interrupted: it never ran, so it is started again.
+                Ok("prelaunch") => {
+                    tracing::warn!(%uid, "instance left paused before it ran: stopping it");
+                    if let Err(e) = self.stop_unit(uid).await {
+                        tracing::warn!(%uid, error = %e, "cannot stop it");
+                        running.push(uid);
+                    }
+                }
+                Ok(_) => {
+                    let _ = std::fs::create_dir_all(STARTED_ROOT)
+                        .and_then(|()| std::fs::write(started(uid), b""));
+                    running.push(uid);
+                }
+                // Not answering (yet): looked at again next time.
+                Err(_) => running.push(uid),
+            }
+        }
+        // Markers of instances that are gone.
+        if let Ok(dir) = std::fs::read_dir(STARTED_ROOT) {
+            for e in dir.flatten() {
+                let gone = e
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| Uuid::parse_str(n).ok())
+                    .is_none_or(|u| !running.contains(&u));
+                if gone {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        running
     }
 }
 
@@ -515,7 +665,7 @@ mod tests {
     async fn refuses_unsupported_capabilities() {
         let r = QemuRuntime::new(QemuConfig::default());
         let e = r
-            .start(&inst("vm-gpu", 1, 128, &[Capability::Gpu]))
+            .start(&inst("vm-gpu", 1, 128, &[Capability::Gpu]), &[])
             .await
             .unwrap_err();
         assert!(e.contains("not available"), "{e}");
