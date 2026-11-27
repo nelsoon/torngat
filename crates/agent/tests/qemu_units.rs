@@ -268,7 +268,12 @@ async fn instances_boot_from_their_disks() {
     );
     // Its UEFI variables are its own, kept across restarts.
     let vars = format!("/var/lib/private/torngat-vm/{ua}/uefi-vars.fd");
-    assert_eq!(std::fs::metadata(&vars).unwrap().len(), 540672, "{vars}");
+    let size = std::fs::metadata(&vars).map(|m| m.len()).ok();
+    assert_eq!(
+        size,
+        Some(540672),
+        "UEFI variables missing or of the wrong size"
+    );
     let pid = show(ua, "MainPID");
     let open = open_in(&pid);
     for d in [&boot.0, &data.0] {
