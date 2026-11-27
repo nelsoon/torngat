@@ -36,6 +36,7 @@ torngat-proto = { path = "../proto" }
 torngat-store = { path = "../store" }
 
 [dev-dependencies]
+futures = "0.3"
 axum = { version = "0.8", default-features = false }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }

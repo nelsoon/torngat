@@ -18,6 +18,10 @@ service Control {
   // Key of a volume that is on the caller. The node keeps it in memory only, and asks again after a
   // reboot. Made at the first call.
   rpc GetVolumeKey(VolumeKeyRequest) returns (VolumeKeyResponse);
+  // What the node found in one of its storage pools.
+  rpc ReportPool(PoolReport) returns (ReportResponse);
+  // What the node did with a volume on one of its pools.
+  rpc ReportVolume(VolumeReport) returns (ReportResponse);
 }
 
 message RegisterRequest {
@@ -35,6 +39,12 @@ message AssignmentSet {
   string api_version = 1;
   // JSON of torngat_api::compute::Instance, one per assigned instance.
   repeated bytes instances_json = 2;
+  // JSON of torngat_api::storage::StoragePool: the caller's pools, deleted ones until released.
+  repeated bytes pools_json = 3;
+  // JSON of torngat_api::storage::Volume: placed, ready and deleting volumes on those pools.
+  repeated bytes volumes_json = 4;
+  // The controller could not read storage objects: ignore both lists, they are empty.
+  bool storage_unavailable = 5;
 }
 
 message InstanceReport {
@@ -51,6 +61,35 @@ message InstanceReport {
   string message = 8;
 }
 message ReportResponse {}
+
+message PoolReport {
+  string name = 1;
+  // The pool's metadata.uid.
+  string uid = 2;
+  bool ready = 3;
+  uint64 capacity_bytes = 4;
+  // A power of two, at most 1 GiB.
+  uint64 allocation_unit_bytes = 5;
+  bool snapshots = 6;
+  bool checksums = 7;
+  string message = 8;
+  // The mark is removed: only for a pool being deleted.
+  bool released = 9;
+}
+
+message VolumeReport {
+  string org = 1;
+  string project = 2;
+  string name = 3;
+  string uid = 4;
+  // Exists on the node, encrypted and usable.
+  bool created = 5;
+  // What the instance can see.
+  uint64 size_bytes = 6;
+  // Its blocks are gone: only for a volume being deleted.
+  bool deleted = 7;
+  string message = 8;
+}
 
 message VolumeKeyRequest {
   string org = 1;

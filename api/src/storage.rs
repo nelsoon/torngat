@@ -188,7 +188,7 @@ impl VolumeTypeSpec {
             return Err(StorageError::Pools);
         }
         if self.description.len() > MAX_DESCRIPTION_LEN
-            || self.description.chars().any(char::is_control)
+            || self.description.chars().any(crate::is_hidden)
         {
             return Err(StorageError::Description);
         }

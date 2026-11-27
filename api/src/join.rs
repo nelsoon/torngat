@@ -40,7 +40,7 @@ impl CreateJoinTokenRequest {
             ));
         }
         if self.description.len() > MAX_DESCRIPTION
-            || self.description.chars().any(char::is_control)
+            || self.description.chars().any(crate::is_hidden)
         {
             return Err(format!(
                 "description must be at most {MAX_DESCRIPTION} bytes without control characters"

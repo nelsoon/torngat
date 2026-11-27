@@ -2846,6 +2846,7 @@ name = "torngat-controller"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "futures",
  "http-body-util",
  "pem",
  "rcgen",

@@ -108,7 +108,7 @@ impl ObjectMeta {
             if !key_ok {
                 return Err(MetaError::BadLabelKey(k.clone()));
             }
-            if v.len() > MAX_LABEL_VALUE_LEN || v.chars().any(char::is_control) {
+            if v.len() > MAX_LABEL_VALUE_LEN || v.chars().any(crate::is_hidden) {
                 return Err(MetaError::BadLabelValue(k.clone()));
             }
         }

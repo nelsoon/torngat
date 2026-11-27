@@ -398,7 +398,7 @@ const MAX_MESSAGE: usize = 1024;
 pub fn sanitize(m: &str) -> String {
     let mut out = String::new();
     for c in m.chars() {
-        let c = if c.is_control() { ' ' } else { c };
+        let c = if torngat_api::is_hidden(c) { ' ' } else { c };
         if out.len() + c.len_utf8() > MAX_MESSAGE {
             break;
         }

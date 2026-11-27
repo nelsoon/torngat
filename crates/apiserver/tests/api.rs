@@ -683,12 +683,10 @@ async fn storage_pools() {
         call(&e.app, "DELETE", &one, None, true).await.0,
         StatusCode::OK
     );
-    assert_eq!(
-        call(&e.app, "GET", &one, None, true).await.0,
-        StatusCode::NOT_FOUND
-    );
-    let (_, v) = call(&e.app, "GET", POOLS, None, true).await;
-    assert_eq!(v["items"].as_array().unwrap().len(), 2);
+    // The controller removes it (crates/controller/tests/storage.rs).
+    let (status, v) = call(&e.app, "GET", &one, None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(v["metadata"]["delete_time"].is_string());
     e.store.shutdown().await.unwrap();
 }
 

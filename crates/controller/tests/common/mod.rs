@@ -24,6 +24,11 @@ pub struct Env {
 
 /// A cluster trusting `tpm_anchors` for TPM endorsement certificates, with the given policy.
 pub async fn env(tpm_anchors: Vec<Vec<u8>>, tpm_required: bool) -> Env {
+    env_with(tpm_anchors, tpm_required, true).await
+}
+
+/// Without the controller's background passes if `passes` is false: for tests that set states by hand.
+pub async fn env_with(tpm_anchors: Vec<Vec<u8>>, tpm_required: bool, passes: bool) -> Env {
     let dir = TempDir::new().unwrap();
     let net = TestNet::default();
     let store = Store::open(dir.path(), 1, default_config(), net.factory(1))
@@ -63,7 +68,9 @@ pub async fn env(tpm_anchors: Vec<Vec<u8>>, tpm_required: bool) -> Env {
         tls.cert_pem,
         tls.key_pem,
     ));
-    tokio::spawn(ctl.run_scheduler(Duration::from_millis(100)));
+    if passes {
+        tokio::spawn(ctl.run_scheduler(Duration::from_millis(100)));
+    }
     Env {
         store,
         ca,

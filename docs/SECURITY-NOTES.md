@@ -28,22 +28,25 @@ Items found in reviews that a later chunk must enforce.
   - Before volumes are opened on a host: a udev rule so that their content is not probed.
   - Volume status has the pool's name, for operators: hide it from tenants when IAM comes.
   - A volume type or pool name in a stored object may no longer exist, or be another one: compare the uid.
-  - Placement order: pool and `granted_bytes` in the volume's status, then the reservation, then `Placed`; without space both are cleared again. Growth order: the reservation, then `granted_bytes`. Deletion order: blocks, reservation (the pool is always written), then the object. Sweep reservations of volumes that are gone. Before reserving, check the pool's uid and that it is not being deleted.
-  - Before a pool is finally removed, check again that no volume type lists it.
+  - Placement order (`crates/controller/src/storage.rs`): pool and `granted_bytes` in the volume's status, then the reservation, then `Placed`; without space both are cleared again. Growth order: the reservation, then `granted_bytes`. Deletion order: blocks, reservation (the pool is always written), the key's tombstone, then the object. The sweep reads a pool before the volumes, so that it never releases a reservation being made. Before reserving, check the pool's uid and that it is not being deleted.
+  - A volume whose node is lost cannot be deleted, nor its pool: forced removal comes with node removal.
+  - Each agent's assignment stream reads every instance, pool and volume twice a second: one stream per node (a newer one ends the older), at most 32 streams per connection.  If storage objects cannot be read, instances keep flowing and the node is told to ignore the storage lists. An index by node before large clusters.
+  - A node releases a pool only once no volume names it and nothing is reserved; it cannot change a pool's allocation unit while it holds volumes; its messages may not hold control, invisible or direction characters (`torngat_api::is_hidden`).
+  - A growth that is taken back before it is granted leaves the larger reservation until the volume is deleted.
+  - A pool is only removed by the controller, after its node released it, once no volume type lists it and no volume names it.
   - Volume keys (`crates/controller/src/volume_keys.rs`): never made again for a formatted volume or a destroyed uid (tombstone). Tombstones are never removed.
-  - Racing creates with one request id can briefly bring a uid back, before its tombstone: whoever removes a placed volume's object writes the tombstone first, even if there was no key. The undo in `create_volume` must be retried, and placement must refuse a uid with a tombstone.
+  - Racing creates with one request id can briefly bring a uid back: the object of a placed volume goes only after its tombstone, the undo in `create_volume` is retried, and placement refuses a uid with a tombstone.
   - Keys are given by the pool's node, which is enough for local storage. Shared storage must also check that the instance in `attached_to` runs on the caller.
-  - A node that never reports `formatted` gets keys without an attached instance: the controller should set it when it gives the key for formatting.
   - Node removal must delete the identity before the node's record, or registering makes the record again as active. Needed before real data: a stolen node cannot be cut off yet.
   - Core dumps are off for the `torngatd` service only, not when it is run by hand.
   - After a restore, nodes have volumes that the store does not know: the agent must never delete a volume because it is unknown, only when told to.
   - Restoring brings back revoked nodes and destroyed keys, and stops instances made since. Etags start again, so an old one can match by chance. A list of revoked nodes outside the store, and instances that are adopted rather than stopped: later.
   - Backups (`crates/keys/src/recovery.rs`) can only be read with the recovery code, and only be made by the cluster. An old backup is not refused: the operator checks its date.
   - The agent keeps received keys in memory that is erased, and never logs them.
-  - Set `formatted` before the first write to a volume, and never clear it: it decides whether a missing key may be made.
+  - A volume's key goes only to the node of its pool while an instance uses it (`attached_to`), the first time too. The controller then sets `formatted`, and nothing clears it: from then on a missing key is never made.
   - Project keys are named by the project's path: when projects become objects, destroy the key with the project, so that a project made later under the same name does not get it.
-  - Every controller needs the platform key file: before multi-controller. Rotation of project and platform keys: not yet.
-  - A device is formatted only if the volume was never formatted and its header area is blank.
+  - Every controller needs the platform key file: promotion copies it, with the CA key, over mTLS and only to an attested node. Before multi-controller. Rotation of project and platform keys: not yet.
+  - A node formats a device only if its header area is blank (a format that was cut leaves it blank), never one with a header that it cannot open.
   - Volumes and request id records have no limit per project, and the records never expire: before tenants get access.
   - An older version that changes an object drops fields that it does not know: before rolling upgrades.
 - **CI:** third-party actions are pinned to commit SHAs; keep them pinned when updating.

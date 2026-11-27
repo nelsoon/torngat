@@ -16,6 +16,7 @@ pub mod keys;
 mod ops;
 mod scheduler;
 mod service;
+pub mod storage;
 pub mod volume_keys;
 
 use std::collections::HashMap;
@@ -80,6 +81,9 @@ impl Controller {
             if let Err(e) = schedule_once(&self).await {
                 tracing::warn!(error = %e, "scheduling pass failed");
             }
+            if let Err(e) = storage::storage_once(&self).await {
+                tracing::warn!(error = %e, "storage pass failed");
+            }
             if let Err(e) = complete_operations_once(&self).await {
                 tracing::warn!(error = %e, "operation pass failed");
             }
@@ -126,6 +130,8 @@ pub async fn serve(
         .client_ca_root(Certificate::from_pem(tls.client_ca_pem));
     Server::builder()
         .tls_config(tls)?
+        // Per connection; a node has one assignment stream at a time.
+        .max_concurrent_streams(32)
         .add_service(torngat_proto::v1::control_server::ControlServer::new(
             ControlService::new(ctl),
         ))

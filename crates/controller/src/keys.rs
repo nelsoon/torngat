@@ -86,3 +86,20 @@ pub fn volume_key(uid: Uuid) -> Result<Key, KeyError> {
 pub fn volume_keys() -> Result<Prefix, KeyError> {
     Prefix::new("keys", ["volumes"])
 }
+
+pub fn storage_pools() -> Result<Prefix, KeyError> {
+    Prefix::new("platform", ["storagepools"])
+}
+
+pub fn volume_type(name: &Name) -> Result<Key, KeyError> {
+    Key::new("platform", ["volumetypes", name.as_str()])
+}
+
+pub fn volume_types() -> Result<Prefix, KeyError> {
+    Prefix::new("platform", ["volumetypes"])
+}
+
+/// Every volume in every project.
+pub fn all_volumes() -> Result<Prefix, KeyError> {
+    Prefix::new("storage", ["orgs"])
+}
