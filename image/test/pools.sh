@@ -72,10 +72,18 @@ mmd -i "$esp" ::/EFI ::/EFI/BOOT
 mcopy -i "$esp" /usr/lib/systemd/boot/efi/systemd-bootx64.efi ::/EFI/BOOT/BOOTX64.EFI
 guest "dd of=/dev/mapper/torngat-vol-$vuid bs=1M conv=notrunc,fsync status=none" <"$esp"
 opened || fail "the boot disk was closed"
+log=/var/lib/torngat-vm/$iuid/console.log
+# Only what this start writes counts.
+before=$(guest "stat -c %s $log 2>/dev/null || echo 0")
 power running
+until_true "running again" 60 phase_is running
 # The firmware starts the loader from the disk (a PCI device).
-booted() { guest grep -aq 'BdsDxe: starting Boot0001.*PciRoot' "/var/lib/torngat-vm/$iuid/console.log" 2>/dev/null; }
-until_true "boots from its disk" 60 booted
+booted() { guest "tail -c +$((before + 1)) $log | grep -aq 'BdsDxe: starting Boot0001.*PciRoot'"; }
+for _ in $(seq 60); do booted && break; sleep 1; done
+booted || {
+  guest "tail -c +$((before + 1)) $log" | tr -c '[:print:]\n' ' ' | grep -a BdsDxe >&2
+  fail "did not boot from its disk"
+}
 [ "$(vm | jq -r .status.phase)" = running ] || fail "instance: $(vm | jq -c .status)"
 echo "ok: booted from its encrypted boot disk"
 # Added while it runs: QEMU gets it without a restart.
