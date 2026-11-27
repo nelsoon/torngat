@@ -278,7 +278,8 @@ pub struct VolumeStatus {
     /// Size that the instance sees. Smaller than the spec until a resize is done.
     #[serde(default)]
     pub size_bytes: u64,
-    /// The device was formatted once: it is never formatted again, whatever is found on it.
+    /// The node formatted the device (it reports it): it is never formatted again, whatever is
+    /// found on it.
     #[serde(default)]
     pub formatted: bool,
     /// uid of the one instance that uses it, set with compare-and-swap.

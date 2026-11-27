@@ -49,8 +49,8 @@ fn object(
     })
 }
 
-/// An enrolled and registered node, and its connection.
-async fn node(e: &Env, name: &str, phase: &str) -> Client {
+/// An enrolled and registered node's credentials.
+async fn node_cfg(e: &Env, name: &str, phase: &str) -> AgentConfig {
     let issued = e.ca.issue_node(&n(name)).unwrap();
     torngat_controller::identity::enroll(
         &e.store,
@@ -60,15 +60,20 @@ async fn node(e: &Env, name: &str, phase: &str) -> Client {
     .await
     .unwrap();
     set_phase(e, name, phase).await;
-    torngat_agent::connect(&AgentConfig {
+    AgentConfig {
         controller_url: format!("https://{}", e.control),
         controller_name: torngat_pki::CONTROLLER_NAME.into(),
         ca_pem: e.ca.cert_pem().as_bytes().to_vec(),
         cert_pem: issued.chain_pem.into_bytes(),
         key: NodeKey::File(issued.key_pem.unwrap().into_bytes()),
-    })
-    .await
-    .unwrap()
+    }
+}
+
+/// An enrolled and registered node, and its connection.
+async fn node(e: &Env, name: &str, phase: &str) -> Client {
+    torngat_agent::connect(&node_cfg(e, name, phase).await)
+        .await
+        .unwrap()
 }
 
 async fn set_phase(e: &Env, name: &str, phase: &str) {
@@ -218,8 +223,7 @@ async fn states() {
     save(&e, &scope(), &v).await;
     assert_eq!(key(&mut n1, &v).await, Err(Code::Internal));
 
-    // Only while an instance uses it, also the first time; the controller records that the node
-    // may format it.
+    // Only while an instance uses it, also the first time; the node reports when it formatted it.
     v.status.formatted = false;
     v.status.attached_to = None;
     save(&e, &scope(), &v).await;
@@ -236,7 +240,7 @@ async fn states() {
             serde_json::from_slice::<Volume>(&v.value).unwrap()
         }
     };
-    assert!(stored(&e).await.status.formatted);
+    assert!(!stored(&e).await.status.formatted);
     v.status.formatted = true;
     save(&e, &scope(), &v).await;
     assert_eq!(key(&mut n1, &v).await, k);
@@ -385,7 +389,8 @@ async fn volume_now(e: &Env, name: &str) -> Option<Volume> {
 
 /// Until `f` holds; the controller's passes run every 100 ms.
 async fn until<F: Future<Output = bool>>(what: &str, mut f: impl FnMut() -> F) {
-    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // The agent also retries every 10 s.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(25);
     while !f().await {
         assert!(std::time::Instant::now() < end, "never: {what}");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -781,6 +786,7 @@ async fn interrupted_placement_growth_and_deletion() {
         size_bytes: size,
         deleted,
         message: String::new(),
+        formatted: false,
     };
     let code = |r: Result<tonic::Response<_>, tonic::Status>| r.map(|_| ()).map_err(|s| s.code());
     assert_eq!(
@@ -832,4 +838,168 @@ async fn interrupted_placement_growth_and_deletion() {
         Err(Code::PermissionDenied)
     );
     e.store.shutdown().await.unwrap();
+}
+
+/// Changes an object with compare-and-swap.
+async fn change<T: Serialize + serde::de::DeserializeOwned>(e: &Env, key: Key, f: impl Fn(&mut T)) {
+    loop {
+        let v = e.store.get(&key).await.unwrap().unwrap();
+        let mut o: T = serde_json::from_slice(&v.value).unwrap();
+        f(&mut o);
+        let r = e
+            .store
+            .put(
+                key.clone(),
+                serde_json::to_vec(&o).unwrap(),
+                Precondition::Revision(v.revision),
+            )
+            .await;
+        match r {
+            Ok(_) => return,
+            Err(torngat_store::StoreError::PreconditionFailed { .. }) => continue,
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
+async fn change_volume(e: &Env, name: &str, f: impl Fn(&mut Volume)) {
+    change(e, keys::volume(&scope(), &n(name)).unwrap(), f).await;
+}
+
+/// An instance placed on `node`.
+async fn instance(e: &Env, name: &str, node: &str) -> Uuid {
+    let o = object(
+        name,
+        &scope(),
+        json!({"vcpus": 1, "memory_mib": 256}),
+        json!({"phase": "scheduled", "node": node}),
+    );
+    put(&e.store, keys::instance(&scope(), &n(name)).unwrap(), &o).await;
+    serde_json::from_value(o["metadata"]["uid"].clone()).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_agent_looks_after_its_storage() {
+    use torngat_agent::storage::{FakeCrypt, FileDriver, mapping};
+    let e = env(Vec::new(), false).await;
+    let root = tempfile::TempDir::new().unwrap();
+    let dir = root.path().join("data");
+    std::fs::create_dir(&dir).unwrap();
+    let crypt = FakeCrypt::default();
+    tokio::spawn(torngat_agent::run(
+        node_cfg(&e, "n1", "active").await,
+        torngat_agent::FakeRuntime::default(),
+        FileDriver::new(root.path(), 8 * GIB, false),
+        crypt.clone(),
+    ));
+
+    // Claimed and marked as this cluster's pool.
+    let p = pool(&e, "data", "n1").await;
+    until("pool ready", || async {
+        let s = pool_now(&e, "data").await.unwrap().status;
+        s.ready && s.capacity_bytes == 8 * GIB && s.allocation_unit_bytes == 4 << 20
+    })
+    .await;
+    let mark = std::fs::read_to_string(dir.join(".torngat-pool")).unwrap();
+    assert!(mark.contains(&p.metadata.uid.to_string()));
+
+    // Something the platform does not know is shown and left alone.
+    let stray = dir.join(format!("{}.img", Uuid::now_v7()));
+    std::fs::write(&stray, b"not ours").unwrap();
+    until("stray volume shown", || async {
+        let m = pool_now(&e, "data").await.unwrap().status.message;
+        m.is_some_and(|m| m.contains("does not know"))
+    })
+    .await;
+
+    // Created on the node; not opened while no instance uses it.
+    volume_type(&e, "fast", &["data"]).await;
+    let v = pending(&e, "v1", 1).await;
+    let uid = v.metadata.uid;
+    place(&e, &v, Some("n1")).await.unwrap();
+    let file = dir.join(format!("{uid}.img"));
+    until("volume ready", || async {
+        let s = volume_now(&e, "v1").await.unwrap().status;
+        s.phase == VolumePhase::Ready && s.size_bytes == GIB
+    })
+    .await;
+    assert!(std::fs::metadata(&file).unwrap().len() >= GIB + (16 << 20));
+    assert!(crypt.state().open.is_empty() && crypt.state().formatted.is_empty());
+
+    // Used by an instance on this node: formatted once, then opened.
+    let i1 = instance(&e, "i1", "n1").await;
+    change_volume(&e, "v1", |v| v.status.attached_to = Some(i1)).await;
+    until("opened", || async {
+        crypt.state().open.contains_key(&mapping(uid))
+    })
+    .await;
+    assert!(crypt.state().formatted.contains_key(&file));
+    until("formatted reported", || async {
+        volume_now(&e, "v1").await.unwrap().status.formatted
+    })
+    .await;
+
+    // Grown while open.
+    change_volume(&e, "v1", |v| v.spec.size_gib = 2).await;
+    until("grown", || async {
+        volume_now(&e, "v1").await.unwrap().status.size_bytes == 2 * GIB
+    })
+    .await;
+    assert!(std::fs::metadata(&file).unwrap().len() >= 2 * GIB + (16 << 20));
+
+    // Closed when no longer used, and when left open by an agent that stopped.
+    let other = mapping(Uuid::now_v7());
+    crypt.state().open.insert(other.clone(), file.clone());
+    change_volume(&e, "v1", |v| v.status.attached_to = None).await;
+    until("closed", || async { crypt.state().open.is_empty() }).await;
+
+    // A header that is gone is not made again.
+    let key = crypt.state().formatted.remove(&file).unwrap();
+    change_volume(&e, "v1", |v| v.status.attached_to = Some(i1)).await;
+    until("refused to format again", || async {
+        let m = volume_now(&e, "v1").await.unwrap().status.message;
+        m.is_some_and(|m| m.contains("not formatted again"))
+    })
+    .await;
+    assert!(crypt.state().open.is_empty());
+    crypt.state().formatted.insert(file.clone(), key);
+
+    // Deleted: blocks, then the object; the stray file stays.
+    change_volume(&e, "v1", |v| {
+        v.status.attached_to = None;
+        v.status.phase = VolumePhase::Deleting;
+        v.metadata.delete_time = Some(time::OffsetDateTime::now_utc());
+    })
+    .await;
+    until("volume gone", || async {
+        volume_now(&e, "v1").await.is_none()
+    })
+    .await;
+    assert!(!file.exists());
+    assert!(stray.exists());
+
+    // The pool is released once only the stray file is left and that is removed.
+    e.store
+        .delete(keys::volume_type(&n("fast")).unwrap(), Precondition::None)
+        .await
+        .unwrap();
+    change(
+        &e,
+        keys::storage_pool(&n("data")).unwrap(),
+        |p: &mut StoragePool| {
+            p.metadata.delete_time = Some(time::OffsetDateTime::now_utc());
+        },
+    )
+    .await;
+    until("release refused", || async {
+        let m = pool_now(&e, "data").await.unwrap().status.message;
+        m.is_some_and(|m| m.contains("holds volumes"))
+    })
+    .await;
+    std::fs::remove_file(&stray).unwrap();
+    until("pool gone", || async {
+        pool_now(&e, "data").await.is_none()
+    })
+    .await;
+    assert!(!dir.join(".torngat-pool").exists());
 }

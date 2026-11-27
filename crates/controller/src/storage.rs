@@ -589,6 +589,8 @@ pub(crate) struct VolumeState {
     pub size_bytes: u64,
     /// Its blocks are gone (only for a volume being deleted).
     pub deleted: bool,
+    /// Formatted on the node: never cleared.
+    pub formatted: bool,
     pub message: Option<String>,
 }
 
@@ -656,6 +658,7 @@ pub(crate) async fn report_volume(
         if r.created && new.phase == VolumePhase::Placed {
             new.phase = VolumePhase::Ready;
         }
+        new.formatted |= r.formatted;
         // Never more than was granted.
         new.size_bytes = r.size_bytes.min(new.granted_bytes);
         new.message = r.message.clone();

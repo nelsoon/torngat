@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use torngat_agent::storage::Cryptsetup;
 use torngat_api::Name;
 use torngat_pki::{Ca, JoinToken, TpmPolicy};
 
@@ -138,6 +139,13 @@ enum Cmd {
         /// Join endpoint for new nodes (controller node only).
         #[arg(long, default_value_t = SocketAddr::from(([0, 0, 0, 0], JOIN_PORT)))]
         join: SocketAddr,
+        /// Tests only: every pool is a directory under DIR, volumes are files in it attached as
+        /// loop devices, whatever the pool's driver. Nothing keeps the file system from filling up.
+        #[arg(long, value_name = "DIR")]
+        fake_storage: Option<PathBuf>,
+        /// Room for volumes in each pool of --fake-storage.
+        #[arg(long, default_value_t = 64, requires = "fake_storage")]
+        fake_storage_gib: u64,
     },
 }
 
@@ -561,12 +569,25 @@ fn tpm_anchors(dir: &Path) -> Res<Vec<Vec<u8>>> {
     Ok(out)
 }
 
+/// Where volumes are kept: `--fake-storage`, or nowhere yet (the LVM driver comes later).
+fn storage_driver(fake: Option<PathBuf>, gib: u64) -> torngat_agent::storage::AnyDriver {
+    use torngat_agent::storage::{AnyDriver, FileDriver, NoDriver};
+    match fake {
+        Some(dir) => {
+            tracing::warn!(dir = %dir.display(), "fake storage: for tests only");
+            AnyDriver::Files(FileDriver::new(dir, gib.saturating_mul(1 << 30), true))
+        }
+        None => AnyDriver::None(NoDriver),
+    }
+}
+
 async fn run(
     data: PathBuf,
     qemu_user: Option<String>,
     api: SocketAddr,
     control: SocketAddr,
     join_addr: SocketAddr,
+    driver: torngat_agent::storage::AnyDriver,
 ) -> Res<()> {
     let cfg: NodeConfig = serde_json::from_slice(
         &std::fs::read(data.join("node.json"))
@@ -608,7 +629,9 @@ async fn run(
     if cfg.role == Role::Agent {
         tracing::info!(node = %cfg.name, "torngatd running (agent)");
         tokio::select! {
-            () = torngat_agent::run(agent_cfg, runtime) => return Err("agent stopped".into()),
+            () = torngat_agent::run(agent_cfg, runtime, driver, Cryptsetup) => {
+                return Err("agent stopped".into());
+            }
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("shutting down");
                 return Ok(());
@@ -651,7 +674,7 @@ async fn run(
         tls.key_pem.clone(),
     ));
     let scheduler = tokio::spawn(ctl.run_scheduler(Duration::from_millis(500)));
-    let agent = tokio::spawn(torngat_agent::run(agent_cfg, runtime));
+    let agent = tokio::spawn(torngat_agent::run(agent_cfg, runtime, driver, Cryptsetup));
     let state = torngat_apiserver::AppState {
         store: store.clone(),
         token,
@@ -772,6 +795,11 @@ async fn main_async() -> Res<()> {
             api,
             control,
             join,
-        } => run(data, qemu_user, api, control, join).await,
+            fake_storage,
+            fake_storage_gib,
+        } => {
+            let driver = storage_driver(fake_storage, fake_storage_gib);
+            run(data, qemu_user, api, control, join, driver).await
+        }
     }
 }

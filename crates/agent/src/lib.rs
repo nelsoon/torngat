@@ -10,6 +10,7 @@ pub mod inventory;
 pub mod join;
 pub mod qemu;
 pub mod runtime;
+pub mod storage;
 #[cfg(feature = "tpm")]
 pub mod tpm;
 
@@ -25,8 +26,24 @@ use torngat_proto::v1::*;
 use uuid::Uuid;
 
 pub use runtime::{FakeRuntime, Runtime};
+pub use storage::Storage;
+use storage::{Crypt, Driver};
 
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(2);
+/// Storage steps that failed or wait are tried again this often, also without a change.
+pub const STORAGE_RETRY: Duration = Duration::from_secs(10);
+
+/// The cluster's uid, which marks its pools: from the CA certificate (the first in `ca_pem`), the
+/// same for every node and across restores.
+pub fn cluster_uid(ca_pem: &[u8]) -> Result<Uuid, AgentError> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+    let ca = CertificateDer::pem_slice_iter(ca_pem)
+        .next()
+        .ok_or_else(|| tls_err("no CA certificate"))?
+        .map_err(tls_err)?;
+    Ok(Uuid::new_v5(&Uuid::NAMESPACE_OID, ca.as_ref()))
+}
 
 /// Runs slow synchronous work (TPM operations) so the runtime can move other tasks, such as
 /// heartbeats, to other workers meanwhile. Inline on a single-threaded runtime.
@@ -232,8 +249,14 @@ pub async fn connect(cfg: &AgentConfig) -> Result<ControlClient<Channel>, AgentE
 }
 
 /// Runs the agent forever, reconnecting on errors.
-pub async fn run<R: Runtime>(cfg: AgentConfig, runtime: R) {
-    let connector = match Connector::new(&cfg) {
+pub async fn run<R: Runtime, D: Driver, C: Crypt>(
+    cfg: AgentConfig,
+    runtime: R,
+    driver: D,
+    crypt: C,
+) {
+    let setup = Connector::new(&cfg).and_then(|c| Ok((c, cluster_uid(&cfg.ca_pem)?)));
+    let (connector, cluster) = match setup {
         Ok(c) => c,
         Err(e) => {
             // Bad local credentials: retrying cannot help.
@@ -241,11 +264,12 @@ pub async fn run<R: Runtime>(cfg: AgentConfig, runtime: R) {
             return;
         }
     };
+    let mut storage = Storage::new(driver, crypt, cluster);
     const MIN: Duration = Duration::from_millis(200);
     let mut backoff = MIN;
     loop {
         let started = std::time::Instant::now();
-        if let Err(e) = session(&connector, &runtime).await {
+        if let Err(e) = session(&connector, &runtime, &mut storage).await {
             tracing::warn!(error = %e, "controller session ended");
         }
         // A session that ran for a while was healthy: start backing off from scratch.
@@ -261,7 +285,12 @@ pub async fn run<R: Runtime>(cfg: AgentConfig, runtime: R) {
 type Reported = BTreeMap<Uuid, (String, u64)>;
 
 /// One connected session: register, heartbeat, follow assignments.
-pub async fn session<R: Runtime>(connector: &Connector, runtime: &R) -> Result<(), AgentError> {
+pub async fn session<R: Runtime, D: Driver, C: Crypt>(
+    connector: &Connector,
+    runtime: &R,
+    storage: &mut Storage<D, C>,
+) -> Result<(), AgentError> {
+    storage.new_session();
     let mut client = connector.connect().await?;
     let status = inventory::collect(env!("CARGO_PKG_VERSION"));
     client
@@ -287,21 +316,40 @@ pub async fn session<R: Runtime>(connector: &Connector, runtime: &R) -> Result<(
         .await?
         .into_inner();
     let mut reported = Reported::new();
+    let mut retry =
+        tokio::time::interval_at(tokio::time::Instant::now() + STORAGE_RETRY, STORAGE_RETRY);
+    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // What the controller last assigned to storage.
+    let mut assigned: Option<storage::Assigned> = None;
     let result = async {
-        while let Some(set) = stream.message().await? {
-            if set.api_version != API_VERSION {
-                return Err(tonic::Status::failed_precondition("api_version mismatch").into());
+        loop {
+            tokio::select! {
+                set = stream.message() => {
+                    let Some(set) = set? else { return Ok(()) };
+                    if set.api_version != API_VERSION {
+                        return Err(tonic::Status::failed_precondition("api_version mismatch").into());
+                    }
+                    // An undecodable entry (e.g. a newer controller) must not look "unassigned", or
+                    // its workload would be stopped: give up on this session instead.
+                    let instances = set
+                        .instances_json
+                        .iter()
+                        .map(|b| serde_json::from_slice::<Instance>(b))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    reconcile(&mut client, runtime, &instances, &mut reported).await?;
+                    assigned = storage::Assigned::decode(
+                        &set.pools_json,
+                        &set.volumes_json,
+                        set.storage_unavailable,
+                        instances.iter().map(|i| i.metadata.uid).collect(),
+                    );
+                }
+                _ = retry.tick(), if assigned.is_some() => {}
             }
-            // An undecodable entry (e.g. a newer controller) must not look "unassigned", or its
-            // workload would be stopped: give up on this session instead.
-            let instances = set
-                .instances_json
-                .iter()
-                .map(|b| serde_json::from_slice::<Instance>(b))
-                .collect::<Result<Vec<_>, _>>()?;
-            reconcile(&mut client, runtime, &instances, &mut reported).await?;
+            if let Some(a) = &assigned {
+                storage.reconcile(&mut client, a).await?;
+            }
         }
-        Ok(())
     }
     .await;
     heartbeat.abort();

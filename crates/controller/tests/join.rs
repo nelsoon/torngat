@@ -58,6 +58,8 @@ async fn join_then_run_as_an_enrolled_node() {
             key: NodeKey::File(key.into_bytes()),
         },
         FakeRuntime::default(),
+        torngat_agent::storage::NoDriver,
+        torngat_agent::storage::FakeCrypt::default(),
     ));
     e.wait_active("n2").await;
 
