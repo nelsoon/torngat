@@ -20,6 +20,11 @@ pub fn mapping(uid: Uuid) -> String {
     format!("{MAPPING_PREFIX}{uid}")
 }
 
+/// The decrypted device of volume `uid`.
+pub fn device(uid: Uuid) -> PathBuf {
+    PathBuf::from(format!("/dev/mapper/{}", mapping(uid)))
+}
+
 /// What is where the encryption header goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Header {

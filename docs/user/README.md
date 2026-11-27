@@ -57,9 +57,15 @@ To stop it, read its `metadata.etag`, then send a `PATCH`:
   one instance at a time.
 - An instance goes to the node where its volumes are, or where they fit. While it cannot run, `status.message` says why
   (for example a volume used by another instance).
-- A disk can be added to `disks` while the instance runs; removing one needs it stopped. Any volume, the boot disk too, can
-  grow while it runs. The boot disk's type cannot change, and it cannot be added or removed.
+- A disk can be added to `disks` while the instance runs (the guest gets it after a restart for now); removing one needs it stopped. Any volume, the boot disk too, can
+  grow while it runs (the guest sees the new size after a restart for now). The boot disk's type cannot change, and it cannot be added or removed.
 - When an instance is deleted, or a disk removed from it, the volume is free again once its node has closed it.
+- The guest sees them as virtio disks, the boot disk first, then `disks` in order. Each has the serial number made of the last
+  20 hex digits of its volume's `uid` (without dashes), so Linux guests find it at `/dev/disk/by-id/virtio-<serial>`.
+- It boots from the boot disk, with BIOS firmware for now (no UEFI yet). A blank boot disk boots nothing: images to start
+  from come later.
+- While the instance waits for its disks to be ready on its node, it stays `starting`, and `status.message` says which.
+  A start that fails is tried again every 10 seconds.
 
 ## Volumes
 

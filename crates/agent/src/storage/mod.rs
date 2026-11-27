@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use tonic::transport::Channel;
+use torngat_api::compute::Instance;
 use torngat_api::storage::{LUKS_HEADER_BYTES, StorageDriver, StoragePool, Volume, VolumePhase};
 use torngat_api::{Name, Scope};
 use torngat_proto::storage::v1 as drv;
@@ -26,11 +27,12 @@ use torngat_proto::v1::{PoolReport, ReportResponse, VolumeKeyRequest, VolumeRepo
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-pub use crypt::{Crypt, Cryptsetup, FakeCrypt, mapping};
+pub use crypt::{Crypt, Cryptsetup, FakeCrypt, device, mapping};
 pub use driver::{AnyDriver, Builtin, Driver, Drivers, NoDriver};
 pub use files::FileDriver;
 pub use lvm::LvmDriver;
 
+use crate::runtime::Disk;
 use crate::{AgentError, sanitize};
 
 /// Wait after a refused key, doubled up to [`MAX_KEY_WAIT`].
@@ -110,6 +112,8 @@ pub struct Storage<D, C> {
     refused: HashMap<Uuid, (Instant, Duration)>,
     pools_reported: HashMap<Uuid, PoolReport>,
     volumes_reported: HashMap<Uuid, VolumeReport>,
+    /// Volumes open for an instance on this node, as of the last pass.
+    open: BTreeSet<Uuid>,
 }
 
 impl<D: Drivers, C: Crypt> Storage<D, C> {
@@ -122,6 +126,7 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             refused: HashMap::new(),
             pools_reported: HashMap::new(),
             volumes_reported: HashMap::new(),
+            open: BTreeSet::new(),
         }
     }
 
@@ -129,6 +134,39 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
     pub fn new_session(&mut self) {
         self.pools_reported.clear();
         self.volumes_reported.clear();
+        self.open.clear();
+    }
+
+    /// `inst`'s disks, in order (its boot disk first), once all of them are open on this node;
+    /// otherwise what it waits for. `a` is `None` while storage is not available.
+    pub fn disks(&self, a: Option<&Assigned>, inst: &Instance) -> Result<Vec<Disk>, String> {
+        let name = &inst.metadata.name;
+        let boot = inst.spec.boot_volume(name).map_err(|e| e.to_string())?;
+        let names = inst.spec.volumes(name).map_err(|e| e.to_string())?;
+        if names.is_empty() {
+            return Ok(vec![]);
+        }
+        let a = a.ok_or("waiting for storage")?;
+        names
+            .iter()
+            .map(|n| {
+                let v = a
+                    .volumes
+                    .iter()
+                    .find(|v| {
+                        v.metadata.scope == inst.metadata.scope
+                            && v.metadata.name == *n
+                            && v.status.attached_to == Some(inst.metadata.uid)
+                    })
+                    .filter(|v| self.open.contains(&v.metadata.uid))
+                    .ok_or_else(|| format!("waiting for volume {n}"))?;
+                Ok(Disk {
+                    volume: v.metadata.uid,
+                    path: device(v.metadata.uid),
+                    boot: boot.as_ref() == Some(n),
+                })
+            })
+            .collect()
     }
 
     fn pool(&self, p: &StoragePool) -> drv::Pool {
@@ -200,6 +238,7 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             }
         }
 
+        let mut in_use = BTreeSet::new();
         for v in &a.volumes {
             let Some((pool, kind)) = pool_of(v) else {
                 continue;
@@ -209,6 +248,9 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             let Some(mut r) = self.volume_step(client, v, pool, *kind, use_).await else {
                 continue;
             };
+            if use_.is_some() && r.open {
+                in_use.insert(v.metadata.uid);
+            }
             // Still open: the controller does not give it to another instance yet.
             r.open |= busy.contains(&name);
             report(&mut self.volumes_reported, v.metadata.uid, r, |r| {
@@ -216,6 +258,7 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             })
             .await?;
         }
+        self.open = in_use;
         Ok(())
     }
 

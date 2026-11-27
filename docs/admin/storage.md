@@ -67,6 +67,8 @@ POST /v1/platform/volumeTypes?volume_type_id=fast
 - Space is never promised twice: a volume takes its full size from the pool, plus 16 MiB for encryption.
 - Deleting a pool waits until its node removed its mark from the storage, and until no volume type lists it. If the node is lost,
   or no longer sees the volume group (its disks missing), the pool stays in deletion: there is no way to force it yet.
+- The node opens an instance's volumes before starting it, and hands QEMU the open devices: QEMU itself cannot open any
+  device but `/dev/kvm`. An instance waits (`starting`) until all its volumes are open.
 - A volume gets its node when an instance first uses it. An instance's boot disk is a volume `<instance>-boot`
   whose `status.owner` names the instance; it is deleted after the instance unless the instance keeps it.
 - `status.open`: the node has it open for an instance. A volume is released from its instance only once closed, so

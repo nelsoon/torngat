@@ -1051,9 +1051,10 @@ async fn instances_get_their_disks() {
     let root = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(root.path().join("data")).unwrap();
     let crypt = FakeCrypt::default();
+    let runtime = torngat_agent::FakeRuntime::default();
     tokio::spawn(torngat_agent::run(
         node_cfg(&e, "n1", "active").await,
-        torngat_agent::FakeRuntime::default(),
+        runtime.clone(),
         FileDriver::new(root.path(), 8 * GIB, false),
         crypt.clone(),
     ));
@@ -1104,6 +1105,18 @@ async fn instances_get_their_disks() {
         volume_now(&e, "data-1").await.unwrap().status.open
     })
     .await;
+    // Started once both were open, with its boot disk first.
+    until("running", || async {
+        inst().await.unwrap().status.phase == torngat_api::compute::InstancePhase::Running
+    })
+    .await;
+    let disks = runtime.disks(web.metadata.uid).unwrap();
+    let got: Vec<_> = disks.iter().map(|d| (d.volume, d.boot)).collect();
+    assert_eq!(got, [(boot.metadata.uid, true), (data.metadata.uid, false)]);
+    assert_eq!(
+        disks[0].path,
+        torngat_agent::storage::device(boot.metadata.uid)
+    );
 
     // Added while it runs: placed on its node, attached and opened.
     let data2 = pending(&e, "data-2", 1).await;
