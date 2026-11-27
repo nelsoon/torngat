@@ -4,7 +4,7 @@
 //! untrusted. Lines are bounded, every exchange has a timeout, and the peer must be the process
 //! the caller expects.
 
-use std::io::{BufRead, BufReader, IoSlice, Read, Write};
+use std::io::{BufRead, BufReader, IoSlice, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::BorrowedFd;
 use std::os::unix::net::UnixStream;
@@ -19,6 +19,7 @@ const MAX_LINE: u64 = 64 * 1024;
 pub struct Qmp {
     /// Written to through `get_ref`.
     reader: BufReader<UnixStream>,
+    io_timeout: Duration,
     deadline: Instant,
 }
 
@@ -42,14 +43,13 @@ impl Qmp {
         total: Duration,
     ) -> std::io::Result<Self> {
         stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(io_timeout))?;
-        stream.set_write_timeout(Some(io_timeout))?;
         let peer = rustix::net::sockopt::socket_peercred(&stream)?;
         if pid <= 0 || peer.pid.as_raw_nonzero().get() != pid || peer.uid.is_root() {
             return Err(err("the QMP socket is not the instance's own"));
         }
         let mut qmp = Self {
             reader: BufReader::new(stream),
+            io_timeout,
             deadline: Instant::now() + total,
         };
         qmp.line()?; // greeting
@@ -57,18 +57,40 @@ impl Qmp {
         Ok(qmp)
     }
 
-    fn line(&mut self) -> std::io::Result<Value> {
-        if Instant::now() >= self.deadline {
+    /// Bounds the next read and write by the time left: a peer that answers a byte at a time
+    /// cannot stretch the session.
+    fn timeouts(&self) -> std::io::Result<()> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
             return Err(err("QMP: timed out"));
         }
+        let t = Some(left.min(self.io_timeout));
+        let s = self.reader.get_ref();
+        s.set_read_timeout(t)?;
+        s.set_write_timeout(t)
+    }
+
+    fn line(&mut self) -> std::io::Result<Value> {
         let mut buf = Vec::new();
-        (&mut self.reader)
-            .take(MAX_LINE)
-            .read_until(b'\n', &mut buf)?;
-        if buf.last() != Some(&b'\n') {
-            return Err(err("QMP: connection closed or line too long"));
+        loop {
+            self.timeouts()?;
+            let got = self.reader.fill_buf()?;
+            if got.is_empty() {
+                return Err(err("QMP: connection closed"));
+            }
+            let (n, end) = match got.iter().position(|&b| b == b'\n') {
+                Some(i) => (i + 1, true),
+                None => (got.len(), false),
+            };
+            buf.extend_from_slice(&got[..n]);
+            self.reader.consume(n);
+            if buf.len() as u64 > MAX_LINE {
+                return Err(err("QMP: line too long"));
+            }
+            if end {
+                return serde_json::from_slice(&buf).map_err(|_| err("QMP: not JSON"));
+            }
         }
-        serde_json::from_slice(&buf).map_err(|_| err("QMP: not JSON"))
     }
 
     /// Runs `command` and returns its result; QEMU's error is returned as text.
@@ -99,6 +121,7 @@ impl Qmp {
         .to_string();
         msg.push('\n');
         let mut rest = msg.as_bytes();
+        self.timeouts()?;
         if let Some(fd) = fd {
             let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
             let mut control = SendAncillaryBuffer::new(&mut space);

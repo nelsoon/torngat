@@ -662,6 +662,18 @@ mod tests {
     }
 
     #[test]
+    fn disk_names_fit_qemu() {
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        let (node, id, serial) = disk_names(a);
+        assert!(node.len() <= 31 && node.starts_with('v'));
+        assert_eq!(serial.len(), 20);
+        assert_eq!(id, format!("disk-{a}"));
+        // Made in the same millisecond, still told apart.
+        assert_ne!(disk_names(b).2, serial);
+        assert_ne!(disk_names(b).0, node);
+    }
+
+    #[test]
     fn units_are_found_again() {
         let a = Uuid::now_v7();
         let b = Uuid::now_v7();

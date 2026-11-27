@@ -331,6 +331,8 @@ pub async fn session<R: Runtime, D: Drivers, C: Crypt>(
         loop {
             let mut changed = false;
             tokio::select! {
+                // Assignments first: retries can take a while.
+                biased;
                 set = stream.message() => {
                     let Some(set) = set? else { return Ok(()) };
                     if set.api_version != API_VERSION {
@@ -361,6 +363,8 @@ pub async fn session<R: Runtime, D: Drivers, C: Crypt>(
                 let disks = |i: &Instance| storage.disks(assigned.as_ref(), i);
                 waiting = reconcile(&mut client, runtime, &instances, disks, &mut reported).await?;
             }
+            // The next retry comes a full interval after this pass, however long it took.
+            retry.reset();
         }
     }
     .await;
@@ -414,6 +418,7 @@ pub async fn reconcile<R: Runtime>(
                 Ok(()) => ("stopped", String::new()),
                 Err(e) => {
                     tracing::warn!(%uid, error = %e, "instance failed to stop");
+                    waiting = true;
                     ("failed", e)
                 }
             },
