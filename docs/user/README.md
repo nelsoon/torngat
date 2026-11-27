@@ -63,7 +63,7 @@ To stop it, read its `metadata.etag`, then send a `PATCH`:
 - The guest sees them as virtio disks, the boot disk first, then `disks` in order. Each has the serial number made of the last
   20 hex digits of its volume's `uid` (without dashes), so Linux guests find it at `/dev/disk/by-id/virtio-<serial>`.
 - It boots from the boot disk with UEFI firmware (no legacy BIOS): the disk needs an EFI system partition, as cloud images
-  have. Its UEFI variables (boot entries) are kept while the instance exists. A blank boot disk boots nothing: images to
+  have. Its UEFI variables (boot entries) are kept across its restarts. A blank boot disk boots nothing: images to
   start from come later. Secure Boot inside the guest is not offered yet.
 - While the instance waits for its disks to be ready on its node, it stays `starting`, and `status.message` says which.
   A start that fails is tried again every 10 seconds.

@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Seek, SeekFrom};
 use std::os::fd::AsFd;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -104,7 +105,7 @@ pub fn unit(uid: Uuid) -> String {
     format!("{UNIT_PREFIX}{uid}.service")
 }
 
-/// The instance's UEFI variables (boot entries), kept while it exists.
+/// The instance's UEFI variables (boot entries), kept across its restarts.
 fn uefi_vars(uid: Uuid) -> String {
     format!("{STATE_ROOT}/{uid}/uefi-vars.fd")
 }
@@ -283,21 +284,24 @@ fn update_disks(
     let (mut used, have) = plugged(q)?;
     let sizes = sizes(q)?;
     let mut known = BTreeMap::new();
-    let mut failure = None;
-    let mut fail = |error, qemu| {
-        failure.get_or_insert(Failure { error, qemu });
+    let mut failure: Option<Failure> = None;
+    // The first failure is told; it is QEMU's if any was.
+    let mut fail = |error, qemu: bool| match &mut failure {
+        Some(f) => f.qemu |= qemu,
+        None => failure = Some(Failure { error, qemu }),
     };
     for d in disks.iter().filter(|d| !have.contains(&d.volume)) {
+        // The ports in use are what QEMU says.
+        let Some(port) = (0..DISK_PORTS).find(|p| !used.contains(p)) else {
+            fail(other("no free disk slot"), true);
+            break;
+        };
         let file = match open_disk(d) {
             Ok(f) => f,
             Err(e) => {
                 fail(e, false);
                 continue;
             }
-        };
-        let Some(port) = (0..DISK_PORTS).find(|p| !used.contains(p)) else {
-            fail(other("no free disk slot"), true);
-            break;
         };
         match add_disk(q, port, d, &file) {
             Ok(()) => {
@@ -334,9 +338,14 @@ fn update_disks(
             fail(e, true);
         }
     }
-    for (v, size) in disk_sizes(q, disks)? {
-        let k = known.entry(v).or_default();
-        *k = (*k).max(size);
+    match disk_sizes(q, disks) {
+        Ok(sizes) => {
+            for (v, size) in sizes {
+                let k = known.entry(v).or_default();
+                *k = (*k).max(size);
+            }
+        }
+        Err(e) => fail(e, true),
     }
     Ok((known, failure))
 }
@@ -358,9 +367,10 @@ pub fn properties(inst: &Instance, cfg: &QemuConfig) -> Vec<String> {
         "RuntimeDirectoryMode=0700".into(),
         "UMask=0077".into(),
         // Its UEFI variables, made from the template at its first start, by its own user (the agent
-        // writes nothing in the instance's directories).
+        // writes nothing in the instance's directories). Copied, then renamed: an interrupted copy
+        // is not taken for the file. `$$` is systemd's escape for `$`.
         format!(
-            "ExecStartPre=/usr/bin/cp --update=none {} {}",
+            "ExecStartPre=/bin/sh -c 'test -e \"$$1\" || {{ cp --no-preserve=mode \"$$0\" \"$$1.tmp\" && mv \"$$1.tmp\" \"$$1\"; }}' {} {}",
             cfg.firmware_vars,
             uefi_vars(uid)
         ),
@@ -666,6 +676,11 @@ impl Runtime for QemuRuntime {
         }
         if self.is_running(uid).await? {
             return Ok(());
+        }
+        for f in [&self.cfg.firmware, &self.cfg.firmware_vars] {
+            if !Path::new(f).is_file() {
+                return Err(format!("the UEFI firmware {f} is missing (package ovmf)"));
+            }
         }
         // A unit that failed before is kept until this.
         let _ = self.output(SYSTEMCTL, &["reset-failed", &unit(uid)]).await;

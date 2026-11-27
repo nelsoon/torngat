@@ -231,9 +231,10 @@ impl Drop for Loop {
     }
 }
 
-async fn console_has(uid: Uuid, text: &str) -> bool {
+async fn console_line(uid: Uuid, f: impl Fn(&str) -> bool) -> bool {
     for _ in 0..100 {
-        if std::fs::read_to_string(console_log(uid)).is_ok_and(|s| s.contains(text)) {
+        let log = std::fs::read(console_log(uid)).unwrap_or_default();
+        if String::from_utf8_lossy(&log).lines().any(&f) {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -260,9 +261,14 @@ async fn instances_boot_from_their_disks() {
         .unwrap();
     // The firmware starts the loader from the boot disk (a PCI device), not one of its own.
     assert!(
-        console_has(ua, "BdsDxe: starting Boot0001").await && console_has(ua, "from PciRoot").await,
+        console_line(ua, |l| l.contains("BdsDxe: starting Boot0001")
+            && l.contains("PciRoot"))
+        .await,
         "did not boot from its disk"
     );
+    // Its UEFI variables are its own, kept across restarts.
+    let vars = format!("/var/lib/private/torngat-vm/{ua}/uefi-vars.fd");
+    assert_eq!(std::fs::metadata(&vars).unwrap().len(), 540672, "{vars}");
     let pid = show(ua, "MainPID");
     let open = open_in(&pid);
     for d in [&boot.0, &data.0] {
