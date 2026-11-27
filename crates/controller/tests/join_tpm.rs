@@ -59,6 +59,8 @@ async fn tpm_join_and_mtls_with_the_tpm_key() {
             key: key.clone(),
         },
         FakeRuntime::default(),
+        torngat_agent::storage::NoDriver,
+        torngat_agent::storage::FakeCrypt::default(),
     ));
     e.wait_active("n2").await;
 

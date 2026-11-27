@@ -366,6 +366,7 @@ impl Control for ControlService {
             created: r.created,
             size_bytes: r.size_bytes,
             deleted: r.deleted,
+            formatted: r.formatted,
             message: message(r.message)?,
         };
         storage::report_volume(&self.ctl.store, &me, &scope, &name, state).await?;

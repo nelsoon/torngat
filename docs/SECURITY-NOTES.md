@@ -25,7 +25,11 @@ Items found in reviews that a later chunk must enforce.
 - **storage:**
   - Pool sizes and capabilities come from agents: only the pool's own node may report them. Reservations are written by the controller only, with compare-and-swap, before a volume is placed.
   - A driver must refuse a volume group or ZFS pool that carries another pool's or cluster's mark.
-  - Before volumes are opened on a host: a udev rule so that their content is not probed.
+  - Decrypted volumes are named `torngat-vol-<uid>`; `59-torngat-volumes.rules` keeps udev from probing, linking or activating them (`crates/agent/tests/luks.rs` checks it, with a control). Tools run by hand still can.
+  - The agent (`crates/agent/src/storage`) opens a volume only while an instance assigned to its node uses it, and closes every other `torngat-vol-*` mapping, also ones left by an agent that stopped. When storage cannot be read or an entry does not decode, it changes nothing.
+  - A driver's device must be a block device at an absolute path; other kinds are refused.
+  - The agent asks for a key each time it formats, opens or grows a volume, keeps it zeroed-on-drop, and passes it to `cryptsetup` on standard input. Keys are not in the agent's files or arguments; the kernel holds the open volume's key.
+  - `--fake-storage` uses files and loop devices: tests only.
   - Volume status has the pool's name, for operators: hide it from tenants when IAM comes.
   - A volume type or pool name in a stored object may no longer exist, or be another one: compare the uid.
   - Placement order (`crates/controller/src/storage.rs`): pool and `granted_bytes` in the volume's status, then the reservation, then `Placed`; without space both are cleared again. Growth order: the reservation, then `granted_bytes`. Deletion order: blocks, reservation (the pool is always written), the key's tombstone, then the object. The sweep reads a pool before the volumes, so that it never releases a reservation being made. Before reserving, check the pool's uid and that it is not being deleted.
@@ -43,10 +47,10 @@ Items found in reviews that a later chunk must enforce.
   - Restoring brings back revoked nodes and destroyed keys, and stops instances made since. Etags start again, so an old one can match by chance. A list of revoked nodes outside the store, and instances that are adopted rather than stopped: later.
   - Backups (`crates/keys/src/recovery.rs`) can only be read with the recovery code, and only be made by the cluster. An old backup is not refused: the operator checks its date.
   - The agent keeps received keys in memory that is erased, and never logs them.
-  - A volume's key goes only to the node of its pool while an instance uses it (`attached_to`), the first time too. The controller then sets `formatted`, and nothing clears it: from then on a missing key is never made.
+  - A volume's key goes only to the node of its pool while an instance uses it (`attached_to`), the first time too. Its record is kept from then on: a missing key is never made again for a volume that had one, nor for one that is `formatted`. The node reports `formatted` after it formatted the volume (or found it formatted), and nothing clears it.
   - Project keys are named by the project's path: when projects become objects, destroy the key with the project, so that a project made later under the same name does not get it.
   - Every controller needs the platform key file: promotion copies it, with the CA key, over mTLS and only to an attested node. Before multi-controller. Rotation of project and platform keys: not yet.
-  - A node formats a device only if its header area is blank (a format that was cut leaves it blank), never one with a header that it cannot open.
+  - A node formats a device only if its first 16 MiB are zero and it is not `formatted`; never one with something else there. A crash after the key was given but before formatting started is harmless; one during `cryptsetup luksFormat` can leave something that is neither blank nor LUKS, and the volume unusable (it held nothing yet: delete it).
   - Volumes and request id records have no limit per project, and the records never expire: before tenants get access.
   - An older version that changes an object drops fields that it does not know: before rolling upgrades.
 - **CI:** third-party actions are pinned to commit SHAs; keep them pinned when updating.

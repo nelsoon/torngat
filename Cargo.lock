@@ -2787,6 +2787,7 @@ dependencies = [
  "tracing",
  "tss-esapi",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

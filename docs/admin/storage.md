@@ -1,7 +1,8 @@
 # Storage for instances
 
-The image contains the tools. Pools, volume types and volumes can be described in the API, but
-**nothing is created on the nodes yet**.
+The image contains the tools. Pools, volume types and volumes can be described in the API, and nodes look
+after them ([on the node](#on-the-node)), but **there is no LVM or ZFS driver yet**: pools show `no storage
+driver on this node`.
 
 | | LVM | ZFS |
 |---|---|---|
@@ -80,9 +81,27 @@ What a pool's `status` says:
 A volume's `status.phase`: `pending` (no pool yet), `placing`, `placed` (has space), `ready` (exists on the node), `deleting`.
 Growing a volume first reserves the space; if there is none, it waits.
 
+## On the node
+
+- The node marks the volume group or ZFS pool as this pool of this cluster. Storage that carries another
+  mark is refused. Deleting the pool removes the mark once its volumes are gone.
+- A volume is made on the node once it has space, and grown when its size grows. It is encrypted (LUKS2) when an
+  instance first uses it, and only if the start of the device is blank: something else there is never
+  formatted over, and a volume formatted once is never formatted again (its `message` says so).
+- What an instance sees is open, as `/dev/mapper/torngat-vol-<uid>`, only while an instance on that node uses it. The host
+  does not look inside it: no file system type, label or uuid in `udev`, nothing in `/dev/disk/by-*`, nothing
+  activated or assembled from it. Do not open, mount or scan it by hand: the content is the tenant's.
+- The node asks for a volume's key each time it opens or grows it, and forgets it right after. A key that was refused is
+  asked for again after 5 s, then up to 5 min.
+- Volumes on the storage that the platform does not know are never deleted: the pool's `message` counts them. Look
+  at them by hand.
+
+`torngatd run --fake-storage DIR` is for tests only: every pool is a directory under `DIR`, volumes are files
+attached as loop devices, and nothing keeps the file system from filling up.
+
 ## Volume keys
 
-Volumes do not exist on the nodes yet; each will be encrypted with its own key. Keys are made and kept by the controller, encrypted under a key
+Each volume is encrypted with its own key. Keys are made and kept by the controller, encrypted under a key
 for each project, itself encrypted under the **platform key**: `/var/lib/torngat/keys/platform.key`.
 
 - A node gets a volume's key only while it is enrolled, the volume is on it, and an instance uses it. The controller logs `volume key given`. A node must ask again after a reboot.

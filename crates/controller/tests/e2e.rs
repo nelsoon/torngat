@@ -225,6 +225,8 @@ async fn instance_lifecycle_through_agent() {
     tokio::spawn(torngat_agent::run(
         agent_cfg(&e, "n1").await,
         runtime.clone(),
+        torngat_agent::storage::NoDriver,
+        torngat_agent::storage::FakeCrypt::default(),
     ));
 
     // Node registers with inventory; identity comes from its certificate.
@@ -317,6 +319,8 @@ async fn agents_cannot_impersonate_or_touch_others() {
     tokio::spawn(torngat_agent::run(
         agent_cfg(&e, "n1").await,
         FakeRuntime::default(),
+        torngat_agent::storage::NoDriver,
+        torngat_agent::storage::FakeCrypt::default(),
     ));
     eventually(&e.api, "/v1/platform/nodes/n1", "node n1", |v| {
         v["status"]["phase"] == "active"

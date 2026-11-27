@@ -82,13 +82,16 @@ message VolumeReport {
   string project = 2;
   string name = 3;
   string uid = 4;
-  // Exists on the node, encrypted and usable.
+  // Exists on the node. It is formatted (encrypted) when an instance first uses it.
   bool created = 5;
   // What the instance can see.
   uint64 size_bytes = 6;
   // Its blocks are gone: only for a volume being deleted.
   bool deleted = 7;
   string message = 8;
+  // The node formatted it, or found it formatted: from then on it is never formatted again. Never
+  // cleared.
+  bool formatted = 9;
 }
 
 message VolumeKeyRequest {

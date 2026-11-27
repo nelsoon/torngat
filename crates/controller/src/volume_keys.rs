@@ -231,23 +231,8 @@ async fn check_and_get(
             rec.project_key
         )));
     }
+    // The record stays: from then on a missing key is never made again.
     let key = project_key.unwrap(wrapped, purpose).map_err(internal)?;
-    if !volume.status.formatted {
-        // The node may write to it now: from then on a missing key is never made again.
-        let vk = keys::volume(scope, name).map_err(internal)?;
-        crate::storage::modify(store, &vk, |v: &mut Volume| {
-            if v.metadata.uid != uid || v.status.formatted {
-                return false;
-            }
-            v.status.formatted = true;
-            v.metadata.etag = None;
-            true
-        })
-        .await
-        .map_err(internal)?
-        .filter(|v| v.metadata.uid == uid)
-        .ok_or_else(|| Status::permission_denied("volume is not on this node"))?;
-    }
     Ok(key)
 }
 
