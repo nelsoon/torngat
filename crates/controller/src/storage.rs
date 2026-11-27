@@ -92,7 +92,7 @@ pub(crate) async fn modify<T: Serialize + DeserializeOwned>(
 }
 
 /// An object and its revision. An object that does not decode is an error, never "missing".
-async fn get<T: DeserializeOwned>(
+pub(crate) async fn get<T: DeserializeOwned>(
     store: &Store,
     key: &Key,
 ) -> Result<Option<(T, u64)>, PlaceError> {
@@ -103,7 +103,7 @@ async fn get<T: DeserializeOwned>(
 }
 
 /// Every object under a prefix, with what was stored. `None` if one does not decode.
-async fn all<T: DeserializeOwned>(
+pub(crate) async fn all<T: DeserializeOwned>(
     store: &Store,
     prefix: &torngat_store::Prefix,
 ) -> Result<Option<Vec<(T, Versioned)>>, ScheduleError> {
@@ -121,7 +121,7 @@ async fn all<T: DeserializeOwned>(
 }
 
 /// The size to reserve for `bytes`: whole allocation units.
-fn rounded(pool: &StoragePool, bytes: u64) -> u64 {
+pub(crate) fn rounded(pool: &StoragePool, bytes: u64) -> u64 {
     match pool.status.allocation_unit_bytes {
         0 | 1 => bytes,
         u => bytes.div_ceil(u).saturating_mul(u),
@@ -129,7 +129,7 @@ fn rounded(pool: &StoragePool, bytes: u64) -> u64 {
 }
 
 /// Whether new volumes may go to this pool.
-fn usable(p: &StoragePool) -> bool {
+pub(crate) fn usable(p: &StoragePool) -> bool {
     p.metadata.delete_time.is_none()
         && p.status.claimed
         && p.status.ready

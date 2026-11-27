@@ -124,10 +124,12 @@ pub async fn create_instance(
     let q = query(q)?;
     let input = body(b)?;
     let n = name("instance", &q.instance_id)?;
-    input
-        .spec
-        .validate()
-        .map_err(|e| ApiError::InvalidArgument(e.to_string()))?;
+    let invalid = |e: torngat_api::compute::InstanceError| ApiError::InvalidArgument(e.to_string());
+    input.spec.validate().map_err(invalid)?;
+    input.spec.boot_volume(&n).map_err(invalid)?;
+    if let Some(b) = &input.spec.boot_disk {
+        crate::storage::require_type(&st, &b.volume_type).await?;
+    }
     let target = resource_path(&scope, "instances", &n);
 
     let op = Operation {
@@ -375,8 +377,14 @@ pub async fn update_instance(
         obj.metadata.labels = labels;
     }
     if let Some(spec) = upd.spec {
-        spec.validate()
-            .map_err(|e| ApiError::InvalidArgument(e.to_string()))?;
+        obj.spec
+            .validate_update(&obj.status, &spec)
+            .map_err(|e| match e {
+                torngat_api::compute::InstanceError::DisksWhileRunning => {
+                    ApiError::FailedPrecondition(e.to_string())
+                }
+                e => ApiError::InvalidArgument(e.to_string()),
+            })?;
         if spec != obj.spec {
             obj.spec = spec;
             obj.metadata.generation += 1;

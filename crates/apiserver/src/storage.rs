@@ -51,6 +51,11 @@ const VOLUMES: Kind = Kind {
     path: "volumes",
 };
 
+/// Refuses a boot disk of a volume type that does not exist.
+pub(crate) async fn require_type(st: &AppState, t: &Name) -> Result<(), ApiError> {
+    require(st, TYPES.key(&Scope::Platform, t)?, "volume type", t).await
+}
+
 /// Refuses a reference to something that does not exist or is being deleted.
 async fn require(st: &AppState, key: Key, what: &str, n: &Name) -> Result<(), ApiError> {
     let found: Option<Object<serde_json::Value, serde_json::Value>> =

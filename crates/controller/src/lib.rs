@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+mod disks;
 pub mod identity;
 pub mod join;
 pub mod keys;
@@ -27,6 +28,7 @@ use torngat_api::Name;
 use torngat_keys::PlatformKey;
 use torngat_store::Store;
 
+pub use disks::disks_once;
 pub use join::{JoinService, expire_join_tokens_once, serve_join};
 pub use ops::complete_operations_once;
 pub use scheduler::schedule_once;
@@ -78,6 +80,9 @@ impl Controller {
         const HOUSEKEEPING_EVERY: Duration = Duration::from_secs(60);
         let mut last_housekeeping: Option<Instant> = None;
         loop {
+            if let Err(e) = disks::disks_once(&self).await {
+                tracing::warn!(error = %e, "disks pass failed");
+            }
             if let Err(e) = schedule_once(&self).await {
                 tracing::warn!(error = %e, "scheduling pass failed");
             }

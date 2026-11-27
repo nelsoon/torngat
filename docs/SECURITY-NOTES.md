@@ -49,6 +49,7 @@ Items found in reviews that a later chunk must enforce.
   - A pool is only removed by the controller, after its node released it, once no volume type lists it and no volume names it.
   - Volume keys (`crates/controller/src/volume_keys.rs`): never made again for a formatted volume or a destroyed uid (tombstone). Tombstones are never removed.
   - Racing creates with one request id can briefly bring a uid back: the object of a placed volume goes only after its tombstone, the undo in `create_volume` is retried, and placement refuses a uid with a tombstone.
+  - Instance disks (`crates/controller/src/disks.rs`): a volume is attached to one instance at a time (compare-and-swap on `attached_to`), only once that instance has a node and the volume is on it. Released when the instance is gone or no longer lists it; the API lets `disks` change only while the instance is stopped. A boot disk is deleted after its instance only if `owner.delete_with_it` and not `delete_protection`. Nothing is released or deleted while an instance or volume does not decode.
   - Keys are given by the pool's node, which is enough for local storage. Shared storage must also check that the instance in `attached_to` runs on the caller.
   - Node removal must delete the identity before the node's record, or registering makes the record again as active. Needed before real data: a stolen node cannot be cut off yet.
   - Core dumps are off for the `torngatd` service only, not when it is run by hand.

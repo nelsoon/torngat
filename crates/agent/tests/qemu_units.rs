@@ -36,6 +36,8 @@ fn inst(name: &str) -> Instance {
             capabilities: BTreeSet::new(),
             power_state: PowerState::Running,
             claims: vec![],
+            boot_disk: None,
+            disks: vec![],
         },
         status: Default::default(),
     }
