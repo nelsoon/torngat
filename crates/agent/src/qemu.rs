@@ -349,7 +349,8 @@ impl Runtime for QemuRuntime {
             if self.qmp(uid, "query-status").await.is_ok() {
                 return Ok(());
             }
-            if !self.is_running(uid).await? {
+            // The cleanup below also runs when systemctl fails.
+            if !matches!(self.is_running(uid).await, Ok(true)) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
