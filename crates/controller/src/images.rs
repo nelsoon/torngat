@@ -35,6 +35,19 @@ use crate::{Controller, keys};
 /// An import that does not move on for this long fails: its node is gone, or it has no room.
 pub const PROGRESS_DEADLINE: Duration = Duration::from_secs(15 * 60);
 
+/// An upload that is not finished in this time is removed.
+pub const UPLOAD_STALE: Duration = Duration::from_secs(24 * 3600);
+
+/// Whether `node` may read `image`'s upload now: it imports it.
+pub(crate) fn may_read_upload(image: &Image, node: &Name, uid: Uuid) -> bool {
+    image.metadata.uid == uid
+        && image.metadata.delete_time.is_none()
+        && image.status.phase == ImagePhase::Importing
+        && image.status.node.as_ref() == Some(node)
+        && image.status.uploaded
+        && image.spec.source.url.is_none()
+}
+
 /// The operator's image settings.
 pub(crate) async fn settings(store: &Store) -> Result<ImageSettings, PlaceError> {
     Ok(get::<ImageSettings>(store, &keys::image_settings()?)
@@ -122,6 +135,32 @@ pub async fn images_once(ctl: &Controller) -> Result<usize, ScheduleError> {
         }
     }
 
+    // Uploads that are no longer needed: the image is imported, failed or gone; or never finished.
+    if let Some(u) = &ctl.uploads {
+        let wanted: BTreeSet<Uuid> = images
+            .iter()
+            .filter(|(i, _)| {
+                i.metadata.delete_time.is_none()
+                    && matches!(i.status.phase, ImagePhase::Pending | ImagePhase::Importing)
+            })
+            .map(|(i, _)| i.metadata.uid)
+            .collect();
+        // Those whose image is done or being deleted at once; others (an image gone) after a while.
+        for (i, _) in &images {
+            if i.spec.source.url.is_none()
+                && !wanted.contains(&i.metadata.uid)
+                && let Err(e) = u.remove(i.metadata.uid).await
+            {
+                tracing::warn!(image = %i.metadata.uid, error = %e, "cannot remove an upload");
+            }
+        }
+        match u.sweep(|uid| wanted.contains(&uid), UPLOAD_STALE).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(count = n, "uploads removed"),
+            Err(e) => tracing::warn!(error = %e, "cannot sweep uploads"),
+        }
+    }
+
     // Volumes of images that are gone.
     let alive: BTreeSet<Uuid> = images.iter().map(|(i, _)| i.metadata.uid).collect();
     for (v, _) in &volumes {
@@ -187,6 +226,9 @@ async fn step(
     }
 
     match image.status.phase {
+        ImagePhase::Pending if image.spec.source.url.is_none() && !image.status.uploaded => {
+            tell(store, image, "waiting for its upload").await
+        }
         ImagePhase::Pending => {
             let Some(node) = choose_node(pools, types, &image.spec.volume_type, |n| {
                 ctl.live.is_live(n)

@@ -554,6 +554,27 @@ async fn the_agent_imports_images() {
         )
     };
     let good: Image = serde_json::from_value(with("good", torngat_pki::hex_sha256(&disk))).unwrap();
+    // One uploaded instead: in parts, put together, then read by the node from the controller.
+    let mut up: Image = serde_json::from_value(with("up", torngat_pki::hex_sha256(&disk))).unwrap();
+    up.spec.source.url = None;
+    // The image first: uploads of images that are not there are removed.
+    let key = keys::image(&Scope::Platform, &n("up")).unwrap();
+    put(&e.store, key.clone(), &up).await;
+    until("waits for its upload", || async {
+        image_now(&e, &up).await.unwrap().status.message.as_deref()
+            == Some("waiting for its upload")
+    })
+    .await;
+    let half = disk.len() / 2;
+    let uid = up.metadata.uid;
+    e.uploads.put_part(uid, 2, &disk[half..]).await.unwrap();
+    e.uploads.put_part(uid, 1, &disk[..half]).await.unwrap();
+    let sum = up.spec.source.checksum.clone();
+    let len = e.uploads.finish(uid, &sum, 1 << 30).await.unwrap();
+    let mut up = image_now(&e, &up).await.unwrap();
+    up.status.uploaded = true;
+    up.status.download_bytes = Some(len);
+    put(&e.store, key, &up).await;
     let bad: Image = serde_json::from_value(with("bad", "0".repeat(64))).unwrap();
     for i in [&good, &bad] {
         put(
@@ -577,6 +598,15 @@ async fn the_agent_imports_images() {
         .await
         .unwrap();
     assert!(target.status.formatted);
+    until("uploaded one imported", || async {
+        image_now(&e, &up).await.unwrap().status.phase == ImagePhase::Ready
+    })
+    .await;
+    // Its upload is removed once imported.
+    until("upload removed", || async {
+        e.uploads.open(up.metadata.uid, 0).await.is_err()
+    })
+    .await;
     until("bad failed", || async {
         image_now(&e, &bad).await.unwrap().status.phase == ImagePhase::Failed
     })

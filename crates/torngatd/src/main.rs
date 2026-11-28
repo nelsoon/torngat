@@ -637,7 +637,12 @@ async fn run(
     let store = open_store(&data).await?;
 
     let platform_key = Arc::new(load_platform_key(&store, &data).await?);
-    let ctl = torngat_controller::Controller::new(store.clone(), platform_key.clone());
+    // Image uploads, until their node has them.
+    let uploads_dir = data.join("uploads");
+    private_dir(&uploads_dir)?;
+    let uploads = torngat_uploads::Uploads::new(uploads_dir);
+    let ctl = torngat_controller::Controller::new(store.clone(), platform_key.clone())
+        .with_uploads(uploads.clone());
     let backups = Arc::new(backup::Backups {
         store: store.clone(),
         platform_key,
@@ -665,6 +670,7 @@ async fn run(
     let scheduler = tokio::spawn(ctl.run_scheduler(Duration::from_millis(500)));
     let agent = tokio::spawn(torngat_agent::run(agent_cfg, runtime, driver, Cryptsetup));
     let state = torngat_apiserver::AppState {
+        uploads: Some(uploads),
         store: store.clone(),
         token,
         ca_hash: ca.hash(),

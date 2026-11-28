@@ -32,8 +32,10 @@ ready() { [ "$(call GET /v1/platform/storagePools/n1-data | jq -r .status.ready)
 until_true "pool ready" 60 ready
 call POST "/v1/platform/volumeTypes?volume_type_id=fast" '{"spec": {"pools": ["n1-data"]}}' >/dev/null
 
-image() { # PATH NAME URL CHECKSUM-JSON
-  call POST "$1?image_id=$2" "{\"spec\": {\"source\": {\"url\": \"$3\", \"checksum\": $4}, \"volume_type\": \"fast\"}}" >/dev/null
+image() { # PATH NAME URL CHECKSUM-JSON; an empty URL: uploaded
+  local url=
+  [ -n "$3" ] && url="\"url\": \"$3\", "
+  call POST "$1?image_id=$2" "{\"spec\": {\"source\": {$url\"checksum\": $4}, \"volume_type\": \"fast\"}}" >/dev/null
 }
 phase() { call GET "$1/$2" | jq -r .status.phase; }
 is() { [ "$(phase "$1" "$2")" = "$3" ]; }
@@ -113,6 +115,25 @@ until_true "boot disk deleted" 120 boot_gone
 data_free() { [ "$(call GET "$base/volumes/data-1" | jq -r '.status.attached_to // empty')" = "" ]; }
 until_true "data volume released" 60 data_free
 call DELETE "$base/volumes/data-1" >/dev/null
+
+echo "== upload"
+# A small raw disk, in two parts, the second first.
+head -c 3000000 /dev/urandom >"$work/up.raw"
+sum=$(sha256sum "$work/up.raw" | cut -d' ' -f1)
+image "$project" up "" "{\"sha256\": \"$sum\"}"
+upload() { # PART FILE
+  curl -s -m 60 -X PUT -o /dev/null -w '%{http_code}' --config <(printf 'header = "Authorization: Bearer %s"\n' "$token") \
+    --data-binary "@$2" "http://127.0.0.1:$api_port$project/up/upload/parts/$1"
+}
+head -c 2000000 "$work/up.raw" >"$work/p1"
+tail -c 1000000 "$work/up.raw" >"$work/p2"
+[ "$(upload 2 "$work/p2")" = 200 ] && [ "$(upload 1 "$work/p1")" = 200 ] || fail "parts refused"
+call POST "$project/up/upload:finish" >/dev/null
+for _ in $(seq 300); do is "$project" up ready && break; sleep 1; done
+is "$project" up ready || { show "$project" up; guest ls -la /var/lib/torngat/uploads/ >&2; fail "uploaded image not imported"; }
+[ "$(call GET "$project/up" | jq -r .status.size_bytes)" = 3000320 ] || fail "upload size"
+echo "ok: an uploaded image is imported"
+call DELETE "$project/up" >/dev/null
 
 echo "== deleted"
 call DELETE "$platform/debian" >/dev/null

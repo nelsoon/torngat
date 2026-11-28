@@ -45,6 +45,8 @@ pub struct AppState {
     /// Pin of the cluster CA, embedded in the join tokens this server hands out.
     pub ca_hash: torngat_pki::CaHash,
     pub backup: Backup,
+    /// Where image uploads are kept; `None`: uploads are refused.
+    pub uploads: Option<torngat_uploads::Uploads>,
 }
 
 async fn not_found() -> ApiError {
@@ -124,6 +126,30 @@ pub fn router(state: AppState) -> Router {
             get(images::get_platform_image)
                 .patch(images::update_platform_image)
                 .delete(images::delete_platform_image),
+        )
+        .route(
+            "/v1/platform/images/{image}/upload/parts/{part}",
+            axum::routing::put(images::put_platform_part),
+        )
+        .route(
+            "/v1/platform/images/{image}/upload",
+            get(images::get_platform_upload),
+        )
+        .route(
+            "/v1/platform/images/{image}/upload:finish",
+            axum::routing::post(images::finish_platform_upload),
+        )
+        .route(
+            "/v1/orgs/{org}/projects/{project}/images/{image}/upload/parts/{part}",
+            axum::routing::put(images::put_part),
+        )
+        .route(
+            "/v1/orgs/{org}/projects/{project}/images/{image}/upload",
+            get(images::get_upload),
+        )
+        .route(
+            "/v1/orgs/{org}/projects/{project}/images/{image}/upload:finish",
+            axum::routing::post(images::finish_upload),
         )
         .route(
             "/v1/orgs/{org}/projects/{project}/images",

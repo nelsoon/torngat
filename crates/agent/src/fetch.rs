@@ -173,27 +173,27 @@ fn allowed_v6(ip: Ipv6Addr, reach: Reach) -> bool {
     !NEVER.iter().any(|(n, l)| in_v6(ip, *n, *l))
 }
 
-enum Hasher {
+pub(crate) enum Hasher {
     Sha256(sha2::Sha256),
     Sha512(sha2::Sha512),
 }
 
 impl Hasher {
-    fn new(c: &Checksum) -> Self {
+    pub(crate) fn new(c: &Checksum) -> Self {
         match c {
             Checksum::Sha256(_) => Hasher::Sha256(sha2::Sha256::new()),
             Checksum::Sha512(_) => Hasher::Sha512(sha2::Sha512::new()),
         }
     }
 
-    fn update(&mut self, b: &[u8]) {
+    pub(crate) fn update(&mut self, b: &[u8]) {
         match self {
             Hasher::Sha256(h) => h.update(b),
             Hasher::Sha512(h) => h.update(b),
         }
     }
 
-    fn matches(self, c: &Checksum) -> bool {
+    pub(crate) fn matches(self, c: &Checksum) -> bool {
         let (got, want) = match (self, c) {
             (Hasher::Sha256(h), Checksum::Sha256(w)) => (torngat_pki::hex(&h.finalize()), w),
             (Hasher::Sha512(h), Checksum::Sha512(w)) => (torngat_pki::hex(&h.finalize()), w),

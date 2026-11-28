@@ -24,6 +24,8 @@ service Control {
   rpc ReportVolume(VolumeReport) returns (ReportResponse);
   // How the import of an image assigned to the caller goes.
   rpc ReportImage(ImageReport) returns (ReportResponse);
+  // The uploaded file of an image that the caller imports, from an offset.
+  rpc ReadUpload(ReadUploadRequest) returns (stream UploadChunk);
 }
 
 message RegisterRequest {
@@ -133,6 +135,19 @@ message ImageReport {
   // The import cannot succeed; message says why.
   bool failed = 9;
   string message = 10;
+}
+
+// Empty org and project: the platform's.
+message ReadUploadRequest {
+  string org = 1;
+  string project = 2;
+  string name = 3;
+  // The image's metadata.uid.
+  string uid = 4;
+  uint64 offset = 5;
+}
+message UploadChunk {
+  bytes data = 1;
 }
 
 message VolumeKeyResponse {

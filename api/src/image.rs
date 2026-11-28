@@ -62,8 +62,9 @@ impl Checksum {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageSource {
     /// Downloaded by a node. Only public addresses are reached, unless the operator allows others
-    /// for platform images.
-    pub url: String,
+    /// for platform images. Without one, the image is uploaded through the API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     pub checksum: Checksum,
 }
 
@@ -102,7 +103,7 @@ pub struct ImageSpec {
 
 impl ImageSpec {
     pub fn validate(&self) -> Result<(), ImageError> {
-        if !valid_url(&self.source.url) {
+        if self.source.url.as_deref().is_some_and(|u| !valid_url(u)) {
             return Err(ImageError::Url);
         }
         self.source.checksum.validate()?;
@@ -198,6 +199,9 @@ pub struct ImageStatus {
     pub size_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Its upload is complete and matches its checksum (for an image without a URL).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub uploaded: bool,
     /// When the import last moved on: its node was chosen, or the node reported.
     #[serde(
         default,
@@ -214,7 +218,7 @@ mod tests {
     fn spec(url: &str) -> ImageSpec {
         ImageSpec {
             source: ImageSource {
-                url: url.into(),
+                url: Some(url.into()),
                 checksum: Checksum::Sha256("0".repeat(64)),
             },
             volume_type: Name::new("fast").unwrap_or_else(|e| unreachable!("{e}")),
@@ -259,7 +263,7 @@ mod tests {
     fn checksums() {
         let with = |c| ImageSpec {
             source: ImageSource {
-                url: "https://h/x".into(),
+                url: Some("https://h/x".into()),
                 checksum: c,
             },
             ..spec("https://h/x")
@@ -286,7 +290,7 @@ mod tests {
         b.description = "Debian 13".into();
         assert_eq!(a.validate_update(&b), Ok(()));
         let mut c = a.clone();
-        c.source.url = "https://h/y".into();
+        c.source.url = Some("https://h/y".into());
         assert_eq!(a.validate_update(&c), Err(ImageError::Immutable));
         let mut d = a.clone();
         d.volume_type = Name::new("slow").unwrap_or_else(|e| unreachable!("{e}"));

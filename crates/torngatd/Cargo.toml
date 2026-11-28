@@ -30,6 +30,7 @@ torngat-controller = { path = "../controller" }
 torngat-keys = { path = "../keys" }
 torngat-pki = { path = "../pki" }
 torngat-store = { path = "../store" }
+torngat-uploads = { path = "../uploads" }
 zeroize = { version = "1.9", features = ["serde"] }
 
 [dev-dependencies]

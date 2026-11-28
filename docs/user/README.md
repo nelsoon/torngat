@@ -104,10 +104,21 @@ POST /v1/orgs/acme/projects/web/images?image_id=debian-13
   they are made for it.
 - Only `description` can change. To change anything else, delete the image and make it again.
 - `status.phase`: `pending`, `importing`, `ready`, `failed` (`status.message` says why) or `deleting`. `status.size_bytes` is
-  the size of the disk it holds, and `status.format` what was found.
+  the size of the disk it holds (for a raw image, its length rounded up to 512 bytes), and `status.format` what was found.
 - The image's volumes are listed with the project's volumes, with `status.owner.image`. They cannot be changed, deleted or
   used in `disks`: deleting the image deletes them.
 - The operator publishes platform images (`/v1/platform/images`) for every project.
+- Without `source.url`, the image is uploaded instead, in parts (resumable):
+
+  ```
+  PUT  .../images/{image}/upload/parts/{n}     the bytes of part n (1 to 10000, at most 64 MiB each)
+  GET  .../images/{image}/upload               the parts received
+  POST .../images/{image}/upload:finish        puts parts 1 to the last together
+  ```
+
+  Parts can come in any order, and a part sent again replaces it. `upload:finish` refuses missing parts, an upload larger
+  than the limit, or one that does not match `checksum`; it can then be sent again. Once finished the image is
+  imported like a downloaded one. An upload not finished within a day is removed.
 - The download must be reachable on a public address (not your own network), say how long it is (no compressed or
   chunked answers), and be at most the operator's limit (64 GiB by default). Up to 5 redirects are followed, to https only.
 - `status.message` says how the import goes (`downloading`, `copying it into its volume`). An import that does not move on

@@ -47,6 +47,7 @@ async fn env() -> Env {
         token: AdminToken::new(TOKEN).unwrap(),
         ca_hash: torngat_pki::CaHash([7; 32]),
         backup: torngat_apiserver::Backup::new(|| async { Ok(None) }),
+        uploads: Some(torngat_uploads::Uploads::new(dir.path().join("uploads"))),
     });
     Env {
         app,
@@ -1119,5 +1120,121 @@ async fn images() {
         v["error"]["message"],
         "web-image belongs to an image: delete the image instead"
     );
+    e.store.shutdown().await.unwrap();
+}
+
+/// PUTs raw bytes.
+async fn put_bytes(app: &Router, uri: &str, data: Vec<u8>) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/octet-stream")
+        .body(Body::from(data))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_uploads() {
+    let e = storage_env().await;
+    let disk: Vec<u8> = (0..1_000_000u32).map(|i| (i % 249) as u8).collect();
+    let sha = torngat_pki::hex_sha256(&disk);
+    let base = "/v1/orgs/acme/projects/web/images";
+    let spec = json!({"spec": {"source": {"checksum": {"sha256": sha}}, "volume_type": "fast"}});
+    let (s, v) = call(
+        &e.app,
+        "POST",
+        &format!("{base}?image_id=up"),
+        Some(spec),
+        true,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(v["spec"]["source"].get("url").is_none());
+    let part = |n: u32| format!("{base}/up/upload/parts/{n}");
+
+    // Larger than the body limit of other requests; any order; one sent again.
+    assert_eq!(
+        put_bytes(&e.app, &part(2), disk[600_000..].to_vec())
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        put_bytes(&e.app, &part(1), b"wrong".to_vec()).await.0,
+        StatusCode::OK
+    );
+    let (s, v) = put_bytes(&e.app, &part(1), disk[..600_000].to_vec()).await;
+    assert_eq!((s, &v["bytes"]), (StatusCode::OK, &json!(600_000)));
+    assert_eq!(
+        put_bytes(&e.app, &part(0), vec![1]).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    let (_, v) = call(&e.app, "GET", &format!("{base}/up/upload"), None, true).await;
+    assert_eq!(
+        v["parts"],
+        json!([{"part": 1, "bytes": 600_000}, {"part": 2, "bytes": 400_000}])
+    );
+
+    let finish = format!("{base}/up/upload:finish");
+    let (s, v) = call(&e.app, "POST", &finish, None, true).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["status"]["uploaded"], true);
+    assert_eq!(v["status"]["download_bytes"], 1_000_000);
+    // Once only.
+    assert_eq!(
+        put_bytes(&e.app, &part(3), vec![1]).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(&e.app, "POST", &finish, None, true).await.0,
+        StatusCode::BAD_REQUEST
+    );
+
+    // A wrong checksum is refused at the finish, and the parts can be sent again.
+    let spec = json!({"spec": {"source": {"checksum": {"sha256": "0".repeat(64)}}, "volume_type": "fast"}});
+    call(
+        &e.app,
+        "POST",
+        &format!("{base}?image_id=bad"),
+        Some(spec),
+        true,
+    )
+    .await;
+    put_bytes(&e.app, &format!("{base}/bad/upload/parts/1"), disk.clone()).await;
+    let (s, v) = call(
+        &e.app,
+        "POST",
+        &format!("{base}/bad/upload:finish"),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["message"], "the checksum does not match");
+
+    // An image with a URL takes no upload.
+    let spec = json!({"spec": {"source": {"url": "https://h/x", "checksum": {"sha256": sha}}, "volume_type": "fast"}});
+    call(
+        &e.app,
+        "POST",
+        &format!("{base}?image_id=url"),
+        Some(spec),
+        true,
+    )
+    .await;
+    let (s, v) = put_bytes(&e.app, &format!("{base}/url/upload/parts/1"), vec![1]).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(v["error"]["message"], "url is downloaded from its URL");
+    // Nor one that is not there.
+    let (s, _) = put_bytes(&e.app, &format!("{base}/nope/upload/parts/1"), vec![1]).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
     e.store.shutdown().await.unwrap();
 }

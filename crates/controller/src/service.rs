@@ -113,6 +113,7 @@ fn project_object(
     Ok((scope, name, uid))
 }
 
+type UploadStream = Pin<Box<dyn Stream<Item = Result<UploadChunk, Status>> + Send>>;
 type AssignmentStream = Pin<Box<dyn Stream<Item = Result<AssignmentSet, Status>> + Send>>;
 
 #[tonic::async_trait]
@@ -426,6 +427,62 @@ impl Control for ControlService {
         };
         images::report_image(&self.ctl.store, &me, &scope, &name, state).await?;
         Ok(Response::new(ReportResponse {}))
+    }
+
+    type ReadUploadStream = UploadStream;
+
+    async fn read_upload(
+        &self,
+        req: Request<ReadUploadRequest>,
+    ) -> Result<Response<Self::ReadUploadStream>, Status> {
+        let me = identity::authenticate(&self.ctl.store, &req).await?;
+        let r = req.into_inner();
+        let (scope, name, uid) = scoped_object(r.org, r.project, r.name, &r.uid)?;
+        let uploads = self
+            .ctl
+            .uploads
+            .clone()
+            .ok_or_else(|| Status::unavailable("this controller keeps no uploads"))?;
+        let key = keys::image(&scope, &name).map_err(internal)?;
+        let image: Option<torngat_api::image::Image> =
+            match self.ctl.store.get(&key).await.map_err(store_err)? {
+                Some(v) => Some(serde_json::from_slice(&v.value).map_err(internal)?),
+                None => None,
+            };
+        if !image.is_some_and(|i| images::may_read_upload(&i, &me, uid)) {
+            return Err(Status::permission_denied(
+                "the image is not imported by this node",
+            ));
+        }
+        let mut file = uploads.open(uid, r.offset).await.map_err(|e| {
+            tracing::warn!(image = %uid, error = %e, "cannot open an upload");
+            Status::failed_precondition("the upload is not there")
+        })?;
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                match file.read(&mut buf).await {
+                    Ok(0) => return,
+                    Ok(n) => {
+                        let chunk = UploadChunk {
+                            data: buf[..n].to_vec(),
+                        };
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(internal(e))).await;
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
 
     async fn get_volume_key(

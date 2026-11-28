@@ -2883,6 +2883,7 @@ name = "torngat-apiserver"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "futures-util",
  "http-body-util",
  "serde",
  "serde_json",
@@ -2892,9 +2893,11 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "tokio-util",
  "torngat-api",
  "torngat-pki",
  "torngat-store",
+ "torngat-uploads",
  "tower",
  "tracing",
  "uuid",
@@ -2944,6 +2947,7 @@ dependencies = [
  "torngat-pki",
  "torngat-proto",
  "torngat-store",
+ "torngat-uploads",
  "tower",
  "tracing",
  "uuid",
@@ -3013,6 +3017,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "torngat-uploads"
+version = "0.0.1"
+dependencies = [
+ "sha2 0.11.1",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "torngat-api",
+ "torngat-pki",
+ "uuid",
+]
+
+[[package]]
 name = "torngatd"
 version = "0.0.1"
 dependencies = [
@@ -3031,6 +3048,7 @@ dependencies = [
  "torngat-keys",
  "torngat-pki",
  "torngat-store",
+ "torngat-uploads",
  "tracing",
  "tracing-subscriber",
  "zeroize",

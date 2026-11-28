@@ -119,6 +119,7 @@ async fn env() -> Env {
         token: AdminToken::new(TOKEN).unwrap(),
         ca_hash: pki.ca.hash(),
         backup: torngat_apiserver::Backup::new(|| async { Ok(None) }),
+        uploads: None,
     });
     Env {
         api,

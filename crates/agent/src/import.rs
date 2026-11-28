@@ -361,6 +361,8 @@ impl<T: ImageTool> Importer<T> {
             let Some(step) = want else { continue };
             let job = Job {
                 tool: self.tool.clone(),
+                client: client.clone(),
+                report: report_of(image),
                 uid,
                 url: image.spec.source.url.clone(),
                 checksum: image.spec.source.checksum.clone(),
@@ -426,8 +428,11 @@ async fn send(client: &mut ControlClient<Channel>, r: ImageReport) -> Sent {
 /// What a step needs, copied out of the image.
 struct Job<T> {
     tool: T,
+    /// To read an uploaded image from the controller.
+    client: ControlClient<Channel>,
+    report: ImageReport,
     uid: Uuid,
-    url: String,
+    url: Option<String>,
     checksum: Checksum,
     length: u64,
     format: Option<ImageFormat>,
@@ -442,7 +447,9 @@ impl<T: ImageTool> Job<T> {
     async fn run(self, step: Step) -> Result<Done, String> {
         match step {
             Step::Length => {
-                let n = self.tool.length(&self.url, self.reach, self.max).await?;
+                // An upload's length is known from the start.
+                let url = self.url.as_deref().ok_or("no URL to download")?;
+                let n = self.tool.length(url, self.reach, self.max).await?;
                 if n == 0 {
                     return Err("the file is empty".into());
                 }
@@ -450,7 +457,7 @@ impl<T: ImageTool> Job<T> {
             }
             Step::Download => {
                 let (path, room) = self.staging.clone().ok_or("no staging volume")?;
-                if room < self.length {
+                if room < padded(self.length) {
                     return Err("the staging volume is too small".into());
                 }
                 let mut out = tokio::fs::OpenOptions::new()
@@ -458,19 +465,34 @@ impl<T: ImageTool> Job<T> {
                     .open(&path)
                     .await
                     .map_err(|e| format!("cannot open the staging volume: {e}"))?;
-                let (url, reach, max) = (&self.url, self.reach, self.max);
-                self.tool
-                    .download(url, reach, max, self.length, &self.checksum, &mut out)
-                    .await?;
+                match self.url.as_deref() {
+                    Some(url) => {
+                        let (reach, max) = (self.reach, self.max);
+                        self.tool
+                            .download(url, reach, max, self.length, &self.checksum, &mut out)
+                            .await?;
+                    }
+                    None => self.read_upload(&mut out).await?,
+                }
+                // qemu-img reads whole sectors: what follows the file, up to the next one, is zeros.
+                {
+                    use tokio::io::AsyncWriteExt;
+                    let pad = padded(self.length) - self.length;
+                    out.write_all(&vec![0u8; usize::try_from(pad).unwrap_or(0)])
+                        .await
+                        .map_err(|e| format!("cannot write the staging volume: {e}"))?;
+                }
                 out.sync_all()
                     .await
                     .map_err(|e| format!("cannot write the staging volume: {e}"))?;
                 drop(out);
                 let format = detect(&path, self.length).await?;
                 let size = match format {
-                    ImageFormat::Raw => self.length,
+                    ImageFormat::Raw => padded(self.length),
                     ImageFormat::Qcow2 => {
-                        self.tool.qcow2_size(self.uid, &path, self.length).await?
+                        self.tool
+                            .qcow2_size(self.uid, &path, padded(self.length))
+                            .await?
                     }
                 };
                 if size == 0 || size > self.max {
@@ -489,12 +511,63 @@ impl<T: ImageTool> Job<T> {
                     return Err("the image's volume is too small".into());
                 }
                 self.tool
-                    .convert(self.uid, &src, self.length, format, &dst)
+                    .convert(self.uid, &src, padded(self.length), format, &dst)
                     .await?;
                 Ok(Done::Converted)
             }
         }
     }
+}
+
+impl<T> Job<T> {
+    /// Copies the image's upload from the controller into `out`, checking its length and
+    /// checksum again.
+    async fn read_upload(&self, out: &mut tokio::fs::File) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+        let r = &self.report;
+        let req = torngat_proto::v1::ReadUploadRequest {
+            org: r.org.clone(),
+            project: r.project.clone(),
+            name: r.name.clone(),
+            uid: r.uid.clone(),
+            offset: 0,
+        };
+        let lost = |e: tonic::Status| {
+            tracing::warn!(error = %e, "cannot read an upload from the controller");
+            "the upload could not be read: trying again".to_owned()
+        };
+        let mut stream = self
+            .client
+            .clone()
+            .read_upload(req)
+            .await
+            .map_err(lost)?
+            .into_inner();
+        let mut hash = crate::fetch::Hasher::new(&self.checksum);
+        let mut got: u64 = 0;
+        while let Some(chunk) = stream.message().await.map_err(lost)? {
+            got = got.saturating_add(chunk.data.len() as u64);
+            if got > self.length {
+                return Err("the upload is longer than announced".into());
+            }
+            hash.update(&chunk.data);
+            out.write_all(&chunk.data)
+                .await
+                .map_err(|e| format!("cannot write the staging volume: {e}"))?;
+        }
+        if got != self.length {
+            return Err("the upload is shorter than announced".into());
+        }
+        if !hash.matches(&self.checksum) {
+            return Err("the checksum does not match".into());
+        }
+        Ok(())
+    }
+}
+
+/// `len` rounded up to whole sectors, as qemu-img reads them.
+fn padded(len: u64) -> u64 {
+    len.div_ceil(512).saturating_mul(512)
 }
 
 /// The format of the image in the first `len` bytes of `path`, from its first bytes. A qcow2
