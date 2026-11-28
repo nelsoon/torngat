@@ -11,6 +11,7 @@ pub mod fetch;
 pub mod import;
 pub mod inventory;
 pub mod join;
+pub mod net;
 pub mod qemu;
 pub mod qmp;
 pub mod runtime;
@@ -261,16 +262,25 @@ pub async fn run<R: Runtime, D: Drivers, C: Crypt>(
     drivers: D,
     crypt: C,
 ) {
-    run_with(cfg, runtime, drivers, crypt, import::QemuImg::default()).await;
+    run_with(
+        cfg,
+        runtime,
+        drivers,
+        crypt,
+        import::QemuImg::default(),
+        net::Off,
+    )
+    .await;
 }
 
-/// [`run`], with `tool` for images.
-pub async fn run_with<R: Runtime, D: Drivers, C: Crypt, T: import::ImageTool>(
+/// [`run`], with `tool` for images and `network` for the node's networks.
+pub async fn run_with<R: Runtime, D: Drivers, C: Crypt, T: import::ImageTool, N: net::Network>(
     cfg: AgentConfig,
     runtime: R,
     drivers: D,
     crypt: C,
     tool: T,
+    mut network: N,
 ) {
     let setup = Connector::new(&cfg).and_then(|c| Ok((c, cluster_uid(&cfg.ca_pem)?)));
     let (connector, cluster) = match setup {
@@ -287,7 +297,14 @@ pub async fn run_with<R: Runtime, D: Drivers, C: Crypt, T: import::ImageTool>(
     let mut backoff = MIN;
     loop {
         let started = std::time::Instant::now();
-        let r = session(&connector, &runtime, &mut storage, &mut importer).await;
+        let r = session(
+            &connector,
+            &runtime,
+            &mut storage,
+            &mut importer,
+            &mut network,
+        )
+        .await;
         // What a step found can no longer be reported: the next session starts it again.
         importer.stop_all().await;
         if let Err(e) = r {
@@ -307,11 +324,12 @@ pub async fn run_with<R: Runtime, D: Drivers, C: Crypt, T: import::ImageTool>(
 type Reported = BTreeMap<Uuid, (String, u64, String)>;
 
 /// One connected session: register, heartbeat, follow assignments.
-pub async fn session<R: Runtime, D: Drivers, C: Crypt, T: import::ImageTool>(
+pub async fn session<R: Runtime, D: Drivers, C: Crypt, T: import::ImageTool, N: net::Network>(
     connector: &Connector,
     runtime: &R,
     storage: &mut Storage<D, C>,
     importer: &mut import::Importer<T>,
+    network: &mut N,
 ) -> Result<(), AgentError> {
     let step_done = importer.notifier();
     storage.new_session();
@@ -346,6 +364,8 @@ pub async fn session<R: Runtime, D: Drivers, C: Crypt, T: import::ImageTool>(
     // What the controller last assigned: instances, and storage (`None` if it could not be read).
     let mut instances: Vec<Instance> = vec![];
     let mut assigned: Option<storage::Assigned> = None;
+    // The node's networks; `None` until told, or while the controller cannot read them.
+    let mut networks: Option<torngat_api::network::NodeNetworks> = None;
     // Some instance waits for its disks or failed to start: tried again.
     let mut waiting = false;
     let result = async {
@@ -371,6 +391,13 @@ pub async fn session<R: Runtime, D: Drivers, C: Crypt, T: import::ImageTool>(
                         &set,
                         storage::Assigned::instances(&instances),
                     );
+                    // Unreadable or undecodable: the networks stay as they are.
+                    if !set.networks_unavailable {
+                        match serde_json::from_slice(&set.networks_json) {
+                            Ok(n) => networks = Some(n),
+                            Err(e) => tracing::error!(error = %e, "undecodable networks: left as they are"),
+                        }
+                    }
                 }
                 _ = retry.tick(), if assigned.is_some() || waiting => {}
                 () = step_done.notified() => {}
@@ -397,6 +424,10 @@ pub async fn session<R: Runtime, D: Drivers, C: Crypt, T: import::ImageTool>(
             if changed || waiting || disks_changed {
                 let disks = |i: &Instance| storage.disks(assigned.as_ref(), i);
                 waiting = reconcile(&mut client, runtime, &instances, disks, &mut reported).await?;
+            }
+            // After the instances: their interfaces exist once they run.
+            if let Some(n) = &networks {
+                network.apply(&instances, n).await;
             }
             // The next retry comes a full interval after this pass, however long it took.
             retry.reset();

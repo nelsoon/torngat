@@ -397,12 +397,20 @@ pub fn properties(inst: &Instance, cfg: &QemuConfig) -> Vec<String> {
 /// What a unit that runs untrusted input is allowed, for QEMU and qemu-img: no network, no
 /// privileges, and little of the host.
 pub(crate) fn confined() -> Vec<String> {
-    vec![
-        "PrivateIPC=yes".into(),
+    let mut p = sandbox();
+    p.extend([
         // Network: none for now; networks will hand QEMU its interfaces.
         "PrivateNetwork=yes".into(),
         "IPAddressDeny=any".into(),
         "RestrictAddressFamilies=AF_UNIX".into(),
+    ]);
+    p
+}
+
+/// [`confined`] without its network part, for units that need another.
+pub(crate) fn sandbox() -> Vec<String> {
+    vec![
+        "PrivateIPC=yes".into(),
         // Privileges.
         "CapabilityBoundingSet=".into(),
         "AmbientCapabilities=".into(),

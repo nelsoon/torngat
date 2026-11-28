@@ -39,6 +39,7 @@ torngat-attest = { path = "../attest", optional = true }
 torngat-pki = { path = "../pki" }
 torngat-proto = { path = "../proto" }
 dhcproto = "0.15.0"
+tokio-tun = "1"
 
 [dev-dependencies]
 tempfile = "3.4"

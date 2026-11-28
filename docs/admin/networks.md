@@ -42,7 +42,19 @@ POST /v1/platform/providerNetworks?provider_network_id=public
   a project's network, cannot be deleted.
 - `status.allocations`: the addresses given out, by instance uid.
 
-Datapath (next version): Open vSwitch on each node, a router namespace with NAT for each private network, one DHCP
-server per node that answers only the instances' own MACs with the address the controller gave them (no pool, no
-leases), and anti-spoofing rules on every instance port. Private networks stay on their node until the tenant overlay:
-instances on one private network but on different nodes do not reach each other.
+## Datapath
+
+Each node runs Open vSwitch with one bridge, `br-int`, that only the agent's flows forward on (secure fail mode):
+
+- Each network on the node has a VLAN tag on the bridge, chosen by the node; an instance interface is a port of its
+  network's tag. Networks with the same addresses (two projects can have them) stay apart.
+- Every instance port lets out only the instance's own MAC, its own address and ARP for it. IPv6, DHCP server replies
+  and anything else from the guest are dropped.
+- DHCP: one process per node, `torngat-dhcp.service`, user `torngat-dhcp`, sandboxed, on a tap port of the bridge. It
+  gets only the instances' DHCP requests, and answers each with the address the controller gave it (no pool, no
+  leases). Its leases are in `/run/torngat-dhcp/leases.json`.
+- `ovs-vsctl show` and `ovs-ofctl dump-flows br-int` show it all. The agent sets it again on each pass; changes made by
+  hand are undone.
+
+Not yet: the router and NAT of private networks, and provider networks' uplinks (next version). Private networks stay on
+their node until the tenant overlay: instances on one private network but on different nodes do not reach each other.
