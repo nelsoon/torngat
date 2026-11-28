@@ -142,4 +142,7 @@ POST /v1/orgs/acme/projects/web/networks?network_id=wan
   interface on each, in order. `status.interfaces` shows the MAC and address each got. Interfaces change only while the
   instance is stopped.
 - A network that an instance uses cannot be deleted, and its kind and addresses cannot change.
+- The guest gets its address by DHCP: the address in `status.interfaces`, the gateway, the name servers and the MTU.
+  Only that address works on the interface.
+- In this version a private network stays on its node: instances on it but on different nodes do not reach each other.
 - Pre-alpha: nodes do not connect interfaces yet.

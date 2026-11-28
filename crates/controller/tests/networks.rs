@@ -7,12 +7,12 @@ mod common;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
-use common::{Env, env, n};
+use common::{Env, env, n, node_cfg};
 use serde::Serialize;
 use serde_json::json;
 use torngat_api::Scope;
 use torngat_api::compute::Instance;
-use torngat_api::network::{Network, ProviderNetwork};
+use torngat_api::network::{Network, NodeNetworks, ProviderNetwork};
 use torngat_controller::keys;
 use torngat_store::{Key, Precondition};
 use uuid::Uuid;
@@ -164,4 +164,106 @@ async fn interfaces_get_addresses() {
             == Some("network wan2 is on the same provider network as another interface's")
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nodes_get_their_networks() {
+    let e = env(Vec::new(), false).await;
+    let p = Scope::Project {
+        org: n("acme"),
+        project: n("web"),
+    };
+    let pool = |net: &str| {
+        json!({"scope": "external", "cidr": format!("{net}.0/24"), "gateway": format!("{net}.1"),
+               "first": format!("{net}.10"), "last": format!("{net}.20")})
+    };
+    for (name, spec) in [
+        (
+            "public",
+            json!({"physnet": "physnet1", "tenants": true, "pool": pool("203.0.113")}),
+        ),
+        (
+            "out",
+            json!({"physnet": "physnet1", "vlan": 7, "egress": true, "pool": pool("198.51.100")}),
+        ),
+        (
+            "other",
+            json!({"physnet": "physnet1", "vlan": 8, "pool": pool("192.0.2")}),
+        ),
+    ] {
+        let o = object(name, &Scope::Platform, spec);
+        put(&e, keys::provider_network(&n(name)).unwrap(), &o).await;
+    }
+    for (name, node) in [("n1-eno2", "n1"), ("n2-eno2", "n2")] {
+        let o = object(
+            name,
+            &Scope::Platform,
+            json!({"node": node, "uplink": "eno2", "roles": ["provider"], "physnet": "physnet1"}),
+        );
+        put(&e, keys::host_network(&n(name)).unwrap(), &o).await;
+    }
+    for (name, spec) in [
+        ("lan", json!({"private": {"cidr": "10.9.0.0/29"}})),
+        ("wan", json!({"provider": {"network": "public"}})),
+        ("unused", json!({"private": {"cidr": "10.8.0.0/29"}})),
+    ] {
+        put(
+            &e,
+            keys::network(&p, &n(name)).unwrap(),
+            &object(name, &p, spec),
+        )
+        .await;
+    }
+    let mut vm = object(
+        "a",
+        &p,
+        json!({"vcpus": 1, "memory_mib": 64, "power_state": "stopped",
+               "interfaces": [{"network": "lan"}, {"network": "wan"}]}),
+    );
+    vm["status"] = json!({"node": "n1"});
+    put(&e, keys::instance(&p, &n("a")).unwrap(), &vm).await;
+
+    let mut c = torngat_agent::connect(&node_cfg(&e, "n1", "active").await)
+        .await
+        .unwrap();
+    let mut stream = c
+        .assignments(torngat_proto::v1::AssignmentsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let set = stream.message().await.unwrap().unwrap();
+    assert!(!set.networks_unavailable);
+    let got: NodeNetworks = serde_json::from_slice(&set.networks_json).unwrap();
+    let names = |v: Vec<String>| {
+        let mut v = v;
+        v.sort();
+        v
+    };
+    assert_eq!(
+        names(
+            got.networks
+                .iter()
+                .map(|x| x.metadata.name.to_string())
+                .collect()
+        ),
+        ["lan", "wan"]
+    );
+    assert_eq!(
+        names(
+            got.provider_networks
+                .iter()
+                .map(|x| x.metadata.name.to_string())
+                .collect()
+        ),
+        ["out", "public"]
+    );
+    assert_eq!(
+        names(
+            got.host_networks
+                .iter()
+                .map(|x| x.metadata.name.to_string())
+                .collect()
+        ),
+        ["n1-eno2"]
+    );
 }

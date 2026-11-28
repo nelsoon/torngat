@@ -84,6 +84,15 @@ pub async fn create_host_network(
             "a host network on this uplink and VLAN".into(),
         ));
     }
+    // A node reaches a physnet by one uplink.
+    let physnet = |h: &HostNetwork| {
+        h.spec.node == spec.node && spec.physnet.is_some() && h.spec.physnet == spec.physnet
+    };
+    if any(&st, &HOST_NETWORKS.prefix(&Scope::Platform)?, physnet).await? {
+        return Err(ApiError::AlreadyExists(
+            "a host network of this node on this physnet".into(),
+        ));
+    }
     HOST_NETWORKS
         .create(&st, Scope::Platform, n, Uuid::now_v7(), input)
         .await
@@ -113,8 +122,15 @@ pub async fn update_host_network(
     let n = name("host network", &h)?;
     let check = async |old: HostNetwork, new: HostNetworkSpec| {
         new.validate()?;
-        if (&old.spec.node, &old.spec.uplink, old.spec.vlan) != (&new.node, &new.uplink, new.vlan) {
-            return Err(invalid("node, uplink and vlan cannot change"));
+        // Physnet too: a node reaches a physnet by one uplink, checked when it is made.
+        if (
+            &old.spec.node,
+            &old.spec.uplink,
+            old.spec.vlan,
+            &old.spec.physnet,
+        ) != (&new.node, &new.uplink, new.vlan, &new.physnet)
+        {
+            return Err(invalid("node, uplink, vlan and physnet cannot change"));
         }
         Ok(())
     };

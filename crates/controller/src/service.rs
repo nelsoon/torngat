@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::scheduler::list_all;
 use torngat_api::storage::StorageCapabilities;
 
-use crate::{Controller, identity, images, keys, storage, volume_keys};
+use crate::{Controller, identity, images, interfaces, keys, storage, volume_keys};
 
 /// How often an agent's assignment set is recomputed.
 const ASSIGNMENT_POLL: Duration = Duration::from_millis(500);
@@ -271,7 +271,11 @@ impl Control for ControlService {
                         None
                     }
                 };
-                let set = (set, storage);
+                let networks = interfaces::assigned_networks(&store, &me)
+                    .await
+                    .map_err(|e| tracing::error!(node = %me, error = %e, "network assignments unavailable"))
+                    .ok();
+                let set = (set, storage, networks);
                 if last.as_ref() != Some(&set) {
                     let msg = AssignmentSet {
                         api_version: API_VERSION.into(),
@@ -285,6 +289,8 @@ impl Control for ControlService {
                             .map(|s| s.3.clone())
                             .unwrap_or_default(),
                         storage_unavailable: set.1.is_none(),
+                        networks_json: set.2.clone().unwrap_or_default(),
+                        networks_unavailable: set.2.is_none(),
                     };
                     if tx.send(Ok(msg)).await.is_err() {
                         return; // agent went away

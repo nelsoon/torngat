@@ -4,12 +4,11 @@
 
 mod common;
 
-use common::{Env, env, env_with, n};
+use common::{Env, env, env_with, n, node_cfg, set_phase};
 use serde::Serialize;
 use serde_json::json;
 use tonic::Code;
 use tonic::transport::Channel;
-use torngat_agent::{AgentConfig, NodeKey};
 use torngat_api::storage::{StoragePool, Volume, VolumeOwner, VolumePhase};
 use torngat_api::{Name, Scope};
 use torngat_controller::storage::{PlaceError, place_volume};
@@ -65,40 +64,11 @@ fn object(
 }
 
 /// An enrolled and registered node's credentials.
-async fn node_cfg(e: &Env, name: &str, phase: &str) -> AgentConfig {
-    let issued = e.ca.issue_node(&n(name)).unwrap();
-    torngat_controller::identity::enroll(
-        &e.store,
-        &n(name),
-        &issued.identity(torngat_pki::KeyStorage::File).unwrap(),
-    )
-    .await
-    .unwrap();
-    set_phase(e, name, phase).await;
-    AgentConfig {
-        controller_url: format!("https://{}", e.control),
-        controller_name: torngat_pki::CONTROLLER_NAME.into(),
-        ca_pem: e.ca.cert_pem().as_bytes().to_vec(),
-        cert_pem: issued.chain_pem.into_bytes(),
-        key: NodeKey::File(issued.key_pem.unwrap().into_bytes()),
-    }
-}
-
 /// An enrolled and registered node, and its connection.
 async fn node(e: &Env, name: &str, phase: &str) -> Client {
     torngat_agent::connect(&node_cfg(e, name, phase).await)
         .await
         .unwrap()
-}
-
-async fn set_phase(e: &Env, name: &str, phase: &str) {
-    let o = object(
-        name,
-        &Scope::Platform,
-        json!({"roles": ["compute"]}),
-        json!({"phase": phase}),
-    );
-    put(&e.store, keys::node(&n(name)).unwrap(), &o).await;
 }
 
 async fn pool(e: &Env, name: &str, node: &str) -> StoragePool {

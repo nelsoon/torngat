@@ -11,7 +11,8 @@ use std::net::Ipv4Addr;
 
 use torngat_api::compute::Instance;
 use torngat_api::network::{
-    InterfaceStatus, Network, NetworkSpec, NetworkStatus, ProviderNetwork, mac_of,
+    HostNetwork, InterfaceStatus, Network, NetworkSpec, NetworkStatus, NodeNetworks,
+    ProviderNetwork, mac_of,
 };
 use torngat_api::{Name, Object, Scope};
 use torngat_store::{Key, Store};
@@ -251,4 +252,70 @@ pub async fn interfaces_once(ctl: &Controller) -> Result<usize, ScheduleError> {
 /// released here. None yet.
 fn is_node_address(_owner: Uuid) -> bool {
     false
+}
+
+/// What `node` is told of networks (JSON of [`NodeNetworks`]): deleted ones too, so it can take
+/// them apart.
+pub(crate) async fn assigned_networks(
+    store: &Store,
+    node: &Name,
+) -> Result<Vec<u8>, ScheduleError> {
+    let instances = all::<Instance>(store, &keys::all_instances()?)
+        .await?
+        .ok_or_else(unreadable)?;
+    let named: BTreeSet<(&Scope, &Name)> = instances
+        .iter()
+        .filter(|(i, _)| i.status.node.as_ref() == Some(node))
+        .flat_map(|(i, _)| {
+            i.spec
+                .interfaces
+                .iter()
+                .map(|f| (&i.metadata.scope, &f.network))
+        })
+        .collect();
+    let networks: Vec<Network> = all::<Network>(store, &keys::all_networks()?)
+        .await?
+        .ok_or_else(unreadable)?
+        .into_iter()
+        .map(|(n, _)| n)
+        .filter(|n| named.contains(&(&n.metadata.scope, &n.metadata.name)))
+        .collect();
+    let providers_named: BTreeSet<&Name> = networks
+        .iter()
+        .filter_map(|n| match &n.spec {
+            NetworkSpec::Provider { network } => Some(network),
+            NetworkSpec::Private { .. } => None,
+        })
+        .collect();
+    let provider_networks = all::<ProviderNetwork>(store, &keys::provider_networks()?)
+        .await?
+        .ok_or_else(unreadable)?
+        .into_iter()
+        .map(|(p, _)| p)
+        .filter(|p| p.spec.egress || providers_named.contains(&p.metadata.name))
+        .collect();
+    let host_networks = all::<HostNetwork>(store, &keys::host_networks()?)
+        .await?
+        .ok_or_else(unreadable)?
+        .into_iter()
+        .map(|(h, _)| h)
+        .filter(|h| &h.spec.node == node)
+        .collect();
+    // Specs only: allocations name other instances (and other tenants' on provider networks).
+    let mut out = NodeNetworks {
+        host_networks,
+        provider_networks,
+        networks,
+    };
+    for n in &mut out.networks {
+        n.status = NetworkStatus::default();
+        n.metadata.etag = None;
+        n.metadata.update_time = None;
+    }
+    for p in &mut out.provider_networks {
+        p.status = NetworkStatus::default();
+        p.metadata.etag = None;
+        p.metadata.update_time = None;
+    }
+    Ok(serde_json::to_vec(&out)?)
 }

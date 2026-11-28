@@ -54,6 +54,10 @@ message AssignmentSet {
   repeated bytes images_json = 6;
   // JSON of torngat_api::settings::ImageSettings. Empty with storage_unavailable.
   bytes image_settings_json = 7;
+  // JSON of torngat_api::network::NodeNetworks. Empty with networks_unavailable.
+  bytes networks_json = 8;
+  // The controller could not read networks: leave the node's networks as they are.
+  bool networks_unavailable = 9;
 }
 
 message InstanceReport {

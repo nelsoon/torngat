@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dhcp;
 pub mod fetch;
 pub mod import;
 pub mod inventory;
