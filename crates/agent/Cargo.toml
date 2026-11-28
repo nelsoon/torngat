@@ -38,6 +38,7 @@ torngat-api = { path = "../../api" }
 torngat-attest = { path = "../attest", optional = true }
 torngat-pki = { path = "../pki" }
 torngat-proto = { path = "../proto" }
+dhcproto = "0.15.0"
 
 [dev-dependencies]
 tempfile = "3.4"

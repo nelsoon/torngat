@@ -7,7 +7,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{Env, env, n};
+use common::{Env, env, n, node_cfg};
 use serde::Serialize;
 use serde_json::json;
 use tonic::Code;
@@ -60,35 +60,9 @@ async fn until<F: Future<Output = bool>>(what: &str, mut f: impl FnMut() -> F) {
     }
 }
 
-/// An enrolled, active node's credentials.
-async fn node_cfg(e: &Env, name: &str) -> torngat_agent::AgentConfig {
-    let issued = e.ca.issue_node(&n(name)).unwrap();
-    torngat_controller::identity::enroll(
-        &e.store,
-        &n(name),
-        &issued.identity(torngat_pki::KeyStorage::File).unwrap(),
-    )
-    .await
-    .unwrap();
-    let o = object(
-        name,
-        &Scope::Platform,
-        json!({"roles": ["compute"]}),
-        json!({"phase": "active"}),
-    );
-    put(&e.store, keys::node(&n(name)).unwrap(), &o).await;
-    torngat_agent::AgentConfig {
-        controller_url: format!("https://{}", e.control),
-        controller_name: torngat_pki::CONTROLLER_NAME.into(),
-        ca_pem: e.ca.cert_pem().as_bytes().to_vec(),
-        cert_pem: issued.chain_pem.into_bytes(),
-        key: torngat_agent::NodeKey::File(issued.key_pem.unwrap().into_bytes()),
-    }
-}
-
 /// An enrolled, active node, and its connection.
 async fn node(e: &Env, name: &str) -> Client {
-    let mut c = torngat_agent::connect(&node_cfg(e, name).await)
+    let mut c = torngat_agent::connect(&node_cfg(e, name, "active").await)
         .await
         .unwrap();
     // Images go only to live nodes.
@@ -516,7 +490,7 @@ async fn the_agent_imports_images() {
     let url = "https://cloud.example/disk.raw";
     tool.files.lock().unwrap().insert(url.into(), disk.clone());
     tokio::spawn(torngat_agent::run_with(
-        node_cfg(&e, "n1").await,
+        node_cfg(&e, "n1", "active").await,
         runtime.clone(),
         FileDriver::new(root.path(), 8 * GIB, false),
         crypt.clone(),

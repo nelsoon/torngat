@@ -146,3 +146,7 @@ pub fn provider_networks() -> Result<Prefix, KeyError> {
 pub fn host_networks() -> Result<Prefix, KeyError> {
     Prefix::new("platform", ["hostnetworks"])
 }
+
+pub fn host_network(name: &Name) -> Result<Key, KeyError> {
+    Key::new("platform", ["hostnetworks", name.as_str()])
+}

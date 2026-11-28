@@ -165,3 +165,39 @@ impl Env {
         }
     }
 }
+
+/// Marks `name` a compute node in `phase`.
+pub async fn set_phase(e: &Env, name: &str, phase: &str) {
+    let o = serde_json::json!({
+        "metadata": {"name": name, "scope": torngat_api::Scope::Platform, "uid": uuid::Uuid::now_v7(),
+                     "generation": 1},
+        "spec": {"roles": ["compute"]}, "status": {"phase": phase}});
+    e.store
+        .put(
+            keys::node(&n(name)).unwrap(),
+            serde_json::to_vec(&o).unwrap(),
+            Precondition::None,
+        )
+        .await
+        .unwrap();
+}
+
+/// An enrolled node in `phase`: its credentials.
+pub async fn node_cfg(e: &Env, name: &str, phase: &str) -> torngat_agent::AgentConfig {
+    let issued = e.ca.issue_node(&n(name)).unwrap();
+    torngat_controller::identity::enroll(
+        &e.store,
+        &n(name),
+        &issued.identity(torngat_pki::KeyStorage::File).unwrap(),
+    )
+    .await
+    .unwrap();
+    set_phase(e, name, phase).await;
+    torngat_agent::AgentConfig {
+        controller_url: format!("https://{}", e.control),
+        controller_name: torngat_pki::CONTROLLER_NAME.into(),
+        ca_pem: e.ca.cert_pem().as_bytes().to_vec(),
+        cert_pem: issued.chain_pem.into_bytes(),
+        key: torngat_agent::NodeKey::File(issued.key_pem.unwrap().into_bytes()),
+    }
+}

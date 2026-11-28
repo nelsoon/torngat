@@ -89,6 +89,8 @@ pub enum NetworkError {
     Range,
     #[error("at most {MAX_INTERFACES} interfaces, each on a different network")]
     Interfaces,
+    #[error("at most {MAX_DNS} name servers")]
+    Dns,
     #[error("the network's kind and addresses cannot change")]
     Immutable,
 }
@@ -321,13 +323,34 @@ pub struct ProviderNetworkSpec {
     /// The nodes' NAT for private networks goes out by it (an address of its pool per node).
     #[serde(default)]
     pub egress: bool,
+    /// Name servers given to instances by DHCP: on it, and on private networks that go out by it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns: Vec<Ipv4Addr>,
 }
+
+/// Name servers a provider network gives at most.
+pub const MAX_DNS: usize = 3;
 
 impl ProviderNetworkSpec {
     pub fn validate(&self) -> Result<(), NetworkError> {
         vlan_ok(self.vlan)?;
+        if self.dns.len() > MAX_DNS {
+            return Err(NetworkError::Dns);
+        }
         self.pool.validate()
     }
+}
+
+/// What a node is told of networks: its host networks, and the networks and provider networks
+/// its instances are on, with the egress provider networks.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodeNetworks {
+    #[serde(default)]
+    pub host_networks: Vec<HostNetwork>,
+    #[serde(default)]
+    pub provider_networks: Vec<ProviderNetwork>,
+    #[serde(default)]
+    pub networks: Vec<Network>,
 }
 
 pub type Network = Object<NetworkSpec, NetworkStatus>;
@@ -540,6 +563,7 @@ mod m1_tests {
             },
             tenants: true,
             egress: true,
+            dns: vec![ip("203.0.113.53")],
         };
         assert_eq!(p.validate(), Ok(()));
         let with = |g: &str, f: &str, l: &str| ProviderNetworkSpec {
