@@ -108,9 +108,11 @@ impl Kind {
             .map_err(|e| ApiError::Internal(e.to_string()))
     }
 
-    /// Every project's objects of every kind in the keyspace.
+    /// Every object in the keyspace, of the platform and of every project: only for a keyspace
+    /// that holds this kind alone.
     pub(crate) fn all(&self) -> Result<Prefix, ApiError> {
-        Prefix::new(self.keyspace, ["orgs"]).map_err(|e| ApiError::Internal(e.to_string()))
+        debug_assert_ne!(self.keyspace, "platform");
+        Prefix::new(self.keyspace, []).map_err(|e| ApiError::Internal(e.to_string()))
     }
 
     pub(crate) fn full_name(&self, scope: &Scope, n: &Name) -> String {

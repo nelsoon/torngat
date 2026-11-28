@@ -86,7 +86,10 @@ impl World {
 fn refusal(v: &Volume, inst: &Instance, boot: Option<&Name>) -> Option<String> {
     let n = &v.metadata.name;
     let me = inst.metadata.uid;
-    let owner = v.status.owner.map(|o| o.instance);
+    if v.status.owner.is_some_and(|o| o.image().is_some()) {
+        return Some(format!("volume {n} belongs to an image"));
+    }
+    let owner = v.status.owner.and_then(|o| o.instance());
     if boot == Some(n) && owner != Some(me) {
         return Some(format!(
             "volume {n} already exists and is not this instance's boot disk"
@@ -187,7 +190,7 @@ fn now() -> Option<OffsetDateTime> {
 }
 
 /// A pass's count of changes, from a compare-and-swap that may have lost a race (retried next pass).
-fn changed<T>(r: Result<T, PlaceError>) -> Result<usize, ScheduleError> {
+pub(crate) fn changed<T>(r: Result<T, PlaceError>) -> Result<usize, ScheduleError> {
     match r {
         Ok(_) | Err(PlaceError::Conflict) => Ok(1),
         Err(PlaceError::Controller(e)) => Err(e),
@@ -339,10 +342,13 @@ pub async fn disks_once(ctl: &Controller) -> Result<(Option<World>, usize), Sche
         {
             count += changed(release(&ctl.store, &v.metadata.scope, &v.metadata.name, u).await)?;
         }
-        if let Some(o) = v.status.owner
-            && !by_uid.contains_key(&o.instance)
+        if let Some(VolumeOwner::Instance {
+            instance,
+            delete_with_it,
+        }) = v.status.owner
+            && !by_uid.contains_key(&instance)
         {
-            count += if o.delete_with_it && !v.spec.delete_protection {
+            count += if delete_with_it && !v.spec.delete_protection {
                 delete_volume(&ctl.store, v).await?
             } else {
                 // Kept: now a volume like any other.
@@ -362,36 +368,19 @@ async fn boot_disk(ctl: &Controller, w: &World, inst: &Instance) -> Result<usize
         return Ok(0);
     };
     let scope = &inst.metadata.scope;
-    let owner = VolumeOwner {
+    let owner = VolumeOwner::Instance {
         instance: inst.metadata.uid,
         delete_with_it: !boot.keep,
     };
     let key = keys::volume(scope, &name).map_err(err)?;
     match w.volume(scope, &name) {
         None => {
-            let v: Volume = Object {
-                metadata: ObjectMeta {
-                    name: name.clone(),
-                    scope: scope.clone(),
-                    uid: Uuid::now_v7(),
-                    cell: Some(Cell::default_cell()),
-                    labels: Default::default(),
-                    generation: 1,
-                    etag: None,
-                    create_time: now(),
-                    update_time: now(),
-                    delete_time: None,
-                },
-                spec: VolumeSpec {
-                    volume_type: boot.volume_type.clone(),
-                    size_gib: boot.size_gib,
-                    delete_protection: false,
-                },
-                status: VolumeStatus {
-                    owner: Some(owner),
-                    ..Default::default()
-                },
+            let spec = VolumeSpec {
+                volume_type: boot.volume_type.clone(),
+                size_gib: boot.size_gib,
+                delete_protection: false,
             };
+            let v = new_volume(scope, &name, spec, owner);
             let made = ctl
                 .store
                 .put(
@@ -406,7 +395,7 @@ async fn boot_disk(ctl: &Controller, w: &World, inst: &Instance) -> Result<usize
                 Err(e) => Err(e.to_string()),
             }
         }
-        Some(v) if v.status.owner.is_some_and(|o| o.instance == owner.instance) => {
+        Some(v) if v.status.owner.and_then(|o| o.instance()) == Some(inst.metadata.uid) => {
             if v.status.owner == Some(owner) && v.spec.size_gib >= boot.size_gib {
                 return Ok(0);
             }
@@ -430,6 +419,34 @@ async fn boot_disk(ctl: &Controller, w: &World, inst: &Instance) -> Result<usize
         Some(_) => Err(format!(
             "volume {name} already exists and is not this instance's boot disk"
         )),
+    }
+}
+
+/// A volume that the platform makes for `owner`.
+pub(crate) fn new_volume(
+    scope: &Scope,
+    name: &Name,
+    spec: VolumeSpec,
+    owner: VolumeOwner,
+) -> Volume {
+    Object {
+        metadata: ObjectMeta {
+            name: name.clone(),
+            scope: scope.clone(),
+            uid: Uuid::now_v7(),
+            cell: Some(Cell::default_cell()),
+            labels: Default::default(),
+            generation: 1,
+            etag: None,
+            create_time: now(),
+            update_time: now(),
+            delete_time: None,
+        },
+        spec,
+        status: VolumeStatus {
+            owner: Some(owner),
+            ..Default::default()
+        },
     }
 }
 
@@ -494,8 +511,9 @@ async fn disown(store: &Store, v: &Volume) -> Result<Option<Volume>, PlaceError>
     .await
 }
 
-/// Deletes a boot disk whose instance is gone: like the API, its blocks first once it has a pool.
-async fn delete_volume(store: &Store, v: &Volume) -> Result<usize, ScheduleError> {
+/// Deletes a volume that the platform made, whose owner is gone: like the API, its blocks first
+/// once it has a pool.
+pub(crate) async fn delete_volume(store: &Store, v: &Volume) -> Result<usize, ScheduleError> {
     let key = keys::volume(&v.metadata.scope, &v.metadata.name)?;
     let Some(cur) = store.get(&key).await? else {
         return Ok(0);

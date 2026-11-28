@@ -120,6 +120,10 @@ pub(crate) async fn all<T: DeserializeOwned>(
     Ok(Some(out))
 }
 
+pub(crate) fn unreadable() -> ScheduleError {
+    ScheduleError::Store(StoreError::Raft("unreadable storage object".into()))
+}
+
 /// The size to reserve for `bytes`: whole allocation units.
 pub(crate) fn rounded(pool: &StoragePool, bytes: u64) -> u64 {
     match pool.status.allocation_unit_bytes {
@@ -682,7 +686,6 @@ pub(crate) async fn assigned_storage(
     store: &Store,
     node: &Name,
 ) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>), ScheduleError> {
-    let unreadable = || ScheduleError::Store(StoreError::Raft("unreadable storage object".into()));
     let pools = all::<StoragePool>(store, &keys::storage_pools()?)
         .await?
         .ok_or_else(unreadable)?;

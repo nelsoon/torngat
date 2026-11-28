@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::Name;
 use crate::meta::Object;
 
-const GIB: u64 = 1024 * 1024 * 1024;
+pub const GIB: u64 = 1024 * 1024 * 1024;
 /// Space at the start of a device for the LUKS2 header.
 pub const LUKS_HEADER_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -256,13 +256,41 @@ pub enum VolumePhase {
     Failed,
 }
 
-/// The instance a volume was made for.
+/// What a volume was made for, by the platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VolumeOwner {
-    /// The instance's uid.
-    pub instance: Uuid,
-    /// Deleted when the instance is (unless `boot_disk.keep`).
-    pub delete_with_it: bool,
+#[serde(untagged)]
+pub enum VolumeOwner {
+    /// An instance's boot disk.
+    Instance {
+        /// The instance's uid.
+        instance: Uuid,
+        /// Deleted when the instance is (unless `boot_disk.keep`).
+        delete_with_it: bool,
+    },
+    /// Holds an image, or is where it is downloaded. Read-only for tenants, never attached as a
+    /// disk, deleted with the image.
+    Image {
+        /// The image's uid.
+        image: Uuid,
+    },
+}
+
+impl VolumeOwner {
+    /// The instance whose boot disk it is.
+    pub fn instance(&self) -> Option<Uuid> {
+        match self {
+            VolumeOwner::Instance { instance, .. } => Some(*instance),
+            VolumeOwner::Image { .. } => None,
+        }
+    }
+
+    /// The image that it holds.
+    pub fn image(&self) -> Option<Uuid> {
+        match self {
+            VolumeOwner::Image { image } => Some(*image),
+            VolumeOwner::Instance { .. } => None,
+        }
+    }
 }
 
 /// A pool, and not one made later with the same name.
@@ -298,7 +326,7 @@ pub struct VolumeStatus {
     /// only once closed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub open: bool,
-    /// The instance whose boot disk it is, if the platform made it as one.
+    /// What the platform made it for, if it made it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<VolumeOwner>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -367,6 +395,29 @@ mod tests {
         }
         assert_eq!(s.reserve(Uuid::max(), 1), Err(StorageError::TooManyVolumes));
         assert_eq!(s.reserve(Uuid::from_u128(0), 2), Ok(()));
+    }
+
+    #[test]
+    fn owners_keep_their_json() {
+        let u = Uuid::from_u128(7);
+        let boot = VolumeOwner::Instance {
+            instance: u,
+            delete_with_it: true,
+        };
+        let json = serde_json::to_value(boot).unwrap_or_default();
+        assert_eq!(
+            json,
+            serde_json::json!({"instance": u, "delete_with_it": true})
+        );
+        let image = VolumeOwner::Image { image: u };
+        for o in [boot, image] {
+            let back: VolumeOwner =
+                serde_json::from_value(serde_json::to_value(o).unwrap_or_default())
+                    .unwrap_or_else(|e| unreachable!("{e}"));
+            assert_eq!(back, o);
+        }
+        assert_eq!((boot.instance(), boot.image()), (Some(u), None));
+        assert_eq!((image.instance(), image.image()), (None, Some(u)));
     }
 
     #[test]

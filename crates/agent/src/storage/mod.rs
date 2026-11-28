@@ -39,6 +39,15 @@ use crate::{AgentError, sanitize};
 const KEY_WAIT: Duration = Duration::from_secs(5);
 const MAX_KEY_WAIT: Duration = Duration::from_secs(300);
 
+/// Org and project in messages to the controller: empty for the platform's volumes.
+fn org_project(scope: &Scope) -> Option<(String, String)> {
+    match scope {
+        Scope::Platform => Some((String::new(), String::new())),
+        Scope::Project { org, project } => Some((org.to_string(), project.to_string())),
+        Scope::Organization { .. } => None,
+    }
+}
+
 /// An instance's disks: those open on this node, and what it waits for if not all are.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Disks {
@@ -371,12 +380,10 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
         kind: StorageDriver,
         use_: Option<Option<u64>>,
     ) -> Option<VolumeReport> {
-        let Scope::Project { org, project } = &v.metadata.scope else {
-            return None;
-        };
+        let (org, project) = org_project(&v.metadata.scope)?;
         let mut report = VolumeReport {
-            org: org.to_string(),
-            project: project.to_string(),
+            org,
+            project,
             name: v.metadata.name.to_string(),
             uid: v.metadata.uid.to_string(),
             ..Default::default()
@@ -545,13 +552,13 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
         {
             return Err("the key was refused: waiting before asking again".into());
         }
-        let Scope::Project { org, project } = &v.metadata.scope else {
-            return Err("not a project's volume".into());
+        let Some((org, project)) = org_project(&v.metadata.scope) else {
+            return Err("neither a project's nor the platform's volume".into());
         };
         let r = client
             .get_volume_key(VolumeKeyRequest {
-                org: org.to_string(),
-                project: project.to_string(),
+                org,
+                project,
                 name: v.metadata.name.to_string(),
                 uid: uid.to_string(),
             })

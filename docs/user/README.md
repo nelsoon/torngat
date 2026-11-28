@@ -1,7 +1,7 @@
 # User guide
 
 Pre-alpha: there is an API, no command-line client or web interface yet, and a single administrator
-token. Instances have no images or networks yet, and their disks are not handed to the guest yet.
+token. Instances have no networks yet, and boot disks cannot be made from images yet.
 
 The API listens on the controller's loopback interface. Through a tunnel:
 
@@ -80,3 +80,28 @@ POST /v1/orgs/acme/projects/web/volumes?volume_id=data
 - A `PATCH` replaces the whole `spec`: send `delete_protection` again, or it is turned off. Send the `etag` too.
 - It is placed on a node at its first use by an instance, and stays on that node.
 - A volume in an instance's `disks` cannot be deleted. Remove it from the instance (stopped) first.
+
+## Images
+
+An image is the content of a disk to start from, such as a cloud image. It is downloaded once and kept as a read-only,
+encrypted copy. Boot disks made from images come in a later version.
+
+```
+POST /v1/orgs/acme/projects/web/images?image_id=debian-13
+{"spec": {"source": {"url": "https://cloud.example/debian-13-genericcloud-amd64.qcow2",
+                     "checksum": {"sha512": "<128 hex digits>"}},
+          "volume_type": "fast", "description": "Debian 13"}}
+```
+
+- `source.url` is an `https://` URL, without a user name, password or `#`. `checksum` is `sha256` or `sha512`, in lowercase
+  hex: an image whose download does not match is refused. qcow2 and raw images are accepted, told apart by their content.
+- `volume_type` is where the image is kept, and its space is counted like any volume's. The image's name must be at most 55
+  characters, and the volumes `<image>-staging` (the download, while it is imported) and `<image>-image` must not exist:
+  they are made for it.
+- Only `description` can change. To change anything else, delete the image and make it again.
+- `status.phase`: `pending`, `importing`, `ready`, `failed` (`status.message` says why) or `deleting`. `status.size_bytes` is
+  the size of the disk it holds, and `status.format` what was found.
+- The image's volumes are listed with the project's volumes, with `status.owner.image`. They cannot be changed, deleted or
+  used in `disks`: deleting the image deletes them.
+- The operator publishes platform images (`/v1/platform/images`) for every project.
+- Pre-alpha: nodes do not import images yet, so an image stays `importing`.

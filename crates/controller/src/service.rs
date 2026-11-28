@@ -9,6 +9,7 @@ use time::OffsetDateTime;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 use torngat_api::compute::{Instance, InstancePhase, Runtime};
+use torngat_api::image::ImageFormat;
 use torngat_api::meta::Cell;
 use torngat_api::node::{Node, NodePhase, NodeSpec, NodeStatus, Role};
 use torngat_api::{Name, Object, ObjectMeta, Scope};
@@ -21,7 +22,7 @@ use uuid::Uuid;
 use crate::scheduler::list_all;
 use torngat_api::storage::StorageCapabilities;
 
-use crate::{Controller, identity, keys, storage, volume_keys};
+use crate::{Controller, identity, images, keys, storage, volume_keys};
 
 /// How often an agent's assignment set is recomputed.
 const ASSIGNMENT_POLL: Duration = Duration::from_millis(500);
@@ -78,6 +79,22 @@ fn message(m: String) -> Result<Option<String>, Status> {
 
 fn bad(what: &str) -> Status {
     Status::invalid_argument(format!("invalid {what}"))
+}
+
+/// The platform or project object that a request is about: empty org and project are the
+/// platform's.
+fn scoped_object(
+    org: String,
+    project: String,
+    name: String,
+    uid: &str,
+) -> Result<(Scope, Name, Uuid), Status> {
+    if org.is_empty() && project.is_empty() {
+        let name = Name::new(name).map_err(|_| bad("name"))?;
+        let uid = Uuid::parse_str(uid).map_err(|_| bad("uid"))?;
+        return Ok((Scope::Platform, name, uid));
+    }
+    project_object(org, project, name, uid)
 }
 
 /// The project object that a request is about.
@@ -241,7 +258,13 @@ impl Control for ControlService {
                 // Instances keep flowing when storage objects cannot be read: then the node is
                 // told to ignore the storage lists, never given a partial one.
                 let storage = match storage::assigned_storage(&store, &me).await {
-                    Ok(s) => Some(s),
+                    Ok((pools, volumes)) => match images::assigned_images(&store, &me).await {
+                        Ok(images) => Some((pools, volumes, images)),
+                        Err(e) => {
+                            tracing::error!(node = %me, error = %e, "image assignments unavailable");
+                            None
+                        }
+                    },
                     Err(e) => {
                         tracing::error!(node = %me, error = %e, "storage assignments unavailable");
                         None
@@ -254,6 +277,7 @@ impl Control for ControlService {
                         instances_json: set.0.clone(),
                         pools_json: set.1.as_ref().map(|s| s.0.clone()).unwrap_or_default(),
                         volumes_json: set.1.as_ref().map(|s| s.1.clone()).unwrap_or_default(),
+                        images_json: set.1.as_ref().map(|s| s.2.clone()).unwrap_or_default(),
                         storage_unavailable: set.1.is_none(),
                     };
                     if tx.send(Ok(msg)).await.is_err() {
@@ -360,7 +384,7 @@ impl Control for ControlService {
     ) -> Result<Response<ReportResponse>, Status> {
         let me = identity::authenticate(&self.ctl.store, &req).await?;
         let r = req.into_inner();
-        let (scope, name, uid) = project_object(r.org, r.project, r.name, &r.uid)?;
+        let (scope, name, uid) = scoped_object(r.org, r.project, r.name, &r.uid)?;
         let state = storage::VolumeState {
             uid,
             created: r.created,
@@ -374,13 +398,39 @@ impl Control for ControlService {
         Ok(Response::new(ReportResponse {}))
     }
 
+    async fn report_image(
+        &self,
+        req: Request<ImageReport>,
+    ) -> Result<Response<ReportResponse>, Status> {
+        let me = identity::authenticate(&self.ctl.store, &req).await?;
+        let r = req.into_inner();
+        let (scope, name, uid) = scoped_object(r.org, r.project, r.name, &r.uid)?;
+        let format = match r.format.as_str() {
+            "" => None,
+            "raw" => Some(ImageFormat::Raw),
+            "qcow2" => Some(ImageFormat::Qcow2),
+            _ => return Err(bad("format")),
+        };
+        let state = images::ImageState {
+            uid,
+            download_bytes: Some(r.download_bytes).filter(|b| *b > 0),
+            format,
+            size_bytes: Some(r.size_bytes).filter(|b| *b > 0),
+            done: r.done,
+            failed: r.failed,
+            message: message(r.message)?,
+        };
+        images::report_image(&self.ctl.store, &me, &scope, &name, state).await?;
+        Ok(Response::new(ReportResponse {}))
+    }
+
     async fn get_volume_key(
         &self,
         req: Request<VolumeKeyRequest>,
     ) -> Result<Response<VolumeKeyResponse>, Status> {
         let me = identity::authenticate(&self.ctl.store, &req).await?;
         let r = req.into_inner();
-        let (scope, name, uid) = project_object(r.org, r.project, r.name, &r.uid)?;
+        let (scope, name, uid) = scoped_object(r.org, r.project, r.name, &r.uid)?;
         let key = volume_keys::volume_key(&self.ctl, &me, &scope, &name, uid).await?;
         Ok(Response::new(VolumeKeyResponse {
             key: key.expose().to_vec(),

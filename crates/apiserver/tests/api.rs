@@ -1006,3 +1006,118 @@ async fn instance_disks() {
     assert_eq!(s, StatusCode::OK, "{v}");
     e.store.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn images() {
+    let e = storage_env().await;
+    let sha = "a".repeat(64);
+    let spec = |url: &str| json!({"source": {"url": url, "checksum": {"sha256": sha}}, "volume_type": "fast"});
+    let platform = "/v1/platform/images";
+    let project = "/v1/orgs/acme/projects/web/images";
+    for base in [platform, project] {
+        let post = async |id: &str, spec: Value| {
+            let uri = format!("{base}?image_id={id}");
+            call(&e.app, "POST", &uri, Some(json!({"spec": spec})), true).await
+        };
+        let (s, v) = post("debian", spec("https://cloud.example/debian.qcow2")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["status"]["phase"], "pending");
+        let mut no_type = spec("https://h/x");
+        no_type["volume_type"] = json!("nope");
+        let mut extra = spec("https://h/x");
+        extra["node"] = json!("n1");
+        for bad in [
+            spec("http://cloud.example/x"),
+            spec("https://user:pw@cloud.example/x"),
+            json!({"source": {"url": "https://h/x", "checksum": {"md5": sha}}, "volume_type": "fast"}),
+            json!({"source": {"url": "https://h/x", "checksum": {"sha256": "ab"}}, "volume_type": "fast"}),
+            no_type,
+            extra,
+        ] {
+            let (s, v) = post("bad", bad.clone()).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {v}");
+        }
+        // Room for "<name>-staging".
+        let (s, _) = post(&"a".repeat(56), spec("https://h/x")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            post(&"a".repeat(55), spec("https://h/x")).await.0,
+            StatusCode::OK
+        );
+
+        // Only the description changes.
+        let one = format!("{base}/debian");
+        let patch = |spec: Value| call(&e.app, "PATCH", &one, Some(json!({"spec": spec})), true);
+        let mut described = spec("https://cloud.example/debian.qcow2");
+        described["description"] = json!("Debian 13");
+        assert_eq!(patch(described).await.0, StatusCode::OK);
+        assert_eq!(patch(spec("https://h/y")).await.0, StatusCode::BAD_REQUEST);
+        let (_, v) = call(&e.app, "GET", base, None, true).await;
+        assert_eq!(v["items"].as_array().unwrap().len(), 2);
+    }
+
+    // Projects see only theirs.
+    let (_, v) = call(
+        &e.app,
+        "GET",
+        "/v1/orgs/acme/projects/other/images",
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(v["items"], json!([]));
+
+    // A type used by an image stays.
+    let (_, v) = call(&e.app, "DELETE", &format!("{TYPES}/fast"), None, true).await;
+    assert_eq!(v["error"]["message"], "fast is used by images");
+
+    // Without a node yet, an image goes at once; with one, the platform deletes its volumes first.
+    let one = format!("{project}/debian");
+    assert_eq!(
+        call(&e.app, "DELETE", &one, None, true).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&e.app, "GET", &one, None, true).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let one = format!("{platform}/debian");
+    edit(&e.store, &["images", "debian"], "images", |v| {
+        v["status"] = json!({"phase": "importing", "node": "n1"});
+    })
+    .await;
+    assert_eq!(
+        call(&e.app, "DELETE", &one, None, true).await.0,
+        StatusCode::OK
+    );
+    let (_, v) = call(&e.app, "GET", &one, None, true).await;
+    assert_eq!(v["status"]["phase"], "deleting");
+    assert!(v["metadata"]["delete_time"].is_string());
+
+    // An image's volume is changed only through its image.
+    let uri = format!("{VOLUMES}?volume_id=web-image");
+    let b = json!({"spec": {"volume_type": "fast", "size_gib": 1}});
+    assert_eq!(
+        call(&e.app, "POST", &uri, Some(b), true).await.0,
+        StatusCode::OK
+    );
+    let segs = ["orgs", "acme", "projects", "web", "volumes", "web-image"];
+    edit(&e.store, &segs, "storage", |v| {
+        v["status"]["owner"] = json!({"image": UID});
+    })
+    .await;
+    let vol = format!("{VOLUMES}/web-image");
+    let b = json!({"spec": {"volume_type": "fast", "size_gib": 2}});
+    let (s, v) = call(&e.app, "PATCH", &vol, Some(b), true).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        v["error"]["message"],
+        "web-image belongs to an image: delete the image instead"
+    );
+    let (_, v) = call(&e.app, "DELETE", &vol, None, true).await;
+    assert_eq!(
+        v["error"]["message"],
+        "web-image belongs to an image: delete the image instead"
+    );
+    e.store.shutdown().await.unwrap();
+}

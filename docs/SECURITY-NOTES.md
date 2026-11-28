@@ -40,7 +40,7 @@ Items found in reviews that a later chunk must enforce.
   - A driver's device must be a block device at an absolute path; other kinds are refused.
   - The agent asks for a key each time it formats, opens or grows a volume, keeps it zeroed-on-drop, and passes it to `cryptsetup` on standard input. Keys are not in the agent's files or arguments; the kernel holds the open volume's key.
   - `--fake-storage` uses files and loop devices: tests only.
-  - Volume status has the pool's name, for operators: hide it from tenants when IAM comes.
+  - Volume status has the pool's name, and image status the node's, for operators: hide them from tenants when IAM comes.
   - A volume type or pool name in a stored object may no longer exist, or be another one: compare the uid.
   - Placement order (`crates/controller/src/storage.rs`): pool and `granted_bytes` in the volume's status, then the reservation, then `Placed`; without space both are cleared again. Growth order: the reservation, then `granted_bytes`. Deletion order: blocks, reservation (the pool is always written), the key's tombstone, then the object. The sweep reads a pool before the volumes, so that it never releases a reservation being made. Before reserving, check the pool's uid and that it is not being deleted.
   - A volume whose node is lost cannot be deleted, nor its pool: forced removal comes with node removal.
@@ -54,6 +54,8 @@ Items found in reviews that a later chunk must enforce.
   - Keys are given by the pool's node, which is enough for local storage. Shared storage must also check that the instance in `attached_to` runs on the caller.
   - Node removal must delete the identity before the node's record, or registering makes the record again as active. Needed before real data: a stolen node cannot be cut off yet.
   - Core dumps are off for the `torngatd` service only, not when it is run by hand.
+  - Images (`crates/controller/src/images.rs`): only the image's node may report on it, and only while it imports it. Each reported value (download size, format and size) is written once and bounded (at most the largest volume); `done` is accepted only once the image's volume is ready and formatted. The node gets the key of an image's volume only while it imports that image. Volumes owned by an image are never attached, and cannot be changed or deleted through the volume API. Volumes of an image that is gone are deleted (volumes are read before images, so that a new image's are not).
+  - Image URLs are checked by the API for their form only (https, a host, no credentials or fragment). Where they lead is checked on the node, at each address and redirect: before tenants get access, no import may reach private, loopback, link-local or metadata addresses.
   - After a restore, nodes have volumes that the store does not know: the agent must never delete a volume because it is unknown, only when told to.
   - Restoring brings back revoked nodes and destroyed keys, and stops instances made since. Etags start again, so an old one can match by chance. A list of revoked nodes outside the store, and instances that are adopted rather than stopped: later.
   - Backups (`crates/keys/src/recovery.rs`) can only be read with the recovery code, and only be made by the cluster. An old backup is not refused: the operator checks its date.

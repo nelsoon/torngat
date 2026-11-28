@@ -192,8 +192,12 @@ async fn check_and_get(
     {
         return Err(Status::failed_precondition("volume is not in use"));
     }
-    // Only while an instance uses it, also to format it.
-    if volume.status.attached_to.is_none() {
+    // Only while an instance uses it (also to format it), or while the node imports its image.
+    if volume.status.attached_to.is_none()
+        && !crate::images::importing_on(store, node, &volume)
+            .await
+            .map_err(internal)?
+    {
         return Err(Status::failed_precondition("no instance uses the volume"));
     }
 

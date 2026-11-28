@@ -22,6 +22,8 @@ service Control {
   rpc ReportPool(PoolReport) returns (ReportResponse);
   // What the node did with a volume on one of its pools.
   rpc ReportVolume(VolumeReport) returns (ReportResponse);
+  // How the import of an image assigned to the caller goes.
+  rpc ReportImage(ImageReport) returns (ReportResponse);
 }
 
 message RegisterRequest {
@@ -43,8 +45,11 @@ message AssignmentSet {
   repeated bytes pools_json = 3;
   // JSON of torngat_api::storage::Volume: placed, ready and deleting volumes on those pools.
   repeated bytes volumes_json = 4;
-  // The controller could not read storage objects: ignore both lists, they are empty.
+  // The controller could not read storage objects: ignore the storage and image lists, they are
+  // empty.
   bool storage_unavailable = 5;
+  // JSON of torngat_api::image::Image: the images that the caller imports.
+  repeated bytes images_json = 6;
 }
 
 message InstanceReport {
@@ -77,6 +82,7 @@ message PoolReport {
   bool released = 9;
 }
 
+// Empty org and project: the platform's.
 message VolumeReport {
   string org = 1;
   string project = 2;
@@ -96,6 +102,7 @@ message VolumeReport {
   bool open = 10;
 }
 
+// Empty org and project: the platform's.
 message VolumeKeyRequest {
   string org = 1;
   string project = 2;
@@ -103,6 +110,27 @@ message VolumeKeyRequest {
   // The volume's metadata.uid.
   string uid = 4;
 }
+// Empty org and project: the platform's. Each value is written once: a report that changes one is
+// refused.
+message ImageReport {
+  string org = 1;
+  string project = 2;
+  string name = 3;
+  // The image's metadata.uid.
+  string uid = 4;
+  // Length of the file, from the server. 0: not known yet.
+  uint64 download_bytes = 5;
+  // Detected from the downloaded file: raw or qcow2; empty if not known yet. With size_bytes.
+  string format = 6;
+  // Size of the disk that the image holds. 0: not known yet.
+  uint64 size_bytes = 7;
+  // The image is in its volume.
+  bool done = 8;
+  // The import cannot succeed; message says why.
+  bool failed = 9;
+  string message = 10;
+}
+
 message VolumeKeyResponse {
   // 32 bytes. Never logged: has no Debug that shows it.
   bytes key = 1;
