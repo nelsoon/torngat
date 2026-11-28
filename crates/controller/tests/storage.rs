@@ -10,7 +10,7 @@ use serde_json::json;
 use tonic::Code;
 use tonic::transport::Channel;
 use torngat_agent::{AgentConfig, NodeKey};
-use torngat_api::storage::{StoragePool, Volume, VolumePhase};
+use torngat_api::storage::{StoragePool, Volume, VolumeOwner, VolumePhase};
 use torngat_api::{Name, Scope};
 use torngat_controller::storage::{PlaceError, place_volume};
 use torngat_controller::volume_keys::{self, PlatformKeyError, VolumeKeyRecord};
@@ -1100,8 +1100,13 @@ async fn instances_get_their_disks() {
     })
     .await;
     let boot = volume_now(&e, "web-boot").await.unwrap();
-    let owner = boot.status.owner.unwrap();
-    assert!(owner.instance == web.metadata.uid && owner.delete_with_it);
+    assert_eq!(
+        boot.status.owner,
+        Some(VolumeOwner::Instance {
+            instance: web.metadata.uid,
+            delete_with_it: true
+        })
+    );
     assert_eq!(boot.spec.size_gib, 2);
     for v in ["web-boot", "data-1"] {
         until("attached", || async {

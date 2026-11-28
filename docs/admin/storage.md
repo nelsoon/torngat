@@ -69,7 +69,7 @@ POST /v1/platform/volumeTypes?volume_type_id=fast
   or no longer sees the volume group (its disks missing), the pool stays in deletion: there is no way to force it yet.
 - The node opens an instance's volumes before starting it, and hands QEMU the open devices: QEMU itself cannot open any
   device but `/dev/kvm`. An instance waits (`starting`) until all its volumes are open.
-- A volume gets its node when an instance first uses it. An instance's boot disk is a volume `<instance>-boot`
+- A volume gets its node when an instance first uses it (an image's, when the image gets its node). An instance's boot disk is a volume `<instance>-boot`
   whose `status.owner` names the instance; it is deleted after the instance unless the instance keeps it.
 - `status.open`: the node has it open for an instance. A volume is released from its instance only once closed, so
   that two instances never have it at once. If its node is lost, it stays with its instance.
@@ -85,6 +85,26 @@ What a pool's `status` says:
 
 A volume's `status.phase`: `pending` (no pool yet), `placing`, `placed` (has space), `ready` (exists on the node), `deleting`.
 Growing a volume first reserves the space; if there is none, it waits.
+
+## Images
+
+Platform images are for every project; projects can import their own (see the [user guide](../user/README.md#images)).
+
+```
+POST /v1/platform/images?image_id=debian-13
+{"spec": {"source": {"url": "https://cloud.example/debian-13-genericcloud-amd64.qcow2",
+                     "checksum": {"sha512": "<128 hex digits>"}},
+          "volume_type": "fast"}}
+```
+
+- An image is imported on one node: the controller picks the node with the most room in a pool of the image's volume
+  type, and shows it in `status.node`. That node downloads it into the volume `<image>-staging`, the size of the download,
+  and copies it into the volume `<image>-image`, the size of its disk. Both are volumes of the image's scope (platform
+  images have platform volumes) with `status.owner.image`, and take space like any volume. The staging volume is deleted
+  once the image is ready, or failed.
+- A volume type that an image uses cannot be deleted.
+- Deleting an image deletes its volumes first; the image goes once they are gone.
+- Pre-alpha: nodes do not import images yet (the next version does), so an image stays `importing`.
 
 ## On the node
 
@@ -121,7 +141,8 @@ attached as loop devices, and nothing keeps the file system from filling up.
 Each volume is encrypted with its own key. Keys are made and kept by the controller, encrypted under a key
 for each project, itself encrypted under the **platform key**: `/var/lib/torngat/keys/platform.key`.
 
-- A node gets a volume's key only while it is enrolled, the volume is on it, and an instance uses it. The controller logs `volume key given`. A node must ask again after a reboot.
+- A node gets a volume's key only while it is enrolled, the volume is on it, and an instance uses it, or the volume is an
+  image's that this node imports now. The controller logs `volume key given`. A node must ask again after a reboot.
 - There is no way to remove a node yet, so a stolen one can still ask for its keys.
 - A minute or so after a volume is gone, its key is destroyed. Copies may remain for a while in the store's own log and
   snapshots, and in backups; reading them takes the platform key, or

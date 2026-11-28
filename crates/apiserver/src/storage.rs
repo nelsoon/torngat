@@ -7,6 +7,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use torngat_api::image::Image;
 use torngat_api::storage::{
     StorageError, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec, VolumeType,
     VolumeTypeSpec,
@@ -51,7 +52,7 @@ const VOLUMES: Kind = Kind {
     path: "volumes",
 };
 
-/// Refuses a boot disk of a volume type that does not exist.
+/// Refuses a volume type that does not exist.
 pub(crate) async fn require_type(st: &AppState, t: &Name) -> Result<(), ApiError> {
     require(st, TYPES.key(&Scope::Platform, t)?, "volume type", t).await
 }
@@ -248,10 +249,27 @@ pub async fn delete_type(
             "{n} is used by volumes"
         )));
     }
+    // Their volumes may not be made yet.
+    let images = crate::images::IMAGES.all()?;
+    if any(&st, &images, |i: &Image| i.spec.volume_type == n).await? {
+        return Err(ApiError::FailedPrecondition(format!(
+            "{n} is used by images"
+        )));
+    }
     TYPES.delete(&st, &Scope::Platform, &n, cur.revision).await
 }
 
 // ---------- volumes ----------
+
+/// Refuses to change a volume that belongs to an image: the image does that.
+fn image_volume(v: &Volume) -> Option<ApiError> {
+    v.status.owner.and_then(|o| o.image()).map(|_| {
+        ApiError::FailedPrecondition(format!(
+            "{} belongs to an image: delete the image instead",
+            v.metadata.name
+        ))
+    })
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CreateVolumeQuery {
@@ -440,8 +458,12 @@ pub async fn update_volume(
     b: Body<Update<VolumeSpec>>,
 ) -> Result<Json<Volume>, ApiError> {
     let n = name("volume", &volume)?;
-    let check =
-        async |old: Volume, new: VolumeSpec| Ok(old.spec.validate_update(&old.status, &new)?);
+    let check = async |old: Volume, new: VolumeSpec| {
+        if let Some(e) = image_volume(&old) {
+            return Err(e);
+        }
+        Ok(old.spec.validate_update(&old.status, &new)?)
+    };
     VOLUMES
         .update(&st, &project_scope(&org, &project)?, &n, body(b)?, check)
         .await
@@ -457,6 +479,9 @@ pub async fn delete_volume(
     let cur = VOLUMES.find_for_delete(&st, &scope, &n, query(q)?).await?;
     let rev = cur.revision;
     let mut v: Volume = decode(cur)?;
+    if let Some(e) = image_volume(&v) {
+        return Err(e);
+    }
     if v.spec.delete_protection {
         return Err(ApiError::FailedPrecondition(format!(
             "{n} is protected from deletion"

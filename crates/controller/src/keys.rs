@@ -51,10 +51,27 @@ pub fn storage_pool(name: &Name) -> Result<Key, KeyError> {
     Key::new("platform", ["storagepools", name.as_str()])
 }
 
+/// Like the API server, objects of the platform have no scope segment.
+fn scoped<'a>(scope: &'a Scope, kind: &'a str, name: &'a Name) -> Vec<&'a str> {
+    let mut s = match scope {
+        Scope::Platform => vec![],
+        s => s.segments(),
+    };
+    s.extend([kind, name.as_str()]);
+    s
+}
+
 pub fn volume(scope: &Scope, name: &Name) -> Result<Key, KeyError> {
-    let mut s = scope.segments();
-    s.extend(["volumes", name.as_str()]);
-    Key::new("storage", s)
+    Key::new("storage", scoped(scope, "volumes", name))
+}
+
+pub fn image(scope: &Scope, name: &Name) -> Result<Key, KeyError> {
+    Key::new("images", scoped(scope, "images", name))
+}
+
+/// Every image, of the platform and of every project.
+pub fn all_images() -> Result<Prefix, KeyError> {
+    Prefix::new("images", [])
 }
 
 pub fn all_keys() -> Result<Prefix, KeyError> {
@@ -99,7 +116,7 @@ pub fn volume_types() -> Result<Prefix, KeyError> {
     Prefix::new("platform", ["volumetypes"])
 }
 
-/// Every volume in every project.
+/// Every volume, of the platform and of every project.
 pub fn all_volumes() -> Result<Prefix, KeyError> {
-    Prefix::new("storage", ["orgs"])
+    Prefix::new("storage", [])
 }

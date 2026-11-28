@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod compute;
+pub mod image;
 pub mod join;
 pub mod meta;
 pub mod name;

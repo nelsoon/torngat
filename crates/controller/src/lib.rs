@@ -12,6 +12,7 @@
 
 mod disks;
 pub mod identity;
+mod images;
 pub mod join;
 pub mod keys;
 mod ops;
@@ -29,6 +30,7 @@ use torngat_keys::PlatformKey;
 use torngat_store::Store;
 
 pub use disks::disks_once;
+pub use images::images_once;
 pub use join::{JoinService, expire_join_tokens_once, serve_join};
 pub use ops::complete_operations_once;
 pub use scheduler::schedule_once;
@@ -97,6 +99,9 @@ impl Controller {
             }
             if let Err(e) = storage::storage_once(&self).await {
                 tracing::warn!(error = %e, "storage pass failed");
+            }
+            if let Err(e) = images::images_once(&self).await {
+                tracing::warn!(error = %e, "image pass failed");
             }
             if let Err(e) = complete_operations_once(&self).await {
                 tracing::warn!(error = %e, "operation pass failed");

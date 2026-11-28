@@ -18,6 +18,7 @@ mod backup;
 mod crud;
 mod error;
 mod handlers;
+mod images;
 mod join_tokens;
 mod settings;
 mod storage;
@@ -109,6 +110,26 @@ pub fn router(state: AppState) -> Router {
             get(storage::get_volume)
                 .patch(storage::update_volume)
                 .delete(storage::delete_volume),
+        )
+        .route(
+            "/v1/platform/images",
+            get(images::list_platform_images).post(images::create_platform_image),
+        )
+        .route(
+            "/v1/platform/images/{image}",
+            get(images::get_platform_image)
+                .patch(images::update_platform_image)
+                .delete(images::delete_platform_image),
+        )
+        .route(
+            "/v1/orgs/{org}/projects/{project}/images",
+            get(images::list_images).post(images::create_image),
+        )
+        .route(
+            "/v1/orgs/{org}/projects/{project}/images/{image}",
+            get(images::get_image)
+                .patch(images::update_image)
+                .delete(images::delete_image),
         )
         // Unknown paths go through authentication too, so they cannot be used to probe the API.
         .fallback(not_found)
