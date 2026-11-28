@@ -40,7 +40,7 @@ Items found in reviews that a later chunk must enforce.
   - A driver's device must be a block device at an absolute path; other kinds are refused.
   - The agent asks for a key each time it formats, opens or grows a volume, keeps it zeroed-on-drop, and passes it to `cryptsetup` on standard input. Keys are not in the agent's files or arguments; the kernel holds the open volume's key.
   - `--fake-storage` uses files and loop devices: tests only.
-  - Volume status has the pool's name, for operators: hide it from tenants when IAM comes.
+  - Volume status has the pool's name, and image status the node's, for operators: hide them from tenants when IAM comes.
   - A volume type or pool name in a stored object may no longer exist, or be another one: compare the uid.
   - Placement order (`crates/controller/src/storage.rs`): pool and `granted_bytes` in the volume's status, then the reservation, then `Placed`; without space both are cleared again. Growth order: the reservation, then `granted_bytes`. Deletion order: blocks, reservation (the pool is always written), the key's tombstone, then the object. The sweep reads a pool before the volumes, so that it never releases a reservation being made. Before reserving, check the pool's uid and that it is not being deleted.
   - A volume whose node is lost cannot be deleted, nor its pool: forced removal comes with node removal.

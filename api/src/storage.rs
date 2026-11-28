@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::Name;
 use crate::meta::Object;
 
-const GIB: u64 = 1024 * 1024 * 1024;
+pub const GIB: u64 = 1024 * 1024 * 1024;
 /// Space at the start of a device for the LUKS2 header.
 pub const LUKS_HEADER_BYTES: u64 = 16 * 1024 * 1024;
 

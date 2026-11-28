@@ -77,7 +77,7 @@ async fn node(e: &Env, name: &str) -> Client {
         json!({"phase": "active"}),
     );
     put(&e.store, keys::node(&n(name)).unwrap(), &o).await;
-    torngat_agent::connect(&torngat_agent::AgentConfig {
+    let mut c = torngat_agent::connect(&torngat_agent::AgentConfig {
         controller_url: format!("https://{}", e.control),
         controller_name: torngat_pki::CONTROLLER_NAME.into(),
         ca_pem: e.ca.cert_pem().as_bytes().to_vec(),
@@ -85,7 +85,12 @@ async fn node(e: &Env, name: &str) -> Client {
         key: torngat_agent::NodeKey::File(issued.key_pem.unwrap().into_bytes()),
     })
     .await
-    .unwrap()
+    .unwrap();
+    // Images go only to live nodes.
+    c.heartbeat(torngat_proto::v1::HeartbeatRequest {})
+        .await
+        .unwrap();
+    c
 }
 
 /// A pool of `node` that the node reported as ready, in the volume type `fast`.
@@ -377,6 +382,11 @@ async fn image_volumes_are_never_disks() {
     assert_eq!(v.status.attached_to, None);
 
     // A failure deletes what the import made.
+    let mut both = report(&img);
+    both.done = true;
+    both.failed = true;
+    both.message = "x".into();
+    assert_eq!(send(&mut n1, both).await, Err(Code::InvalidArgument));
     let mut failed = report(&img);
     failed.failed = true;
     assert_eq!(

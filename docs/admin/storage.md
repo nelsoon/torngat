@@ -97,7 +97,7 @@ POST /v1/platform/images?image_id=debian-13
           "volume_type": "fast"}}
 ```
 
-- An image is imported on one node: the controller picks the node with the most room in a pool of the image's volume
+- An image is imported on one node: the controller picks the live node with the most room in a pool of the image's volume
   type, and shows it in `status.node`. That node downloads it into the volume `<image>-staging`, the size of the download,
   and copies it into the volume `<image>-image`, the size of its disk. Both are volumes of the image's scope (platform
   images have platform volumes) with `status.owner.image`, and take space like any volume. The staging volume is deleted

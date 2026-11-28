@@ -190,7 +190,7 @@ fn now() -> Option<OffsetDateTime> {
 }
 
 /// A pass's count of changes, from a compare-and-swap that may have lost a race (retried next pass).
-fn changed<T>(r: Result<T, PlaceError>) -> Result<usize, ScheduleError> {
+pub(crate) fn changed<T>(r: Result<T, PlaceError>) -> Result<usize, ScheduleError> {
     match r {
         Ok(_) | Err(PlaceError::Conflict) => Ok(1),
         Err(PlaceError::Controller(e)) => Err(e),

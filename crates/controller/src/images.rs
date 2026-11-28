@@ -17,46 +17,33 @@ use std::collections::{BTreeMap, BTreeSet};
 use tonic::Status;
 use torngat_api::image::{Image, ImageFormat, ImagePhase, image_of, image_volume, staging_volume};
 use torngat_api::storage::{
-    MAX_VOLUME_GIB, StoragePool, Volume, VolumeOwner, VolumePhase, VolumeSpec, VolumeType,
+    GIB, MAX_VOLUME_GIB, StoragePool, Volume, VolumeOwner, VolumePhase, VolumeSpec, VolumeType,
 };
 use torngat_api::{Name, Scope};
 use torngat_store::{Precondition, Store, StoreError};
 use uuid::Uuid;
 
-use crate::disks::{delete_volume, new_volume};
+use crate::disks::{changed, delete_volume, new_volume};
 use crate::scheduler::ScheduleError;
-use crate::storage::{PlaceError, all, get, modify, place_volume, rounded, usable};
+use crate::storage::{PlaceError, all, get, modify, place_volume, rounded, unreadable, usable};
 use crate::{Controller, keys};
 
-const GIB: u64 = 1 << 30;
 /// Largest download and largest disk an image may have.
 pub const MAX_IMAGE_BYTES: u64 = MAX_VOLUME_GIB * GIB;
-
-fn unreadable() -> ScheduleError {
-    ScheduleError::Store(StoreError::Raft("unreadable storage object".into()))
-}
-
-/// Counts a change from a compare-and-swap that may have lost a race (retried next pass).
-fn changed<T>(r: Result<T, PlaceError>) -> Result<usize, ScheduleError> {
-    match r {
-        Ok(_) | Err(PlaceError::Conflict) => Ok(1),
-        Err(PlaceError::Controller(e)) => Err(e),
-        Err(e) => Err(ScheduleError::Store(StoreError::Raft(e.to_string()))),
-    }
-}
 
 /// The node with the most room in a usable pool of `volume_type`.
 fn choose_node(
     pools: &BTreeMap<Name, StoragePool>,
     types: &BTreeMap<Name, VolumeType>,
     volume_type: &Name,
+    live: impl Fn(&Name) -> bool,
 ) -> Option<Name> {
     let t = types.get(volume_type)?;
     t.spec
         .pools
         .iter()
         .filter_map(|p| pools.get(p))
-        .filter(|p| usable(p))
+        .filter(|p| usable(p) && live(&p.spec.node))
         .map(|p| {
             let free = p
                 .status
@@ -115,7 +102,12 @@ pub async fn images_once(ctl: &Controller) -> Result<usize, ScheduleError> {
         if let Some(VolumeOwner::Image { image }) = v.status.owner
             && !alive.contains(&image)
         {
-            count += delete_volume(store, v).await?;
+            match delete_volume(store, v).await {
+                Ok(n) => count += n,
+                Err(e) => {
+                    tracing::warn!(volume = %v.metadata.name, error = %e, "cannot delete a volume of a gone image");
+                }
+            }
         }
     }
     Ok(count)
@@ -166,7 +158,9 @@ async fn step(
 
     match image.status.phase {
         ImagePhase::Pending => {
-            let Some(node) = choose_node(pools, types, &image.spec.volume_type) else {
+            let Some(node) = choose_node(pools, types, &image.spec.volume_type, |n| {
+                ctl.live.is_live(n)
+            }) else {
                 return tell(store, image, "waiting for room in its volume type").await;
             };
             changed(
@@ -277,7 +271,9 @@ async fn tell(store: &Store, image: &Image, problem: &str) -> Result<usize, Sche
     }
     changed(
         modify_image(store, image, |i| {
-            if i.status.message.as_deref() == Some(problem) {
+            // Not on an image that is done meanwhile.
+            let busy = matches!(i.status.phase, ImagePhase::Pending | ImagePhase::Importing);
+            if !busy || i.status.message.as_deref() == Some(problem) {
                 return false;
             }
             i.status.message = Some(problem.to_owned());
@@ -368,26 +364,27 @@ pub(crate) async fn report_image(
     if r.format.is_some() != r.size_bytes.is_some() {
         return Err(bad("format and size come together"));
     }
+    if r.done && r.failed {
+        return Err(bad("done or failed, not both"));
+    }
     if r.failed && r.message.is_none() {
         return Err(bad("a failure needs a message"));
     }
     let target = image_volume(name).map_err(internal)?;
-    let done_ok = if r.done {
+    if r.done {
         let v = get::<Volume>(store, &keys::volume(scope, &target).map_err(internal)?)
             .await
             .map_err(internal)?;
-        v.is_some_and(|(v, _)| {
+        let ready = v.is_some_and(|(v, _)| {
             v.status.owner == Some(VolumeOwner::Image { image: r.uid })
                 && v.status.phase == VolumePhase::Ready
                 && v.status.formatted
-        })
-    } else {
-        false
-    };
-    if r.done && !done_ok {
-        return Err(Status::failed_precondition(
-            "the image's volume is not ready",
-        ));
+        });
+        if !ready {
+            return Err(Status::failed_precondition(
+                "the image's volume is not ready",
+            ));
+        }
     }
 
     let mut refused: Option<Status> = None;
@@ -438,7 +435,12 @@ pub(crate) async fn report_image(
         if r.failed {
             new.phase = ImagePhase::Failed;
         }
-        new.message = if r.done { None } else { r.message.clone() };
+        // A report without a message keeps the controller's.
+        if r.done {
+            new.message = None;
+        } else if r.message.is_some() {
+            new.message.clone_from(&r.message);
+        }
         if new == i.status {
             return false;
         }
@@ -509,9 +511,18 @@ mod tests {
         .into_iter()
         .collect();
         let n = |s: &str| Name::new(s).unwrap();
-        assert_eq!(choose_node(&pools, &types, &n("all")), Some(n("n2")));
-        assert_eq!(choose_node(&pools, &types, &n("small")), None);
-        assert_eq!(choose_node(&pools, &types, &n("missing")), None);
-        assert_eq!(choose_node(&pools, &types, &n("unknown")), None);
+        assert_eq!(
+            choose_node(&pools, &types, &n("all"), |_| true),
+            Some(n("n2"))
+        );
+        // Only live nodes.
+        let not_n2 = |x: &Name| x.as_str() != "n2";
+        assert_eq!(
+            choose_node(&pools, &types, &n("all"), not_n2),
+            Some(n("n1"))
+        );
+        assert_eq!(choose_node(&pools, &types, &n("small"), |_| true), None);
+        assert_eq!(choose_node(&pools, &types, &n("missing"), |_| true), None);
+        assert_eq!(choose_node(&pools, &types, &n("unknown"), |_| true), None);
     }
 }
