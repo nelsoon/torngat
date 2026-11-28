@@ -3046,6 +3046,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-tun"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5a376ac808b88a5c2665029159c7842a29806faecc3060a1b4d9b983e0a6ce1"
+dependencies = [
+ "libc",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3150,6 +3160,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
+ "tokio-tun",
  "tonic",
  "torngat-api",
  "torngat-attest",

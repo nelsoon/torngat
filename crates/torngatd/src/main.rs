@@ -118,6 +118,15 @@ enum Cmd {
         #[arg(long)]
         allow_unsealed_root: bool,
     },
+    /// Answer instances' DHCP on the datapath's DHCP port (run by the agent, sandboxed).
+    DhcpServer {
+        /// The tap on the node's bridge.
+        #[arg(long)]
+        tap: String,
+        /// The leases the agent writes.
+        #[arg(long)]
+        leases: PathBuf,
+    },
     /// Print this machine's TPM endorsement key pin (for `ek_sha256` on a join token).
     TpmPin {
         #[arg(long, default_value = DEFAULT_TCTI)]
@@ -618,7 +627,7 @@ async fn run(
     if cfg.role == Role::Agent {
         tracing::info!(node = %cfg.name, "torngatd running (agent)");
         tokio::select! {
-            () = torngat_agent::run(agent_cfg, runtime, driver, Cryptsetup) => {
+            () = agent(agent_cfg, runtime, driver) => {
                 return Err("agent stopped".into());
             }
             _ = tokio::signal::ctrl_c() => {
@@ -668,7 +677,7 @@ async fn run(
         tls.key_pem.clone(),
     ));
     let scheduler = tokio::spawn(ctl.run_scheduler(Duration::from_millis(500)));
-    let agent = tokio::spawn(torngat_agent::run(agent_cfg, runtime, driver, Cryptsetup));
+    let agent = tokio::spawn(agent(agent_cfg, runtime, driver));
     let state = torngat_apiserver::AppState {
         uploads: Some(uploads),
         store: store.clone(),
@@ -704,6 +713,25 @@ async fn run(
     }
     store.shutdown().await?;
     result
+}
+
+/// The agent, with the node's real datapath.
+async fn agent<R: torngat_agent::Runtime, D: torngat_agent::storage::Drivers>(
+    cfg: torngat_agent::AgentConfig,
+    runtime: R,
+    drivers: D,
+) {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/bin/torngatd"));
+    let network = torngat_agent::net::Ovs::new(torngat_agent::net::System::default(), Some(exe));
+    torngat_agent::run_with(
+        cfg,
+        runtime,
+        drivers,
+        Cryptsetup,
+        torngat_agent::import::QemuImg::default(),
+        network,
+    )
+    .await;
 }
 
 fn main() -> std::process::ExitCode {
@@ -758,6 +786,7 @@ async fn main_async() -> Res<()> {
             check_root_sealed(allow_unsealed_root)?;
             backup::restore(data, backup, tpm_device).await
         }
+        Cmd::DhcpServer { tap, leases } => Ok(torngat_agent::dhcp::serve(&tap, &leases).await?),
         Cmd::TpmPin { tpm_device } => {
             println!("{}", node_key::ek_pin(&tpm_device)?);
             Ok(())

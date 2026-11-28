@@ -495,6 +495,7 @@ async fn the_agent_imports_images() {
         FileDriver::new(root.path(), 8 * GIB, false),
         crypt.clone(),
         tool,
+        torngat_agent::net::Off,
     ));
     let o = object(
         "data",
