@@ -197,6 +197,9 @@ async fn check_and_get(
         && !crate::images::importing_on(store, node, &volume)
             .await
             .map_err(internal)?
+        && !crate::images::filling_on(store, node, &volume)
+            .await
+            .map_err(internal)?
     {
         return Err(Status::failed_precondition("no instance uses the volume"));
     }

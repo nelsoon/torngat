@@ -103,7 +103,17 @@ pub async fn images_once(ctl: &Controller) -> Result<usize, ScheduleError> {
 
     let mut count = 0;
     for (image, stored) in &images {
-        let r = step(ctl, image, stored.revision, &by_name, &pools, &types).await;
+        let copying = being_copied(&volumes, image.metadata.uid);
+        let r = step(
+            ctl,
+            image,
+            stored.revision,
+            &by_name,
+            &pools,
+            &types,
+            copying,
+        )
+        .await;
         match r {
             Ok(n) => count += n,
             Err(e) => {
@@ -136,6 +146,7 @@ async fn step(
     volumes: &BTreeMap<(&Scope, &Name), &Volume>,
     pools: &BTreeMap<Name, StoragePool>,
     types: &BTreeMap<Name, VolumeType>,
+    copying: bool,
 ) -> Result<usize, ScheduleError> {
     let store = &ctl.store;
     let scope = &image.metadata.scope;
@@ -157,7 +168,10 @@ async fn step(
     if image.metadata.delete_time.is_some() {
         let mut count = 0;
         let mut left = false;
-        for v in [own(&staging), own(&target)].into_iter().flatten() {
+        // Its volume stays while a boot disk is being filled from it.
+        let target = if copying { None } else { own(&target) };
+        left |= copying;
+        for v in [own(&staging), target].into_iter().flatten() {
             left = true;
             count += delete_volume(store, v).await?;
         }
@@ -398,6 +412,55 @@ pub(crate) async fn importing_on(
         && i.metadata.delete_time.is_none()
         && i.status.phase == ImagePhase::Importing
         && i.status.node.as_ref() == Some(node))
+}
+
+/// Whether `v` holds a ready image that a volume on `node` is being filled from: then the node
+/// may have its key, to copy it.
+pub(crate) async fn filling_on(store: &Store, node: &Name, v: &Volume) -> Result<bool, PlaceError> {
+    let (Some(VolumeOwner::Image { image }), Some(name)) =
+        (v.status.owner, image_of(&v.metadata.name))
+    else {
+        return Ok(false);
+    };
+    if image_volume(&name).as_ref() != Ok(&v.metadata.name) {
+        return Ok(false);
+    }
+    let Some((i, _)) = get::<Image>(store, &keys::image(&v.metadata.scope, &name)?).await? else {
+        return Ok(false);
+    };
+    if i.metadata.uid != image
+        || i.metadata.delete_time.is_some()
+        || i.status.phase != ImagePhase::Ready
+    {
+        return Ok(false);
+    }
+    let volumes = all::<Volume>(store, &keys::all_volumes()?)
+        .await?
+        .ok_or_else(unreadable)?;
+    for (u, _) in volumes {
+        let fills = u.status.fill.is_some_and(|f| f.volume == v.metadata.uid)
+            && !u.status.filled
+            && u.metadata.delete_time.is_none();
+        let Some(pool) = u.status.pool.as_ref().filter(|_| fills) else {
+            continue;
+        };
+        let on = get::<StoragePool>(store, &keys::storage_pool(&pool.name)?)
+            .await?
+            .is_some_and(|(p, _)| p.metadata.uid == pool.uid && p.spec.node == *node);
+        if on {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether a volume is still being filled from the image `uid`.
+fn being_copied(volumes: &[(Volume, torngat_store::Versioned)], uid: Uuid) -> bool {
+    volumes.iter().any(|(v, _)| {
+        v.status.fill.is_some_and(|f| f.image == uid)
+            && !v.status.filled
+            && v.metadata.delete_time.is_none()
+    })
 }
 
 /// What a node reports about an image it imports.

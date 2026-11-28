@@ -102,6 +102,8 @@ message VolumeReport {
   bool formatted = 9;
   // Open on the node for an instance. Released from its instance only once closed.
   bool open = 10;
+  // Filled from its image (status.fill). Never cleared.
+  bool filled = 11;
 }
 
 // Empty org and project: the platform's.

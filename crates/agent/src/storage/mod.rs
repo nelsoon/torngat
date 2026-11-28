@@ -217,6 +217,8 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
                     v.metadata.scope == inst.metadata.scope
                         && v.metadata.name == *n
                         && v.status.attached_to == Some(inst.metadata.uid)
+                        // Not before it holds its image.
+                        && (v.status.fill.is_none() || v.status.filled)
                 })
                 .and_then(|v| Some((v.metadata.uid, *self.open.get(&v.metadata.uid)?)));
             match open {
@@ -252,6 +254,29 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
         Some((self.crypt.device_of(v.metadata.uid), size))
     }
 
+    /// Volumes open here that are still to be filled from their image's volume, also open here:
+    /// (volume uid, image volume's device, volume's device, bytes to copy).
+    pub fn fills(&self, a: &Assigned) -> Vec<(Uuid, PathBuf, PathBuf, u64)> {
+        a.volumes
+            .iter()
+            .filter(|v| !v.status.filled && self.open.contains_key(&v.metadata.uid))
+            .filter_map(|v| {
+                let f = v.status.fill?;
+                let src = a.volumes.iter().find(|s| {
+                    s.metadata.uid == f.volume
+                        && s.status.owner == Some(VolumeOwner::Image { image: f.image })
+                })?;
+                self.open.get(&src.metadata.uid)?;
+                Some((
+                    v.metadata.uid,
+                    self.crypt.device_of(src.metadata.uid),
+                    self.crypt.device_of(v.metadata.uid),
+                    f.size_bytes,
+                ))
+            })
+            .collect()
+    }
+
     fn pool(&self, p: &StoragePool) -> drv::Pool {
         drv::Pool {
             uid: p.metadata.uid.to_string(),
@@ -267,6 +292,7 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
         &mut self,
         client: &mut ControlClient<Channel>,
         a: &Assigned,
+        filled: &BTreeSet<Uuid>,
     ) -> Result<bool, AgentError> {
         let mut mine = BTreeMap::new();
         for p in &a.pools {
@@ -288,20 +314,34 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             }
         };
         let pool_of = |v: &Volume| v.status.pool.as_ref().and_then(|r| mine.get(&r.uid));
-        // In use by an instance on this node that lists it, or by an image that this node imports:
-        // the only mappings that stay open.
+        let usable = |v: &Volume| {
+            pool_of(v).is_some()
+                && v.metadata.delete_time.is_none()
+                && v.status.phase != VolumePhase::Deleting
+        };
+        let used = |v: &Volume| {
+            usable(v)
+                && v.status.attached_to.is_some_and(|i| {
+                    a.instances.get(&i).is_some_and(|(scope, names)| {
+                        *scope == v.metadata.scope && names.contains(&v.metadata.name)
+                    })
+                })
+        };
+        // Images that a used volume is still to be filled from.
+        let sources: BTreeSet<Uuid> = a
+            .volumes
+            .iter()
+            .filter(|v| used(v) && !v.status.filled)
+            .filter_map(|v| v.status.fill.map(|f| f.volume))
+            .collect();
+        // In use by an instance on this node that lists it, by an image that this node imports, or
+        // to fill such a volume: the only mappings that stay open.
         let keep: BTreeSet<String> = a
             .volumes
             .iter()
             .filter(|v| {
-                pool_of(v).is_some()
-                    && v.metadata.delete_time.is_none()
-                    && v.status.phase != VolumePhase::Deleting
-                    && (v.status.attached_to.is_some_and(|i| {
-                        a.instances.get(&i).is_some_and(|(scope, names)| {
-                            *scope == v.metadata.scope && names.contains(&v.metadata.name)
-                        })
-                    }) || a.image_of(v).is_some())
+                used(v)
+                    || (usable(v) && (a.image_of(v).is_some() || sources.contains(&v.metadata.uid)))
             })
             .map(|v| mapping(v.metadata.uid))
             .collect();
@@ -336,6 +376,8 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             if use_.is_some() && r.open {
                 in_use.insert(v.metadata.uid, r.size_bytes);
             }
+            r.filled =
+                v.status.fill.is_some() && (v.status.filled || filled.contains(&v.metadata.uid));
             // Still open: the controller does not give it to another instance yet.
             r.open |= busy.contains(&name);
             report(&mut self.volumes_reported, v.metadata.uid, r, |r| {

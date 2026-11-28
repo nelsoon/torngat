@@ -597,6 +597,8 @@ pub(crate) struct VolumeState {
     pub formatted: bool,
     /// Open on the node for an instance.
     pub open: bool,
+    /// Filled from its image: never cleared.
+    pub filled: bool,
     pub message: Option<String>,
 }
 
@@ -665,6 +667,7 @@ pub(crate) async fn report_volume(
             new.phase = VolumePhase::Ready;
         }
         new.formatted |= r.formatted;
+        new.filled |= r.filled && new.fill.is_some();
         new.open = r.open;
         // Never more than was granted.
         new.size_bytes = r.size_bytes.min(new.granted_bytes);

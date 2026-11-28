@@ -46,7 +46,7 @@ const TYPES: Kind = Kind {
     segment: "volumetypes",
     path: "volumeTypes",
 };
-const VOLUMES: Kind = Kind {
+pub(crate) const VOLUMES: Kind = Kind {
     keyspace: "storage",
     segment: "volumes",
     path: "volumes",

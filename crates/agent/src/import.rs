@@ -10,7 +10,7 @@
 //! A step that was interrupted (the agent stopped, the session ended) starts over. qemu-img reads
 //! what tenants sent: it runs in a sandbox (see [`QemuImg`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -124,6 +124,11 @@ pub struct Importer<T> {
     reported: HashMap<Uuid, (Step, Instant)>,
     /// Results not yet delivered.
     pending: HashMap<Uuid, (Step, ImageReport)>,
+    /// Volumes filled from their image here, until the controller has it.
+    filled: BTreeSet<Uuid>,
+    fills: HashMap<Uuid, JoinHandle<Result<(), String>>>,
+    /// Fills that failed, and when: tried again after a while.
+    fill_failed: HashMap<Uuid, Instant>,
     /// Told when a task ends.
     done: Arc<Notify>,
 }
@@ -146,7 +151,74 @@ impl<T: ImageTool> Importer<T> {
             tasks: HashMap::new(),
             reported: HashMap::new(),
             pending: HashMap::new(),
+            filled: BTreeSet::new(),
+            fills: HashMap::new(),
+            fill_failed: HashMap::new(),
             done: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Volumes filled here that the controller may not know of yet: their reports say so.
+    pub fn filled(&self) -> &BTreeSet<Uuid> {
+        &self.filled
+    }
+
+    /// Fills `fills` (volume, image volume's device, volume's device, bytes): a copy each, in the
+    /// sandbox. Those no longer listed are stopped (or the controller has them).
+    pub async fn fill(&mut self, fills: Vec<(Uuid, PathBuf, PathBuf, u64)>) {
+        let listed: BTreeSet<Uuid> = fills.iter().map(|f| f.0).collect();
+        self.filled.retain(|u| listed.contains(u));
+        self.fill_failed.retain(|u, _| listed.contains(u));
+        let gone: Vec<Uuid> = self
+            .fills
+            .keys()
+            .filter(|u| !listed.contains(u))
+            .copied()
+            .collect();
+        for uid in gone {
+            if let Some(h) = self.fills.remove(&uid) {
+                h.abort();
+                self.tool.stop(uid).await;
+            }
+        }
+        for (uid, src, dst, size) in fills {
+            if self.filled.contains(&uid) {
+                continue;
+            }
+            if let Some(h) = self.fills.get(&uid) {
+                if !h.is_finished() {
+                    continue;
+                }
+                if let Some(h) = self.fills.remove(&uid) {
+                    match h.await.unwrap_or_else(|e| Err(e.to_string())) {
+                        Ok(()) => {
+                            tracing::info!(volume = %uid, "volume filled from its image");
+                            self.filled.insert(uid);
+                        }
+                        Err(e) => {
+                            tracing::warn!(volume = %uid, error = %e, "cannot fill a volume from its image");
+                            self.fill_failed.insert(uid, Instant::now());
+                        }
+                    }
+                }
+                continue;
+            }
+            if self
+                .fill_failed
+                .get(&uid)
+                .is_some_and(|t| t.elapsed() < PROGRESS_EVERY)
+            {
+                continue;
+            }
+            let (tool, done) = (self.tool.clone(), self.done.clone());
+            self.fills.insert(
+                uid,
+                tokio::spawn(async move {
+                    let r = tool.convert(uid, &src, size, ImageFormat::Raw, &dst).await;
+                    done.notify_one();
+                    r
+                }),
+            );
         }
     }
 
@@ -159,6 +231,10 @@ impl<T: ImageTool> Importer<T> {
     /// Results not yet delivered are kept for the next session.
     pub async fn stop_all(&mut self) {
         self.reported.clear();
+        for (uid, h) in self.fills.drain() {
+            h.abort();
+            self.tool.stop(uid).await;
+        }
         for (uid, t) in self.tasks.drain() {
             t.handle.abort();
             self.tool.stop(uid).await;

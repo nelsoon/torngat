@@ -13,10 +13,11 @@
 use std::collections::{BTreeMap, HashMap};
 
 use time::OffsetDateTime;
-use torngat_api::compute::Instance;
+use torngat_api::compute::{BootDisk, ImageRef, Instance};
+use torngat_api::image::{Image, ImagePhase, image_volume};
 use torngat_api::meta::Cell;
 use torngat_api::storage::{
-    StoragePool, Volume, VolumeOwner, VolumePhase, VolumeSpec, VolumeStatus, VolumeType,
+    Fill, GIB, StoragePool, Volume, VolumeOwner, VolumePhase, VolumeSpec, VolumeStatus, VolumeType,
 };
 use torngat_api::{Name, Object, ObjectMeta, Scope};
 use torngat_store::{Precondition, Store, StoreError};
@@ -31,6 +32,9 @@ use crate::{Controller, keys};
 pub struct World {
     pub instances: Vec<Instance>,
     volumes: BTreeMap<Scope, BTreeMap<Name, Volume>>,
+    /// Scope and name of each volume, by uid.
+    by_uid: BTreeMap<Uuid, (Scope, Name)>,
+    images: BTreeMap<(Scope, Name), Image>,
     pools: BTreeMap<Name, StoragePool>,
     types: BTreeMap<Name, VolumeType>,
 }
@@ -38,16 +42,22 @@ pub struct World {
 impl World {
     /// `None` if an object does not decode.
     pub(crate) async fn read(store: &Store) -> Result<Option<Self>, ScheduleError> {
-        let (Some(instances), Some(volumes), Some(pools), Some(types)) = (
+        let (Some(instances), Some(volumes), Some(pools), Some(types), Some(images)) = (
             all::<Instance>(store, &keys::all_instances()?).await?,
             all::<Volume>(store, &keys::all_volumes()?).await?,
             all::<StoragePool>(store, &keys::storage_pools()?).await?,
             all::<VolumeType>(store, &keys::volume_types()?).await?,
+            all::<Image>(store, &keys::all_images()?).await?,
         ) else {
             return Ok(None);
         };
         let mut by_scope: BTreeMap<Scope, BTreeMap<Name, Volume>> = BTreeMap::new();
+        let mut by_uid = BTreeMap::new();
         for (v, _) in volumes {
+            by_uid.insert(
+                v.metadata.uid,
+                (v.metadata.scope.clone(), v.metadata.name.clone()),
+            );
             by_scope
                 .entry(v.metadata.scope.clone())
                 .or_default()
@@ -56,6 +66,11 @@ impl World {
         Ok(Some(Self {
             instances: instances.into_iter().map(|(i, _)| i).collect(),
             volumes: by_scope,
+            by_uid,
+            images: images
+                .into_iter()
+                .map(|(i, _)| ((i.metadata.scope.clone(), i.metadata.name.clone()), i))
+                .collect(),
             pools: pools
                 .into_iter()
                 .map(|(p, _)| (p.metadata.name.clone(), p))
@@ -69,6 +84,48 @@ impl World {
 
     fn volume(&self, scope: &Scope, name: &Name) -> Option<&Volume> {
         self.volumes.get(scope)?.get(name)
+    }
+
+    fn volume_by_uid(&self, uid: Uuid) -> Option<&Volume> {
+        let (scope, name) = self.by_uid.get(&uid)?;
+        self.volume(scope, name)
+    }
+
+    /// What a boot disk made from `r` is filled with, or why it cannot be made yet. Messages are
+    /// for tenants.
+    fn fill(&self, inst: &Instance, boot: &BootDisk, r: &ImageRef) -> Result<Fill, String> {
+        let scope = r.scope(&inst.metadata.scope);
+        let n = &r.name;
+        let Some(img) = self.images.get(&(scope.clone(), n.clone())) else {
+            return Err(format!("there is no image {n}"));
+        };
+        if img.metadata.delete_time.is_some() {
+            return Err(format!("image {n} is being deleted"));
+        }
+        match img.status.phase {
+            ImagePhase::Ready => {}
+            ImagePhase::Failed => return Err(format!("image {n} failed")),
+            _ => return Err(format!("waiting for image {n}")),
+        }
+        let need = img.status.size_bytes.div_ceil(GIB);
+        if boot.size_gib < need {
+            return Err(format!(
+                "boot_disk.size_gib must be at least {need} for image {n}"
+            ));
+        }
+        let owner = Some(VolumeOwner::Image {
+            image: img.metadata.uid,
+        });
+        let v = image_volume(n)
+            .ok()
+            .and_then(|vn| self.volume(&scope, &vn))
+            .filter(|v| v.status.owner == owner && v.status.phase == VolumePhase::Ready)
+            .ok_or_else(|| format!("image {n} cannot be used now"))?;
+        Ok(Fill {
+            image: img.metadata.uid,
+            volume: v.metadata.uid,
+            size_bytes: img.status.size_bytes,
+        })
     }
 
     /// The node of a placed volume's pool.
@@ -137,6 +194,19 @@ pub(crate) fn needs(w: &World, inst: &Instance) -> Result<Needs, String> {
             return Err(r);
         }
         if v.status.pool.is_none() {
+            // Filled on the node that has its image.
+            if let Some(f) = v.status.fill {
+                let node = w
+                    .volume_by_uid(f.volume)
+                    .and_then(|iv| w.node_of(iv))
+                    .ok_or_else(|| format!("the image of volume {n} cannot be used now"))?;
+                match &out.node {
+                    Some(other) if other != node => {
+                        return Err("its volumes are on different nodes".into());
+                    }
+                    _ => out.node = Some(node.clone()),
+                }
+            }
             out.pending.push(v.clone());
             continue;
         }
@@ -375,12 +445,17 @@ async fn boot_disk(ctl: &Controller, w: &World, inst: &Instance) -> Result<usize
     let key = keys::volume(scope, &name).map_err(err)?;
     match w.volume(scope, &name) {
         None => {
+            let fill = match &boot.image {
+                Some(r) => Some(w.fill(inst, boot, r)?),
+                None => None,
+            };
             let spec = VolumeSpec {
                 volume_type: boot.volume_type.clone(),
                 size_gib: boot.size_gib,
                 delete_protection: false,
             };
-            let v = new_volume(scope, &name, spec, owner);
+            let mut v = new_volume(scope, &name, spec, owner);
+            v.status.fill = fill;
             let made = ctl
                 .store
                 .put(
@@ -608,6 +683,8 @@ mod tests {
         let scope: Scope = serde_json::from_value(project()).unwrap();
         let mut w = World {
             instances: vec![],
+            by_uid: BTreeMap::new(),
+            images: BTreeMap::new(),
             volumes: [(
                 scope.clone(),
                 [&on_p2, &small, &big]
