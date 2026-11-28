@@ -122,8 +122,15 @@ pub async fn update_host_network(
     let n = name("host network", &h)?;
     let check = async |old: HostNetwork, new: HostNetworkSpec| {
         new.validate()?;
-        if (&old.spec.node, &old.spec.uplink, old.spec.vlan) != (&new.node, &new.uplink, new.vlan) {
-            return Err(invalid("node, uplink and vlan cannot change"));
+        // Physnet too: a node reaches a physnet by one uplink, checked when it is made.
+        if (
+            &old.spec.node,
+            &old.spec.uplink,
+            old.spec.vlan,
+            &old.spec.physnet,
+        ) != (&new.node, &new.uplink, new.vlan, &new.physnet)
+        {
+            return Err(invalid("node, uplink, vlan and physnet cannot change"));
         }
         Ok(())
     };

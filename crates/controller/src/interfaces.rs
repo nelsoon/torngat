@@ -310,10 +310,12 @@ pub(crate) async fn assigned_networks(
     for n in &mut out.networks {
         n.status = NetworkStatus::default();
         n.metadata.etag = None;
+        n.metadata.update_time = None;
     }
     for p in &mut out.provider_networks {
         p.status = NetworkStatus::default();
         p.metadata.etag = None;
+        p.metadata.update_time = None;
     }
     Ok(serde_json::to_vec(&out)?)
 }

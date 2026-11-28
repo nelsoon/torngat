@@ -419,7 +419,7 @@ pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
     let mut parts = s.split(':');
     for b in &mut out {
         let p = parts.next()?;
-        if p.len() != 2 {
+        if p.len() != 2 || !p.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
         *b = u8::from_str_radix(p, 16).ok()?;
