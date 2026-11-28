@@ -7,10 +7,12 @@ set -euo pipefail
 # Torngat's name on the boot menu, the console and hostnamectl. ID and VERSION_ID stay Debian's: the
 # platform extension and Debian's own tools match on them. mkosi adds IMAGE_ID and IMAGE_VERSION
 # after this.
+version=${IMAGE_VERSION:?}
+[[ $version =~ ^[A-Za-z0-9._+~-]+$ ]] || { echo "mkosi.postinst: bad image version: $version" >&2; exit 1; }
 . /usr/lib/os-release
 cat >/usr/lib/os-release.new <<EOR
 NAME="Torngat"
-PRETTY_NAME="Torngat ${IMAGE_VERSION:?} (Debian ${VERSION_ID})"
+PRETTY_NAME="Torngat ${version} (Debian ${VERSION_ID})"
 ID=debian
 VERSION_ID="${VERSION_ID}"
 VERSION="${VERSION}"
