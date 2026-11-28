@@ -46,6 +46,8 @@ pub struct Limits {
     pub response: Duration,
     /// Longest wait for more of the body.
     pub idle: Duration,
+    /// Longest download, from the request to the last byte.
+    pub total: Duration,
 }
 
 impl Default for Limits {
@@ -56,6 +58,7 @@ impl Default for Limits {
             connect: Duration::from_secs(10),
             response: Duration::from_secs(30),
             idle: Duration::from_secs(60),
+            total: Duration::from_secs(6 * 3600),
         }
     }
 }
@@ -65,10 +68,10 @@ impl Default for Limits {
 pub enum FetchError {
     #[error("not a valid https URL")]
     Url,
-    #[error("{0} cannot be reached from here: it is not a public address")]
+    /// The same answer whether the name has no address or one that may not be reached: tenants
+    /// learn nothing of the operator's network.
+    #[error("{0} cannot be reached from here")]
     NotAllowed(String),
-    #[error("{0} has no address")]
-    NoAddress(String),
     #[error("cannot connect to {0}")]
     Connect(String),
     #[error("TLS with {0} failed: {1}")]
@@ -97,6 +100,8 @@ pub enum FetchError {
     Write(std::io::Error),
     #[error("no trusted certificate authorities")]
     NoRoots,
+    #[error("TLS setup: {0}")]
+    Config(String),
 }
 
 /// Whether a download may reach `ip`.
@@ -236,9 +241,7 @@ impl Fetcher {
     /// Trusts the system's certificate authorities (with the operator's own, if added there).
     pub fn new(reach: Reach, limits: Limits) -> Result<Self, FetchError> {
         let mut roots = rustls::RootCertStore::empty();
-        for c in rustls_native_certs::load_native_certs().certs {
-            let _ = roots.add(c);
-        }
+        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
         Self::with_roots(roots, reach, limits)
     }
 
@@ -253,7 +256,7 @@ impl Fetcher {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let tls = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
-            .map_err(|e| FetchError::Tls(String::new(), e.to_string()))?
+            .map_err(|e| FetchError::Config(e.to_string()))?
             .with_root_certificates(roots)
             .with_no_client_auth();
         Ok(Self {
@@ -272,6 +275,21 @@ impl Fetcher {
     /// Writes the file at `url` to `out`: exactly `length` bytes, which must match `checksum`.
     /// On error, `out` may hold part of it.
     pub async fn download(
+        &self,
+        url: &str,
+        length: u64,
+        checksum: &Checksum,
+        out: &mut (impl AsyncWrite + Unpin),
+    ) -> Result<(), FetchError> {
+        timeout(
+            self.limits.total,
+            self.download_within(url, length, checksum, out),
+        )
+        .await
+        .map_err(|_| FetchError::Timeout)?
+    }
+
+    async fn download_within(
         &self,
         url: &str,
         length: u64,
@@ -315,7 +333,7 @@ impl Fetcher {
     }
 
     fn length_of(&self, resp: &Response<Incoming>) -> Result<u64, FetchError> {
-        if let Some(e) = resp.headers().get(header::CONTENT_ENCODING) {
+        for e in resp.headers().get_all(header::CONTENT_ENCODING) {
             let e = e.to_str().unwrap_or("?");
             if !e.eq_ignore_ascii_case("identity") {
                 return Err(FetchError::Encoded(e.chars().take(32).collect()));
@@ -386,11 +404,11 @@ impl Fetcher {
             )
             .await
             .map_err(|_| FetchError::Timeout)?
-            .map_err(|_| FetchError::NoAddress(bare.clone()))?
+            .map_err(|_| FetchError::NotAllowed(bare.clone()))?
             .collect(),
         };
         if addrs.is_empty() {
-            return Err(FetchError::NoAddress(bare));
+            return Err(FetchError::NotAllowed(bare));
         }
         // All of them: which one a later connection gets is not ours to choose.
         if !addrs.iter().all(|a| allowed(a.ip(), self.reach)) {
@@ -426,7 +444,12 @@ impl Fetcher {
             let _ = conn.await;
         });
         let authority = uri.authority().map(|a| a.as_str()).unwrap_or(&host);
-        let path = uri.path_and_query().map_or("/", |p| p.as_str());
+        // "https://h?q" has a query and no path.
+        let path = match uri.path_and_query().map(|p| p.as_str()) {
+            None | Some("") => "/".to_owned(),
+            Some(q) if q.starts_with('?') => format!("/{q}"),
+            Some(p) => p.to_owned(),
+        };
         let req = Request::get(path)
             .header(header::HOST, authority)
             .header(header::USER_AGENT, "torngat")
@@ -585,7 +608,7 @@ mod tests {
     }
 
     fn sha256(b: &[u8]) -> Checksum {
-        Checksum::Sha256(torngat_pki::hex(&sha2::Sha256::digest(b)))
+        Checksum::Sha256(torngat_pki::hex_sha256(b))
     }
 
     #[tokio::test]
@@ -593,7 +616,7 @@ mod tests {
         let file = b"QFI\xfb hello image".repeat(1000);
         let body = file.clone();
         let (port, roots) = server(move |path| match path {
-            "/file" => ok(&body, body.len()),
+            "/file" | "/?x=1" => ok(&body, body.len()),
             "/short" => ok(&body[..10], body.len()),
             "/long" => ok(&body, 10),
             "/again" => redirect("/file"),
@@ -619,6 +642,8 @@ mod tests {
 
         assert_eq!(f.length(&url("/file")).await.unwrap(), n);
         assert_eq!(f.length(&url("/again")).await.unwrap(), n);
+        let no_path = format!("https://localhost:{port}?x=1");
+        assert_eq!(f.length(&no_path).await.unwrap(), n);
         let mut out = Vec::new();
         f.download(&url("/again"), n, &sha256(&file), &mut out)
             .await
@@ -698,11 +723,19 @@ mod tests {
                 f.length(&by_ip).await,
                 Err(FetchError::NotAllowed(_))
             ));
-            let v6 = format!("https://[::1]:{port}/file");
-            assert!(matches!(
-                f.length(&v6).await,
-                Err(FetchError::NotAllowed(_))
-            ));
+            for other in [
+                "[::1]",
+                "127.1",
+                "2130706433",
+                "0x7f.0.0.1",
+                "[::ffff:127.0.0.1]",
+            ] {
+                let u = format!("https://{other}:{port}/file");
+                assert!(
+                    matches!(f.length(&u).await, Err(FetchError::NotAllowed(_))),
+                    "{other}"
+                );
+            }
         }
 
         // A certificate that is not trusted.
