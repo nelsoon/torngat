@@ -428,7 +428,7 @@ async fn volumes_of_gone_images_are_deleted() {
     let img = image(&e, &p, "debian").await;
     until("told", || async {
         image_now(&e, &img).await.unwrap().status.message.as_deref()
-            == Some("waiting for room in its volume type")
+            == Some("waiting for a live node with room in its volume type")
     })
     .await;
 }

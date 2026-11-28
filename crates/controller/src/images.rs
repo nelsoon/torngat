@@ -161,7 +161,12 @@ async fn step(
             let Some(node) = choose_node(pools, types, &image.spec.volume_type, |n| {
                 ctl.live.is_live(n)
             }) else {
-                return tell(store, image, "waiting for room in its volume type").await;
+                return tell(
+                    store,
+                    image,
+                    "waiting for a live node with room in its volume type",
+                )
+                .await;
             };
             changed(
                 modify_image(store, image, |i| {
@@ -210,11 +215,12 @@ async fn step(
                             continue;
                         }
                         match place_volume(ctl, scope, &n, v.metadata.uid, Some(node)).await {
-                            Ok(_) | Err(PlaceError::Conflict | PlaceError::NotPending) => {
-                                count += 1;
+                            Ok(_) => {
+                                count += 1 + untell(store, image, NO_ROOM_ON_NODE).await?;
                             }
+                            Err(PlaceError::Conflict | PlaceError::NotPending) => count += 1,
                             Err(PlaceError::NoRoom(_)) => {
-                                count += tell(store, image, "waiting for room on its node").await?;
+                                count += tell(store, image, NO_ROOM_ON_NODE).await?;
                             }
                             Err(PlaceError::Controller(e)) => return Err(e),
                             Err(e) => {
@@ -262,6 +268,25 @@ async fn modify_image(
         true
     })
     .await
+}
+
+const NO_ROOM_ON_NODE: &str = "waiting for room on its node";
+
+/// Clears the message `problem` once it no longer holds.
+async fn untell(store: &Store, image: &Image, problem: &str) -> Result<usize, ScheduleError> {
+    if image.status.message.as_deref() != Some(problem) {
+        return Ok(0);
+    }
+    changed(
+        modify_image(store, image, |i| {
+            if i.status.message.as_deref() != Some(problem) {
+                return false;
+            }
+            i.status.message = None;
+            true
+        })
+        .await,
+    )
 }
 
 /// Shows a problem in the image's status. Messages are for tenants: no node or pool names.
