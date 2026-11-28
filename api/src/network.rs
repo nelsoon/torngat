@@ -216,6 +216,11 @@ impl Cidr {
         (Ipv4Addr::from(base + 1), Ipv4Addr::from(last - 1))
     }
 
+    /// The netmask, as an address.
+    pub fn netmask(&self) -> Ipv4Addr {
+        Ipv4Addr::from(Self::mask(self.prefix))
+    }
+
     /// Whether the two share an address.
     pub fn overlaps(&self, other: &Cidr) -> bool {
         let p = self.prefix.min(other.prefix);
@@ -406,6 +411,20 @@ pub struct InterfaceStatus {
     pub mac: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip: Option<Ipv4Addr>,
+}
+
+/// "02:ab:..." as bytes: the inverse of [`mac_of`].
+pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut parts = s.split(':');
+    for b in &mut out {
+        let p = parts.next()?;
+        if p.len() != 2 {
+            return None;
+        }
+        *b = u8::from_str_radix(p, 16).ok()?;
+    }
+    parts.next().is_none().then_some(out)
 }
 
 /// The MAC of an instance's `i`th interface: locally administered, from its uid.

@@ -15,7 +15,7 @@ POST /v1/platform/hostNetworks?host_network_id=n1-provider
 - `uplink`: the NIC or bond on the node. Without `vlan`, untagged.
 - `roles`: `platform` (nodes and controllers), `storage`, `provider` (provider networks of instances), `tenant`
   (overlays, later). One uplink may carry several; do not put `provider` on the untagged network of `platform`.
-- `physnet`: for the provider role only: the physical network that this uplink reaches. Provider networks name it.
+- `physnet`: for the provider role only: the physical network that this uplink reaches. Provider networks name it. A node has one host network per physnet.
 - Node, uplink and VLAN cannot change.
 
 ## Provider networks

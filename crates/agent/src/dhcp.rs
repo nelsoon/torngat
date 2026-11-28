@@ -13,7 +13,7 @@ use std::net::Ipv4Addr;
 use dhcproto::v4::{DhcpOption, HType, Message, MessageType, Opcode, OptionCode};
 use dhcproto::{Decodable, Encodable};
 use torngat_api::compute::Instance;
-use torngat_api::network::{NetworkSpec, NodeNetworks, ProviderNetwork};
+use torngat_api::network::{NetworkSpec, NodeNetworks, ProviderNetwork, TrafficRole, parse_mac};
 use uuid::Uuid;
 
 /// How long a guest keeps its address before it asks again.
@@ -35,35 +35,17 @@ pub struct Lease {
 /// Leases by network uid and MAC.
 pub type Table = BTreeMap<(Uuid, [u8; 6]), Lease>;
 
-/// "02:ab:..." as bytes.
-pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
-    let mut out = [0u8; 6];
-    let mut parts = s.split(':');
-    for b in &mut out {
-        let p = parts.next()?;
-        if p.len() != 2 {
-            return None;
-        }
-        *b = u8::from_str_radix(p, 16).ok()?;
-    }
-    parts.next().is_none().then_some(out)
-}
-
-fn mask(prefix: u8) -> Ipv4Addr {
-    Ipv4Addr::from(u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0))
-}
-
 /// The table for the node's instances: each interface with an address, on a network the node was
 /// told of. An address outside its network is left out.
 pub fn table(instances: &[Instance], nets: &NodeNetworks) -> Table {
     let live = |p: &&ProviderNetwork| p.metadata.delete_time.is_none();
-    // Private networks go out by the egress provider network: its name servers. The first by
-    // name, so every node says the same.
+    // Private networks go out by an egress provider network: the name servers of the first by
+    // name that has some, so every node says the same.
     let mut egress: Vec<&ProviderNetwork> = nets
         .provider_networks
         .iter()
         .filter(live)
-        .filter(|p| p.spec.egress)
+        .filter(|p| p.spec.egress && !p.spec.dns.is_empty())
         .collect();
     egress.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
     let private_dns = egress
@@ -71,7 +53,10 @@ pub fn table(instances: &[Instance], nets: &NodeNetworks) -> Table {
         .map(|p| p.spec.dns.clone())
         .unwrap_or_default();
     let mut out = Table::new();
-    for inst in instances {
+    for inst in instances
+        .iter()
+        .filter(|i| i.metadata.delete_time.is_none())
+    {
         for f in &inst.status.interfaces {
             let (Some(ip), Some(mac)) = (f.ip, parse_mac(&f.mac)) else {
                 continue;
@@ -88,7 +73,7 @@ pub fn table(instances: &[Instance], nets: &NodeNetworks) -> Table {
                     let (first, _) = cidr.hosts();
                     cidr.contains(ip).then(|| Lease {
                         ip,
-                        mask: mask(cidr.prefix),
+                        mask: cidr.netmask(),
                         router: first,
                         dns: private_dns.clone(),
                         mtu: PRIVATE_MTU,
@@ -102,13 +87,17 @@ pub fn table(instances: &[Instance], nets: &NodeNetworks) -> Table {
                     .filter(|p| p.spec.pool.cidr.contains(ip))
                     .map(|p| Lease {
                         ip,
-                        mask: mask(p.spec.pool.cidr.prefix),
+                        mask: p.spec.pool.cidr.netmask(),
                         router: p.spec.pool.gateway,
                         dns: p.spec.dns.clone(),
                         mtu: nets
                             .host_networks
                             .iter()
-                            .find(|h| h.spec.physnet.as_ref() == Some(&p.spec.physnet))
+                            .find(|h| {
+                                h.metadata.delete_time.is_none()
+                                    && h.spec.roles.contains(&TrafficRole::Provider)
+                                    && h.spec.physnet.as_ref() == Some(&p.spec.physnet)
+                            })
                             .and_then(|h| u16::try_from(h.spec.mtu).ok())
                             .unwrap_or(PRIVATE_MTU),
                     }),
@@ -121,8 +110,14 @@ pub fn table(instances: &[Instance], nets: &NodeNetworks) -> Table {
     out
 }
 
-/// The answer to `request`, a DHCP message from a guest on `network`; `None` to stay silent.
-pub fn answer(table: &Table, network: Uuid, request: &[u8]) -> Option<Vec<u8>> {
+/// The answer to `request`, a DHCP message from `src` (the frame's source MAC, which the port
+/// allows) on `network` (from the port it came in on, never from the packet); `None` to stay
+/// silent.
+///
+/// The server identifier is the network's gateway: on a provider network that is a router
+/// outside, so the datapath takes every DHCP request from an instance port, whatever its
+/// destination.
+pub fn answer(table: &Table, network: Uuid, src: [u8; 6], request: &[u8]) -> Option<Vec<u8>> {
     let req = Message::from_bytes(request).ok()?;
     // Guests talk to us directly: never through a relay.
     if req.opcode() != Opcode::BootRequest
@@ -133,6 +128,10 @@ pub fn answer(table: &Table, network: Uuid, request: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let mac: [u8; 6] = req.chaddr().get(..6)?.try_into().ok()?;
+    // Only for itself: never another instance's address.
+    if mac != src {
+        return None;
+    }
     let lease = table.get(&(network, mac))?;
     let opts = req.opts();
     let server = match opts.get(OptionCode::ServerIdentifier) {
@@ -146,10 +145,14 @@ pub fn answer(table: &Table, network: Uuid, request: &[u8]) -> Option<Vec<u8>> {
             if server.is_some_and(|s| s != lease.router) {
                 return None;
             }
+            // Selecting or rebooting: the requested address. Renewing or rebinding: ciaddr.
             let wanted = match opts.get(OptionCode::RequestedIpAddress) {
                 Some(DhcpOption::RequestedIpAddress(ip)) => *ip,
                 _ => req.ciaddr(),
             };
+            if wanted.is_unspecified() {
+                return None;
+            }
             if wanted == lease.ip {
                 (MessageType::Ack, lease.ip)
             } else {
@@ -226,7 +229,8 @@ mod tests {
         let net = Uuid::now_v7();
         let t: Table = [((net, MAC), lease())].into();
 
-        let offer = reply(&answer(&t, net, &request(MessageType::Discover, &MAC, &[])).unwrap());
+        let offer =
+            reply(&answer(&t, net, MAC, &request(MessageType::Discover, &MAC, &[])).unwrap());
         assert_eq!(offer.opcode(), Opcode::BootReply);
         assert_eq!(offer.xid(), 42);
         assert_eq!(offer.opts().msg_type(), Some(MessageType::Offer));
@@ -245,6 +249,7 @@ mod tests {
             answer(
                 &t,
                 net,
+                [2, 9, 9, 9, 9, 9],
                 &request(MessageType::Discover, &[2, 9, 9, 9, 9, 9], &[])
             )
             .is_none()
@@ -253,6 +258,7 @@ mod tests {
             answer(
                 &t,
                 Uuid::now_v7(),
+                MAC,
                 &request(MessageType::Discover, &MAC, &[])
             )
             .is_none()
@@ -262,10 +268,20 @@ mod tests {
         relayed
             .opts_mut()
             .insert(DhcpOption::MessageType(MessageType::Discover));
-        assert!(answer(&t, net, &relayed.to_vec().unwrap()).is_none());
+        assert!(answer(&t, net, MAC, &relayed.to_vec().unwrap()).is_none());
+        // Another MAC than the frame's: never another instance's lease.
+        assert!(
+            answer(
+                &t,
+                net,
+                [2, 9, 9, 9, 9, 9],
+                &request(MessageType::Discover, &MAC, &[])
+            )
+            .is_none()
+        );
         // Not DHCP at all.
-        assert!(answer(&t, net, b"\x01\x02garbage").is_none());
-        assert!(answer(&t, net, &[]).is_none());
+        assert!(answer(&t, net, MAC, b"\x01\x02garbage").is_none());
+        assert!(answer(&t, net, MAC, &[]).is_none());
     }
 
     #[test]
@@ -273,7 +289,7 @@ mod tests {
         let net = Uuid::now_v7();
         let t: Table = [((net, MAC), lease())].into();
         let ask = |extra: &[DhcpOption]| {
-            answer(&t, net, &request(MessageType::Request, &MAC, extra)).map(|b| reply(&b))
+            answer(&t, net, MAC, &request(MessageType::Request, &MAC, extra)).map(|b| reply(&b))
         };
         let ack = ask(&[DhcpOption::RequestedIpAddress(lease().ip)]).unwrap();
         assert_eq!(ack.opts().msg_type(), Some(MessageType::Ack));
@@ -295,8 +311,10 @@ mod tests {
             ])
             .is_none()
         );
+        // No address at all: not a request we can answer.
+        assert!(ask(&[]).is_none());
         // Release and decline: nothing to do.
-        assert!(answer(&t, net, &request(MessageType::Release, &MAC, &[])).is_none());
+        assert!(answer(&t, net, MAC, &request(MessageType::Release, &MAC, &[])).is_none());
     }
 
     fn object<T: serde::de::DeserializeOwned>(
@@ -393,6 +411,8 @@ mod tests {
     #[test]
     fn macs() {
         assert_eq!(parse_mac("02:01:02:03:04:0f"), Some([2, 1, 2, 3, 4, 15]));
+        let uid = Uuid::now_v7();
+        assert!(parse_mac(&torngat_api::network::mac_of(uid, 3)).is_some());
         for bad in [
             "02:01:02:03:04",
             "02:01:02:03:04:05:06",

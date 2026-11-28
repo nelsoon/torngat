@@ -84,6 +84,15 @@ pub async fn create_host_network(
             "a host network on this uplink and VLAN".into(),
         ));
     }
+    // A node reaches a physnet by one uplink.
+    let physnet = |h: &HostNetwork| {
+        h.spec.node == spec.node && spec.physnet.is_some() && h.spec.physnet == spec.physnet
+    };
+    if any(&st, &HOST_NETWORKS.prefix(&Scope::Platform)?, physnet).await? {
+        return Err(ApiError::AlreadyExists(
+            "a host network of this node on this physnet".into(),
+        ));
+    }
     HOST_NETWORKS
         .create(&st, Scope::Platform, n, Uuid::now_v7(), input)
         .await

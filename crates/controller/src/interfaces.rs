@@ -301,9 +301,19 @@ pub(crate) async fn assigned_networks(
         .map(|(h, _)| h)
         .filter(|h| &h.spec.node == node)
         .collect();
-    Ok(serde_json::to_vec(&NodeNetworks {
+    // Specs only: allocations name other instances (and other tenants' on provider networks).
+    let mut out = NodeNetworks {
         host_networks,
         provider_networks,
         networks,
-    })?)
+    };
+    for n in &mut out.networks {
+        n.status = NetworkStatus::default();
+        n.metadata.etag = None;
+    }
+    for p in &mut out.provider_networks {
+        p.status = NetworkStatus::default();
+        p.metadata.etag = None;
+    }
+    Ok(serde_json::to_vec(&out)?)
 }

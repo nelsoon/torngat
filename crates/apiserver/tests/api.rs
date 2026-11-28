@@ -1260,6 +1260,13 @@ async fn networks() {
     )
     .await;
     assert_eq!(s, StatusCode::CONFLICT);
+    // Another uplink to the same physnet.
+    let (s, _) = post(
+        "/v1/platform/hostNetworks?host_network_id=n1-prov2".into(),
+        json!({"node": "n1", "uplink": "eno3", "roles": ["provider"], "physnet": "physnet1"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
     for bad in [
         json!({"node": "nope", "uplink": "eno1", "roles": ["platform"]}),
         json!({"node": "n1", "uplink": "eno1;x", "roles": ["platform"]}),
