@@ -5,14 +5,20 @@ The kernel inside the UKI must not carry our Secure Boot signature: anyone able 
 partition could extract it and boot it with their own initrd and command line, and then replay the
 UKI's PCR measurements. The stub does not need it: it is the UKI's signature that counts.
 
+It also adds our boot splash.
+
 The TPM policy is signed for the initrd phase only: nothing started after the switch to the root file
 system can unseal the disk key, even if that root was substituted.
 """
 
+import os
 import runpy
 import sys
 
 sys.argv = ["ukify"] + ["--no-sign-kernel" if a == "--sign-kernel" else a for a in sys.argv[1:]]
+# The boot splash (made by ../branding/splash.py), in the UKI, so it is signed and measured with it.
+if sys.argv[1:2] == ["build"]:
+    sys.argv.append("--splash=" + os.path.join(os.path.dirname(os.path.abspath(__file__)), "splash.bmp"))
 if any(a.split("=")[0] == "--pcr-private-key" for a in sys.argv):
     sys.argv.append("--phases=enter-initrd")
 runpy.run_path("/usr/lib/systemd/ukify", run_name="__main__")
