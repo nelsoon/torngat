@@ -579,7 +579,8 @@ impl QemuImg {
             "--quiet",
             "--service-type=exec",
         ])
-        .arg(format!("--unit={}", unit(task)));
+        .arg(format!("--unit={}", unit(task)))
+        .arg(format!("--slice={}", crate::qemu::SLICE));
         for p in self.properties(&read, write.as_deref()) {
             cmd.arg("-p").arg(p);
         }
