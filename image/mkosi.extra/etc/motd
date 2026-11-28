@@ -1,0 +1,8 @@
+
+Torngat node. The platform manages this host: what is changed here by hand may be undone, and
+instances are managed through the API, never from here.
+
+Docs: https://github.com/nelsoon/torngat/tree/main/docs
+
+The programs on this host are free software; their licenses are in /usr/share/doc/*/copyright.
+
