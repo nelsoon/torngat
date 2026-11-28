@@ -125,3 +125,24 @@ pub fn volume_types() -> Result<Prefix, KeyError> {
 pub fn all_volumes() -> Result<Prefix, KeyError> {
     Prefix::new("storage", [])
 }
+
+pub fn network(scope: &Scope, name: &Name) -> Result<Key, KeyError> {
+    Key::new("network", scoped(scope, "networks", name))
+}
+
+/// Every network of every project.
+pub fn all_networks() -> Result<Prefix, KeyError> {
+    Prefix::new("network", [])
+}
+
+pub fn provider_network(name: &Name) -> Result<Key, KeyError> {
+    Key::new("platform", ["providernetworks", name.as_str()])
+}
+
+pub fn provider_networks() -> Result<Prefix, KeyError> {
+    Prefix::new("platform", ["providernetworks"])
+}
+
+pub fn host_networks() -> Result<Prefix, KeyError> {
+    Prefix::new("platform", ["hostnetworks"])
+}

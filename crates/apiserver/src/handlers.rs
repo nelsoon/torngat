@@ -44,7 +44,7 @@ fn instance_key(scope: &Scope, n: &Name) -> Result<Key, ApiError> {
     store_key("compute", &segs)
 }
 
-fn instances_prefix(scope: &Scope) -> Result<Prefix, ApiError> {
+pub(crate) fn instances_prefix(scope: &Scope) -> Result<Prefix, ApiError> {
     let mut segs = scope.segments();
     segs.push("instances");
     Prefix::new("compute", segs).map_err(|e| ApiError::Internal(e.to_string()))

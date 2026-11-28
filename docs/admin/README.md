@@ -8,8 +8,9 @@ Torngat is pre-alpha: do not run untrusted tenants or data you cannot lose on it
 4. [Nodes and join tokens](nodes.md)
 5. [Updates and changes](changes.md): what is safe, and what asks for the recovery key
 6. [Storage for instances](storage.md): LVM, building with ZFS
-7. [Back up and restore the cluster](backup.md)
-8. [Troubleshooting](troubleshooting.md)
+7. [Networks](networks.md): host networks, provider networks
+8. [Back up and restore the cluster](backup.md)
+9. [Troubleshooting](troubleshooting.md)
 
 ## The things to remember
 
