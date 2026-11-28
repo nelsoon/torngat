@@ -293,6 +293,7 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
         client: &mut ControlClient<Channel>,
         a: &Assigned,
         filled: &BTreeSet<Uuid>,
+        fill_error: impl Fn(Uuid) -> Option<String>,
     ) -> Result<bool, AgentError> {
         let mut mine = BTreeMap::new();
         for p in &a.pools {
@@ -378,6 +379,13 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             }
             r.filled =
                 v.status.fill.is_some() && (v.status.filled || filled.contains(&v.metadata.uid));
+            if v.status.fill.is_some()
+                && !r.filled
+                && r.message.is_empty()
+                && let Some(e) = fill_error(v.metadata.uid)
+            {
+                r.message = sanitize(&format!("cannot fill it from its image: {e}"));
+            }
             // Still open: the controller does not give it to another instance yet.
             r.open |= busy.contains(&name);
             report(&mut self.volumes_reported, v.metadata.uid, r, |r| {

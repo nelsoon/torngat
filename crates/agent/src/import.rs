@@ -128,7 +128,7 @@ pub struct Importer<T> {
     filled: BTreeSet<Uuid>,
     fills: HashMap<Uuid, JoinHandle<Result<(), String>>>,
     /// Fills that failed, and when: tried again after a while.
-    fill_failed: HashMap<Uuid, Instant>,
+    fill_failed: HashMap<Uuid, (Instant, String)>,
     /// Told when a task ends.
     done: Arc<Notify>,
 }
@@ -161,6 +161,11 @@ impl<T: ImageTool> Importer<T> {
     /// Volumes filled here that the controller may not know of yet: their reports say so.
     pub fn filled(&self) -> &BTreeSet<Uuid> {
         &self.filled
+    }
+
+    /// Why the last fill of volume `uid` failed, if it did.
+    pub fn fill_error(&self, uid: Uuid) -> Option<&str> {
+        self.fill_failed.get(&uid).map(|(_, e)| e.as_str())
     }
 
     /// Fills `fills` (volume, image volume's device, volume's device, bytes): a copy each, in the
@@ -197,7 +202,7 @@ impl<T: ImageTool> Importer<T> {
                         }
                         Err(e) => {
                             tracing::warn!(volume = %uid, error = %e, "cannot fill a volume from its image");
-                            self.fill_failed.insert(uid, Instant::now());
+                            self.fill_failed.insert(uid, (Instant::now(), e));
                         }
                     }
                 }
@@ -206,7 +211,7 @@ impl<T: ImageTool> Importer<T> {
             if self
                 .fill_failed
                 .get(&uid)
-                .is_some_and(|t| t.elapsed() < PROGRESS_EVERY)
+                .is_some_and(|(t, _)| t.elapsed() < PROGRESS_EVERY)
             {
                 continue;
             }

@@ -459,6 +459,7 @@ fn being_copied(volumes: &[(Volume, torngat_store::Versioned)], uid: Uuid) -> bo
     volumes.iter().any(|(v, _)| {
         v.status.fill.is_some_and(|f| f.image == uid)
             && !v.status.filled
+            && v.status.owner.is_some()
             && v.metadata.delete_time.is_none()
     })
 }

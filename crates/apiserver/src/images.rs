@@ -83,7 +83,13 @@ async fn delete(
     let rev = cur.revision;
     let mut i: Image = decode(cur)?;
     let uid = i.metadata.uid;
-    let filling = |v: &Volume| v.status.fill.is_some_and(|f| f.image == uid) && !v.status.filled;
+    // A boot disk of an instance, not yet filled.
+    let filling = |v: &Volume| {
+        v.status.fill.is_some_and(|f| f.image == uid)
+            && !v.status.filled
+            && v.status.owner.is_some()
+            && v.metadata.delete_time.is_none()
+    };
     if any(st, &crate::storage::VOLUMES.all()?, filling).await? {
         return Err(ApiError::FailedPrecondition(format!(
             "{n} is being copied to a boot disk: try again later"
