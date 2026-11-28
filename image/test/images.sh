@@ -129,8 +129,9 @@ head -c 2000000 "$work/up.raw" >"$work/p1"
 tail -c 1000000 "$work/up.raw" >"$work/p2"
 [ "$(upload 2 "$work/p2")" = 200 ] && [ "$(upload 1 "$work/p1")" = 200 ] || fail "parts refused"
 call POST "$project/up/upload:finish" >/dev/null
-until_true "uploaded image imported" 300 is "$project" up ready
-[ "$(call GET "$project/up" | jq -r .status.size_bytes)" = 3000000 ] || fail "upload size"
+for _ in $(seq 300); do is "$project" up ready && break; sleep 1; done
+is "$project" up ready || { show "$project" up; guest ls -la /var/lib/torngat/uploads/ >&2; fail "uploaded image not imported"; }
+[ "$(call GET "$project/up" | jq -r .status.size_bytes)" = 3000320 ] || fail "upload size"
 echo "ok: an uploaded image is imported"
 call DELETE "$project/up" >/dev/null
 

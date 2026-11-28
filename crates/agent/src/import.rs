@@ -457,7 +457,7 @@ impl<T: ImageTool> Job<T> {
             }
             Step::Download => {
                 let (path, room) = self.staging.clone().ok_or("no staging volume")?;
-                if room < self.length {
+                if room < padded(self.length) {
                     return Err("the staging volume is too small".into());
                 }
                 let mut out = tokio::fs::OpenOptions::new()
@@ -474,15 +474,25 @@ impl<T: ImageTool> Job<T> {
                     }
                     None => self.read_upload(&mut out).await?,
                 }
+                // qemu-img reads whole sectors: what follows the file, up to the next one, is zeros.
+                {
+                    use tokio::io::AsyncWriteExt;
+                    let pad = padded(self.length) - self.length;
+                    out.write_all(&vec![0u8; usize::try_from(pad).unwrap_or(0)])
+                        .await
+                        .map_err(|e| format!("cannot write the staging volume: {e}"))?;
+                }
                 out.sync_all()
                     .await
                     .map_err(|e| format!("cannot write the staging volume: {e}"))?;
                 drop(out);
                 let format = detect(&path, self.length).await?;
                 let size = match format {
-                    ImageFormat::Raw => self.length,
+                    ImageFormat::Raw => padded(self.length),
                     ImageFormat::Qcow2 => {
-                        self.tool.qcow2_size(self.uid, &path, self.length).await?
+                        self.tool
+                            .qcow2_size(self.uid, &path, padded(self.length))
+                            .await?
                     }
                 };
                 if size == 0 || size > self.max {
@@ -501,7 +511,7 @@ impl<T: ImageTool> Job<T> {
                     return Err("the image's volume is too small".into());
                 }
                 self.tool
-                    .convert(self.uid, &src, self.length, format, &dst)
+                    .convert(self.uid, &src, padded(self.length), format, &dst)
                     .await?;
                 Ok(Done::Converted)
             }
@@ -553,6 +563,11 @@ impl<T> Job<T> {
         }
         Ok(())
     }
+}
+
+/// `len` rounded up to whole sectors, as qemu-img reads them.
+fn padded(len: u64) -> u64 {
+    len.div_ceil(512).saturating_mul(512)
 }
 
 /// The format of the image in the first `len` bytes of `path`, from its first bytes. A qcow2
