@@ -48,7 +48,8 @@ control; for releases, use a key held offline or in an HSM.
 
 The host says Torngat on the boot menu, the console and `hostnamectl`: `mkosi.postinst.chroot` writes
 `/usr/lib/os-release` (`ID` and `VERSION_ID` stay Debian's, which the platform extension matches on).
-The boot splash, a mountain ridge under the northern lights, is `tools/splash.bmp`; `tools/ukify`
+The boot splash, a mountain ridge under the northern lights that fades to black all around (it is shown centred on a
+black screen, at most 800 wide), is `tools/splash.bmp`; `tools/ukify`
 puts it in the UKI, so it is signed and measured with the kernel. Make it again with
 `image/branding/splash.py image/tools/splash.bmp` (needs Pillow and fonts-dejavu-core). The console
 banner and login message are `mkosi.extra/etc/{issue,issue.net,motd}`.

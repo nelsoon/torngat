@@ -5,7 +5,8 @@
 
 The Torngat Mountains and their northern lights: landscape only, no cultural symbols. A 24-bit BMP
 that the UKI's stub shows centred while the kernel loads. Its edges fade to black, so it blends into
-the screen around it. The same file every time (fixed seed). Needs Pillow and DejaVu Sans (Debian
+the screen around it: a centred image on a black screen that looks like part of it. At most 800 wide, so
+it fits the smallest server consoles. The same file every time (fixed seed). Needs Pillow and DejaVu Sans (Debian
 fonts-dejavu-core).
 """
 
@@ -15,7 +16,9 @@ import sys
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
-W, H = 640, 240
+W, H = 800, 300
+# The drawing is laid out on 640 x 240: scaled to W x H.
+K = W / 640
 S = 3  # drawn this many times larger, then scaled down: smooth edges
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
@@ -25,7 +28,8 @@ def ridge(rng, base, peaks, rough):
     points, then roughened by midpoint displacement (`rough` pixels at the first step, halved each
     step)."""
     pts = [(0.0, base - peaks[0][1])] + [(x * W, base - h) for x, h in peaks] + [(W, base - peaks[-1][1])]
-    step = rough
+    pts = [(x, y * K) for x, y in pts]
+    step = rough * K
     for _ in range(6):
         out = []
         for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
@@ -48,10 +52,11 @@ def aurora():
     ]:
         for x in range(0, W * S, S):
             u = x / (W * S)
-            y0 = (top + amp * math.sin(u * 5.0 + phase) + 4 * math.sin(u * 13 + phase)) * S
+            y0 = (top + amp * math.sin(u * 5.0 + phase) + 4 * math.sin(u * 13 + phase)) * K * S
             fade = math.sin(math.pi * u) ** 1.6
-            for k in range(0, 30 * S, S):
-                a = fade * (1 - k / (30 * S)) ** 2 * 0.75
+            band = int(30 * K) * S
+            for k in range(0, band, S):
+                a = fade * (1 - k / band) ** 2 * 0.75
                 d.rectangle(
                     [x, y0 + k, x + S, y0 + k + S],
                     fill=tuple(int(v * a) for v in colour),
@@ -67,13 +72,15 @@ def main(out):
     # Night sky, darkest at the top.
     for y in range(H * S):
         t = y / (H * S)
-        d.line([(0, y), (W * S, y)], fill=(int(4 + 10 * t), int(7 + 14 * t), int(16 + 24 * t)))
+        # Lightest at the horizon, black at the top and bottom.
+        glow = math.sin(math.pi * min(1.0, t * 1.4)) ** 1.5
+        d.line([(0, y), (W * S, y)], fill=(int(2 + 12 * glow), int(4 + 18 * glow), int(10 + 32 * glow)))
     img = ImageChops.add(img, aurora())
     d = ImageDraw.Draw(img)
 
     # Stars, sparse, above the mountains.
     for _ in range(60):
-        x, y = rng.uniform(0, W * S), rng.uniform(0, 110 * S)
+        x, y = rng.uniform(0, W * S), rng.uniform(0, 110 * K * S)
         v = int(rng.uniform(70, 170))
         d.ellipse([x, y, x + S, y + S], fill=(v, v, min(255, v + 10)))
 
@@ -96,21 +103,25 @@ def main(out):
     d.polygon(near + [(W * S, H * S), (0, H * S)], fill=(8, 11, 20))
     d.line(near, fill=(64, 80, 104), width=S)
 
-    # The name.
-    font = ImageFont.truetype(FONT, 24 * S)
-    text = "T O R N G A T"
-    box = d.textbbox((0, 0), text, font=font)
-    d.text(((W * S - (box[2] - box[0])) / 2, 196 * S), text, font=font, fill=(214, 224, 236))
-
     img = img.resize((W, H), Image.LANCZOS)
 
-    # Every edge fades to black.
+    # A soft fade to black all around: no edge shows on a black screen.
     px = img.load()
     for y in range(H):
         for x in range(W):
-            e = min(x, W - 1 - x, y, H - 1 - y) / 24
-            if e < 1:
-                px[x, y] = tuple(int(c * e) for c in px[x, y])
+            dx, dy = (x - W / 2) / (W / 2), (y - H / 2) / (H / 2)
+            # A rounded rectangle: 1 on every edge; black from there in to 0.7.
+            r = (abs(dx) ** 4 + abs(dy) ** 4) ** 0.25
+            e = min(1.0, max(0.0, (1.0 - r) / 0.3))
+            e = e * e * (3 - 2 * e)
+            px[x, y] = tuple(int(c * e) for c in px[x, y])
+
+    # The name, over the fade.
+    d = ImageDraw.Draw(img)
+    font = ImageFont.truetype(FONT, int(30 * K))
+    text = "Torngat"
+    box = d.textbbox((0, 0), text, font=font)
+    d.text(((W - (box[2] - box[0])) / 2, 190 * K), text, font=font, fill=(214, 224, 236))
     img.save(out, "BMP")
 
 
