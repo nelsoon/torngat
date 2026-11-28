@@ -50,6 +50,8 @@ message AssignmentSet {
   bool storage_unavailable = 5;
   // JSON of torngat_api::image::Image: the images that the caller imports.
   repeated bytes images_json = 6;
+  // JSON of torngat_api::settings::ImageSettings. Empty with storage_unavailable.
+  bytes image_settings_json = 7;
 }
 
 message InstanceReport {

@@ -432,3 +432,57 @@ async fn volumes_of_gone_images_are_deleted() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn imports_are_bounded() {
+    let e = env(Vec::new(), false).await;
+    let mut n1 = node(&e, "n1").await;
+    ready_pool(&e, &mut n1, "data", "n1", 10 * GIB).await;
+    let settings = torngat_api::settings::ImageSettings {
+        max_image_gib: 1,
+        platform_private_sources: true,
+    };
+    put(&e.store, keys::image_settings().unwrap(), &settings).await;
+    let p = Scope::Platform;
+    let img = image(&e, &p, "debian").await;
+    until("given a node", || async {
+        image_now(&e, &img).await.unwrap().status.phase == ImagePhase::Importing
+    })
+    .await;
+    // The node is told the settings.
+    let mut stream = n1
+        .assignments(AssignmentsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let set = stream.message().await.unwrap().unwrap();
+    let told: torngat_api::settings::ImageSettings =
+        serde_json::from_slice(&set.image_settings_json).unwrap();
+    assert_eq!(told, settings);
+
+    // Larger than the operator allows.
+    let mut r = report(&img);
+    r.download_bytes = GIB + 1;
+    assert_eq!(send(&mut n1, r.clone()).await, Err(Code::InvalidArgument));
+    // Each report moves the deadline.
+    let before = image_now(&e, &img).await.unwrap().status.progress_time.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    send(&mut n1, report(&img)).await.unwrap();
+    let after = image_now(&e, &img).await.unwrap().status.progress_time.unwrap();
+    assert!(after > before);
+
+    // No progress for too long: failed.
+    let mut stale = image_now(&e, &img).await.unwrap();
+    stale.status.progress_time =
+        Some(time::OffsetDateTime::now_utc() - time::Duration::minutes(16));
+    put(&e.store, keys::image(&p, &n("debian")).unwrap(), &stale).await;
+    until("failed", || async {
+        image_now(&e, &img).await.unwrap().status.phase == ImagePhase::Failed
+    })
+    .await;
+    let i = image_now(&e, &img).await.unwrap();
+    assert_eq!(
+        i.status.message.as_deref(),
+        Some("the import stopped: no progress for 15 minutes")
+    );
+}

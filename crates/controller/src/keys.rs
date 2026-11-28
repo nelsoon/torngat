@@ -47,6 +47,11 @@ pub fn tpm_policy() -> Result<Key, KeyError> {
     Key::new(TPM_POLICY_KEY.0, TPM_POLICY_KEY.1)
 }
 
+/// The image settings ([`torngat_api::settings::ImageSettings`]).
+pub fn image_settings() -> Result<Key, KeyError> {
+    Key::new("platform", ["settings", "images"])
+}
+
 pub fn storage_pool(name: &Name) -> Result<Key, KeyError> {
     Key::new("platform", ["storagepools", name.as_str()])
 }
