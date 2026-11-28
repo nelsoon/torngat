@@ -353,7 +353,9 @@ fn frame_of(
 pub async fn serve(tap: &str, table: &std::path::Path) -> std::io::Result<()> {
     // This process only serves DHCP: a panic is a frame dropped (see on_frame_guarded), not a
     // message per frame a guest sends.
-    std::panic::set_hook(Box::new(|_| {}));
+    std::panic::set_hook(Box::new(|info| {
+        tracing::debug!(location = ?info.location(), "panic");
+    }));
     let tun = tokio_tun::Tun::builder().name(tap).tap().build_one()?;
     let mac = tun.mac_address()?;
     let mut leases = PortTable::new();

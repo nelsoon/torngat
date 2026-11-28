@@ -195,7 +195,8 @@ pub struct System {
 impl Default for System {
     fn default() -> Self {
         Self {
-            leases: PathBuf::from("/run/torngat/dhcp/leases.json"),
+            // Its own directory right under /run: the DHCP user must get to it.
+            leases: PathBuf::from("/run/torngat-dhcp/leases.json"),
         }
     }
 }
@@ -247,7 +248,12 @@ impl Host for System {
     fn write_leases(&self, leases: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let dir = self.leases.parent().unwrap_or(std::path::Path::new("/"));
-        std::fs::create_dir_all(dir)?;
+        // One level: everything above it must already let the DHCP user through.
+        if let Err(e) = std::fs::create_dir(dir)
+            && e.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(e);
+        }
         // Whatever the agent's umask: the DHCP process's user must get in.
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
         let tmp = self.leases.with_extension("tmp");
@@ -337,8 +343,10 @@ impl<H: Host> Ovs<H> {
                 )
                 .await?;
         }
-        // The host's own IPv6 says nothing on it (router solicitations, MLD).
-        self.host
+        // The host's own IPv6 says nothing on it (router solicitations, MLD). A host without IPv6
+        // has no such key: nothing to turn off.
+        let _ = self
+            .host
             .run(
                 SYSCTL,
                 &[
@@ -348,7 +356,7 @@ impl<H: Host> Ovs<H> {
                 ],
                 None,
             )
-            .await?;
+            .await;
         self.host
             .run(IP, &["link", "set", DHCP_PORT, "up"], None)
             .await?;
@@ -364,10 +372,6 @@ impl<H: Host> Ovs<H> {
             "vlan_mode=trunk",
         ])
         .await?;
-        // Out of flooding: it gets only what the flows send it.
-        self.host
-            .run(OFCTL, &["mod-port", BRIDGE, DHCP_PORT, "no-flood"], None)
-            .await?;
         self.based = true;
         Ok(())
     }
@@ -562,6 +566,11 @@ impl<H: Host> Ovs<H> {
             self.leases = Some(leases);
         }
         self.replace_flows(&ports).await?;
+        // Out of flooding: it gets only what the flows send it. Every pass: it is the switch's
+        // state, not its database's, and a restarted switch forgets it.
+        self.host
+            .run(OFCTL, &["mod-port", BRIDGE, DHCP_PORT, "no-flood"], None)
+            .await?;
         self.dhcp_process().await
     }
 

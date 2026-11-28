@@ -52,7 +52,7 @@ Each node runs Open vSwitch with one bridge, `br-int`, that only the agent's flo
   and anything else from the guest are dropped.
 - DHCP: one process per node, `torngat-dhcp.service`, user `torngat-dhcp`, sandboxed, on a tap port of the bridge. It
   gets only the instances' DHCP requests, and answers each with the address the controller gave it (no pool, no
-  leases). Its leases are in `/run/torngat/dhcp/leases.json`.
+  leases). Its leases are in `/run/torngat-dhcp/leases.json`.
 - `ovs-vsctl show` and `ovs-ofctl dump-flows br-int` show it all. The agent sets it again on each pass; changes made by
   hand are undone.
 
