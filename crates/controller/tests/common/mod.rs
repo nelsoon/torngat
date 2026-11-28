@@ -19,6 +19,9 @@ pub struct Env {
     pub ca: Arc<Ca>,
     pub control: String,
     pub join: String,
+    /// The controller's image uploads.
+    #[allow(dead_code)]
+    pub uploads: torngat_uploads::Uploads,
     _dir: TempDir,
 }
 
@@ -53,10 +56,12 @@ pub async fn env_with(tpm_anchors: Vec<Vec<u8>>, tpm_required: bool, passes: boo
         key_pem: c.key_pem.unwrap().into_bytes(),
         client_ca_pem: ca.cert_pem().as_bytes().to_vec(),
     };
+    let uploads = torngat_uploads::Uploads::new(dir.path().join("uploads"));
     let ctl = Controller::new(
         store.clone(),
         std::sync::Arc::new(torngat_keys::PlatformKey::generate().unwrap()),
-    );
+    )
+    .with_uploads(uploads.clone());
     let cl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let jl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let control = cl.local_addr().unwrap().to_string();
@@ -76,6 +81,7 @@ pub async fn env_with(tpm_anchors: Vec<Vec<u8>>, tpm_required: bool, passes: boo
         ca,
         control,
         join,
+        uploads,
         _dir: dir,
     }
 }

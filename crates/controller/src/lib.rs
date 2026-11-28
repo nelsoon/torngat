@@ -66,6 +66,8 @@ pub struct Controller {
     pub store: Store,
     pub live: Liveness,
     platform_key: Arc<PlatformKey>,
+    /// Image uploads, if this controller keeps them.
+    pub uploads: Option<torngat_uploads::Uploads>,
 }
 
 impl Controller {
@@ -74,7 +76,14 @@ impl Controller {
             store,
             live: Liveness::default(),
             platform_key,
+            uploads: None,
         }
+    }
+
+    /// Keeps image uploads in `uploads`.
+    pub fn with_uploads(mut self, uploads: torngat_uploads::Uploads) -> Self {
+        self.uploads = Some(uploads);
+        self
     }
 
     /// Runs the reconcile loops (scheduling, operation completion, housekeeping) forever.

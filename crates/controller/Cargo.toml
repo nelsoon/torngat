@@ -34,6 +34,7 @@ torngat-keys = { path = "../keys" }
 torngat-pki = { path = "../pki" }
 torngat-proto = { path = "../proto" }
 torngat-store = { path = "../store" }
+torngat-uploads = { path = "../uploads" }
 
 [dev-dependencies]
 futures = "0.3"
@@ -48,6 +49,7 @@ tokio = { version = "1.35", features = ["rt-multi-thread", "macros"] }
 torngat-agent = { path = "../agent" }
 torngat-apiserver = { path = "../apiserver" }
 torngat-store = { path = "../store", features = ["test-util"] }
+torngat-uploads = { path = "../uploads" }
 serde_json.workspace = true
 
 [lints]

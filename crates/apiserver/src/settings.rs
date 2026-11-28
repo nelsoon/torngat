@@ -48,11 +48,15 @@ fn images_key() -> Result<Key, ApiError> {
     Key::new("platform", ["settings", "images"]).map_err(|e| ApiError::Internal(e.to_string()))
 }
 
-pub async fn get_images(State(st): State<AppState>) -> Result<Json<ImageSettings>, ApiError> {
-    Ok(Json(match st.store.get(&images_key()?).await? {
+pub(crate) async fn image_settings(st: &AppState) -> Result<ImageSettings, ApiError> {
+    Ok(match st.store.get(&images_key()?).await? {
         Some(v) => serde_json::from_slice(&v.value)?,
         None => ImageSettings::default(),
-    }))
+    })
+}
+
+pub async fn get_images(State(st): State<AppState>) -> Result<Json<ImageSettings>, ApiError> {
+    Ok(Json(image_settings(&st).await?))
 }
 
 pub async fn put_images(

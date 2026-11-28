@@ -361,6 +361,8 @@ impl<T: ImageTool> Importer<T> {
             let Some(step) = want else { continue };
             let job = Job {
                 tool: self.tool.clone(),
+                client: client.clone(),
+                report: report_of(image),
                 uid,
                 url: image.spec.source.url.clone(),
                 checksum: image.spec.source.checksum.clone(),
@@ -426,8 +428,11 @@ async fn send(client: &mut ControlClient<Channel>, r: ImageReport) -> Sent {
 /// What a step needs, copied out of the image.
 struct Job<T> {
     tool: T,
+    /// To read an uploaded image from the controller.
+    client: ControlClient<Channel>,
+    report: ImageReport,
     uid: Uuid,
-    url: String,
+    url: Option<String>,
     checksum: Checksum,
     length: u64,
     format: Option<ImageFormat>,
@@ -442,7 +447,9 @@ impl<T: ImageTool> Job<T> {
     async fn run(self, step: Step) -> Result<Done, String> {
         match step {
             Step::Length => {
-                let n = self.tool.length(&self.url, self.reach, self.max).await?;
+                // An upload's length is known from the start.
+                let url = self.url.as_deref().ok_or("no URL to download")?;
+                let n = self.tool.length(url, self.reach, self.max).await?;
                 if n == 0 {
                     return Err("the file is empty".into());
                 }
@@ -458,10 +465,15 @@ impl<T: ImageTool> Job<T> {
                     .open(&path)
                     .await
                     .map_err(|e| format!("cannot open the staging volume: {e}"))?;
-                let (url, reach, max) = (&self.url, self.reach, self.max);
-                self.tool
-                    .download(url, reach, max, self.length, &self.checksum, &mut out)
-                    .await?;
+                match self.url.as_deref() {
+                    Some(url) => {
+                        let (reach, max) = (self.reach, self.max);
+                        self.tool
+                            .download(url, reach, max, self.length, &self.checksum, &mut out)
+                            .await?;
+                    }
+                    None => self.read_upload(&mut out).await?,
+                }
                 out.sync_all()
                     .await
                     .map_err(|e| format!("cannot write the staging volume: {e}"))?;
@@ -494,6 +506,52 @@ impl<T: ImageTool> Job<T> {
                 Ok(Done::Converted)
             }
         }
+    }
+}
+
+impl<T> Job<T> {
+    /// Copies the image's upload from the controller into `out`, checking its length and
+    /// checksum again.
+    async fn read_upload(&self, out: &mut tokio::fs::File) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+        let r = &self.report;
+        let req = torngat_proto::v1::ReadUploadRequest {
+            org: r.org.clone(),
+            project: r.project.clone(),
+            name: r.name.clone(),
+            uid: r.uid.clone(),
+            offset: 0,
+        };
+        let lost = |e: tonic::Status| {
+            tracing::warn!(error = %e, "cannot read an upload from the controller");
+            "the upload could not be read: trying again".to_owned()
+        };
+        let mut stream = self
+            .client
+            .clone()
+            .read_upload(req)
+            .await
+            .map_err(lost)?
+            .into_inner();
+        let mut hash = crate::fetch::Hasher::new(&self.checksum);
+        let mut got: u64 = 0;
+        while let Some(chunk) = stream.message().await.map_err(lost)? {
+            got = got.saturating_add(chunk.data.len() as u64);
+            if got > self.length {
+                return Err("the upload is longer than announced".into());
+            }
+            hash.update(&chunk.data);
+            out.write_all(&chunk.data)
+                .await
+                .map_err(|e| format!("cannot write the staging volume: {e}"))?;
+        }
+        if got != self.length {
+            return Err("the upload is shorter than announced".into());
+        }
+        if !hash.matches(&self.checksum) {
+            return Err("the checksum does not match".into());
+        }
+        Ok(())
     }
 }
 

@@ -102,6 +102,10 @@ POST /v1/platform/images?image_id=debian-13
   and copies it into the volume `<image>-image`, the size of its disk. Both are volumes of the image's scope (platform
   images have platform volumes) with `status.owner.image`, and take space like any volume. The staging volume is deleted
   once the image is ready, or failed.
+- Uploads are kept on the controller, in `/var/lib/torngat/uploads/<image uid>/`, until the image is imported or failed
+  (unfinished ones for a day): leave room there for the largest image (`max_image_gib`). The image's node reads the upload
+  from the controller over its mTLS connection, and checks the checksum again. With more than one controller, uploads
+  need shared storage (not done yet): send all the parts of an upload to the same controller.
 - A volume type that an image uses cannot be deleted.
 - A boot disk made from an image goes on the image's node (`status.fill` names the image and its volume), and that node
   copies the image into it at its first use, with `qemu-img` in the same sandbox, before the instance starts
