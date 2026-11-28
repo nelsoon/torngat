@@ -103,6 +103,9 @@ POST /v1/platform/images?image_id=debian-13
   images have platform volumes) with `status.owner.image`, and take space like any volume. The staging volume is deleted
   once the image is ready, or failed.
 - A volume type that an image uses cannot be deleted.
+- A boot disk made from an image goes on the image's node (`status.fill` names the image and its volume), and that node
+  copies the image into it at its first use, with `qemu-img` in the same sandbox, before the instance starts
+  (`status.filled`). Copies across nodes come later: an instance from an image runs on the image's node.
 - Deleting an image deletes its volumes first; the image goes once they are gone.
 - The node checks the download against its checksum as it writes it, tells qcow2 from raw by its first bytes, and copies
   it with `qemu-img` (only qcow2 images are read by `qemu-img` before that, to find their size). qcow2 images with a backing
@@ -158,7 +161,7 @@ Each volume is encrypted with its own key. Keys are made and kept by the control
 for each project, itself encrypted under the **platform key**: `/var/lib/torngat/keys/platform.key`.
 
 - A node gets a volume's key only while it is enrolled, the volume is on it, and an instance uses it, or the volume is an
-  image's that this node imports now. The controller logs `volume key given`. A node must ask again after a reboot.
+  image's that this node imports now, or that it copies into a boot disk. The controller logs `volume key given`. A node must ask again after a reboot.
 - There is no way to remove a node yet, so a stolen one can still ask for its keys.
 - A minute or so after a volume is gone, its key is destroyed. Copies may remain for a while in the store's own log and
   snapshots, and in backups; reading them takes the platform key, or

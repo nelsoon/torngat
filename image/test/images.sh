@@ -2,7 +2,8 @@
 # Image imports on the host image, through the API: a platform image is downloaded from the
 # internet (the Debian 13 cloud image, its checksum taken from Debian's SHA512SUMS), checked, read
 # by qemu-img in its sandbox and copied into its encrypted volume. A project image with a wrong
-# checksum fails, and one on a private address is never fetched.
+# checksum fails, and one on a private address is never fetched. An instance boots Debian from a boot
+# disk made from the image, and its kernel sees a disk added and grown while it runs.
 #
 #   SSH_KEY=KEY image/test/images.sh IMAGE
 #
@@ -74,6 +75,39 @@ until_true "the staging volumes deleted" 120 one_left
 closed() { [ "$(guest sh -c 'ls /dev/mapper/ | grep -c torngat-vol- || true')" = 0 ]; }
 until_true "volumes closed" 60 closed
 echo "ok: one volume left, closed"
+
+echo "== boot from it"
+base=/v1/orgs/acme/projects/web
+call POST "$base/instances?instance_id=vm" '{"spec": {"vcpus": 2, "memory_mib": 1024,
+  "boot_disk": {"volume_type": "fast", "size_gib": 3, "image": {"name": "debian", "platform": true}}}}' >/dev/null
+vm() { call GET "$base/instances/vm"; }
+running() { [ "$(vm | jq -r .status.phase)" = running ]; }
+for _ in $(seq 300); do running && break; sleep 1; done
+running || { vm | jq -c .status >&2; show "$platform" debian; fail "not started from the image"; }
+[ "$(call GET "$base/volumes/vm-boot" | jq -r .status.filled)" = true ] || fail "boot disk not filled"
+log=/var/lib/torngat-vm/$(vm | jq -r .metadata.uid)/console.log
+seen() { guest "grep -aqE '$1' $log"; }
+kernel() { seen 'Linux version'; }
+until_true "the guest's kernel" 180 kernel
+login() { seen 'login:'; }
+until_true "the guest's login prompt" 300 login
+echo "ok: Debian boots from a boot disk made from the image"
+# The guest sees a disk added while it runs, and its growth.
+call POST "$base/volumes?volume_id=data-1" '{"spec": {"volume_type": "fast", "size_gib": 1}}' >/dev/null
+call PATCH "$base/instances/vm" "$(vm | jq -c '{etag: .metadata.etag, spec: (.spec + {disks: [{volume: "data-1"}]})}')" >/dev/null
+vdb() { seen '\[vdb\]'; }
+until_true "the guest sees the added disk" 180 vdb
+d=$(call GET "$base/volumes/data-1")
+call PATCH "$base/volumes/data-1" "$(jq -c '{etag: .metadata.etag, spec: (.spec + {size_gib: 2})}' <<<"$d")" >/dev/null
+grown() { seen 'vdb.*capacity change'; }
+until_true "the guest sees the disk grow" 180 grown
+echo "ok: the guest sees a disk added and grown while it runs"
+call DELETE "$base/instances/vm" >/dev/null
+boot_gone() { [ "$(code "$(api GET "$base/volumes/vm-boot")")" = 404 ]; }
+until_true "boot disk deleted" 120 boot_gone
+data_free() { [ "$(call GET "$base/volumes/data-1" | jq -r '.status.attached_to // empty')" = "" ]; }
+until_true "data volume released" 60 data_free
+call DELETE "$base/volumes/data-1" >/dev/null
 
 echo "== deleted"
 call DELETE "$platform/debian" >/dev/null
