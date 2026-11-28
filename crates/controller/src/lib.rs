@@ -13,6 +13,7 @@
 mod disks;
 pub mod identity;
 mod images;
+mod interfaces;
 pub mod join;
 pub mod keys;
 mod ops;
@@ -108,6 +109,9 @@ impl Controller {
             }
             if let Err(e) = storage::storage_once(&self).await {
                 tracing::warn!(error = %e, "storage pass failed");
+            }
+            if let Err(e) = interfaces::interfaces_once(&self).await {
+                tracing::warn!(error = %e, "interface pass failed");
             }
             if let Err(e) = images::images_once(&self).await {
                 tracing::warn!(error = %e, "image pass failed");

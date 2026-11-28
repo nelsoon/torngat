@@ -20,6 +20,7 @@ mod error;
 mod handlers;
 mod images;
 mod join_tokens;
+mod networks;
 mod settings;
 mod storage;
 
@@ -160,6 +161,36 @@ pub fn router(state: AppState) -> Router {
             get(images::get_image)
                 .patch(images::update_image)
                 .delete(images::delete_image),
+        )
+        .route(
+            "/v1/platform/hostNetworks",
+            get(networks::list_host_networks).post(networks::create_host_network),
+        )
+        .route(
+            "/v1/platform/hostNetworks/{network}",
+            get(networks::get_host_network)
+                .patch(networks::update_host_network)
+                .delete(networks::delete_host_network),
+        )
+        .route(
+            "/v1/platform/providerNetworks",
+            get(networks::list_provider_networks).post(networks::create_provider_network),
+        )
+        .route(
+            "/v1/platform/providerNetworks/{network}",
+            get(networks::get_provider_network)
+                .patch(networks::update_provider_network)
+                .delete(networks::delete_provider_network),
+        )
+        .route(
+            "/v1/orgs/{org}/projects/{project}/networks",
+            get(networks::list_networks).post(networks::create_network),
+        )
+        .route(
+            "/v1/orgs/{org}/projects/{project}/networks/{network}",
+            get(networks::get_network)
+                .patch(networks::update_network)
+                .delete(networks::delete_network),
         )
         // Unknown paths go through authentication too, so they cannot be used to probe the API.
         .fallback(not_found)

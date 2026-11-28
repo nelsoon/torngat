@@ -128,6 +128,10 @@ impl Uploads {
             f.write_all(&buf[..got]).await?;
         }
         f.sync_all().await?;
+        // Code scanning flags this path as built from user input (alert 11, dismissed as a false
+        // positive): it is the image's uid (made by the server, not the name in the URL) and the
+        // part's number, a u32 checked above to be 1 to MAX_PARTS. No text of the tenant's is in
+        // it, so it cannot leave the image's directory.
         tokio::fs::rename(tmp.path(), dir.join(part_name(n))).await?;
         tmp.keep();
         Ok(total)

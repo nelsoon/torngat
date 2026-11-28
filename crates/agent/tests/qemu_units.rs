@@ -43,6 +43,7 @@ fn inst(name: &str) -> Instance {
             claims: vec![],
             boot_disk: None,
             disks: vec![],
+            interfaces: vec![],
         },
         status: Default::default(),
     }

@@ -1238,3 +1238,138 @@ async fn image_uploads() {
     assert_eq!(s, StatusCode::NOT_FOUND);
     e.store.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn networks() {
+    let e = storage_env().await;
+    let post = async |uri: String, spec: Value| {
+        call(&e.app, "POST", &uri, Some(json!({"spec": spec})), true).await
+    };
+    // Host networks.
+    let host = json!({"node": "n1", "uplink": "eno1", "vlan": 100, "roles": ["provider"], "physnet": "physnet1"});
+    let (s, v) = post(
+        "/v1/platform/hostNetworks?host_network_id=n1-prov".into(),
+        host.clone(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["spec"]["mtu"], 1500);
+    let (s, _) = post(
+        "/v1/platform/hostNetworks?host_network_id=again".into(),
+        host.clone(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    for bad in [
+        json!({"node": "nope", "uplink": "eno1", "roles": ["platform"]}),
+        json!({"node": "n1", "uplink": "eno1;x", "roles": ["platform"]}),
+        json!({"node": "n1", "uplink": "eno2", "roles": ["provider"]}),
+        json!({"node": "n1", "uplink": "eno2", "roles": []}),
+    ] {
+        let (s, v) = post(
+            "/v1/platform/hostNetworks?host_network_id=bad".into(),
+            bad.clone(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+    // Provider networks.
+    let pool = json!({"scope": "external", "cidr": "203.0.113.0/24", "gateway": "203.0.113.1",
+                      "first": "203.0.113.10", "last": "203.0.113.20"});
+    let (s, v) = post(
+        "/v1/platform/providerNetworks?provider_network_id=public".into(),
+        json!({"physnet": "physnet1", "pool": pool, "tenants": false}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let mut bad_pool = pool.clone();
+    bad_pool["gateway"] = json!("203.0.113.15");
+    let (s, _) = post(
+        "/v1/platform/providerNetworks?provider_network_id=bad".into(),
+        json!({"physnet": "physnet1", "pool": bad_pool}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    // The same segment with overlapping addresses: two tables for one range.
+    let mut overlap = pool.clone();
+    overlap["cidr"] = json!("203.0.113.128/25");
+    overlap["gateway"] = json!("203.0.113.129");
+    overlap["first"] = json!("203.0.113.130");
+    overlap["last"] = json!("203.0.113.140");
+    let (s, _) = post(
+        "/v1/platform/providerNetworks?provider_network_id=again".into(),
+        json!({"physnet": "physnet1", "pool": overlap}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+
+    // Networks of a project: a provider network only once the operator opens it.
+    let nets = "/v1/orgs/acme/projects/web/networks";
+    let wan = json!({"provider": {"network": "public"}});
+    let (s, _) = post(format!("{nets}?network_id=wan"), wan.clone()).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let one = "/v1/platform/providerNetworks/public";
+    let (_, cur) = call(&e.app, "GET", one, None, true).await;
+    let mut spec = cur["spec"].clone();
+    spec["tenants"] = json!(true);
+    assert_eq!(
+        call(&e.app, "PATCH", one, Some(json!({"spec": spec})), true)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    spec["pool"]["last"] = json!("203.0.113.30");
+    assert_eq!(
+        call(&e.app, "PATCH", one, Some(json!({"spec": spec})), true)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        post(format!("{nets}?network_id=wan"), wan).await.0,
+        StatusCode::OK
+    );
+    let (s, v) = post(
+        format!("{nets}?network_id=lan"),
+        json!({"private": {"cidr": "10.0.0.0/24"}}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    for bad in [
+        json!({"private": {"cidr": "10.0.0.1/24"}}),
+        json!({"private": {"cidr": "10.0.0.0/8"}}),
+    ] {
+        assert_eq!(
+            post(format!("{nets}?network_id=bad"), bad).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    // Not while in use: by a project's network, or an instance.
+    let (_, v) = call(&e.app, "DELETE", one, None, true).await;
+    assert_eq!(
+        v["error"]["message"],
+        "public is used by networks of projects"
+    );
+    let inst = json!({"spec": {"vcpus": 1, "memory_mib": 64, "interfaces": [{"network": "lan"}]}});
+    call(
+        &e.app,
+        "POST",
+        &format!("{BASE}?instance_id=vm"),
+        Some(inst),
+        true,
+    )
+    .await;
+    let (_, v) = call(&e.app, "DELETE", &format!("{nets}/lan"), None, true).await;
+    assert_eq!(v["error"]["message"], "lan is used by instances");
+    assert_eq!(
+        call(&e.app, "DELETE", &format!("{nets}/wan"), None, true)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&e.app, "DELETE", one, None, true).await.0,
+        StatusCode::OK
+    );
+    e.store.shutdown().await.unwrap();
+}

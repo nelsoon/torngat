@@ -93,6 +93,9 @@ pub struct InstanceSpec {
     pub boot_disk: Option<BootDisk>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disks: Vec<DiskRef>,
+    /// Networks of the project, one interface each, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<crate::network::InterfaceRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -105,6 +108,13 @@ pub enum InstanceError {
     Claims,
     #[error("at most {MAX_DISKS} distinct disks")]
     Disks,
+    #[error(
+        "at most {} interfaces, each on a different network",
+        crate::network::MAX_INTERFACES
+    )]
+    Interfaces,
+    #[error("interfaces can only change while the instance is stopped")]
+    InterfacesWhileRunning,
     #[error(
         "boot_disk.size_gib must be between 1 and {}",
         crate::storage::MAX_VOLUME_GIB
@@ -136,6 +146,12 @@ impl InstanceSpec {
         let disks: BTreeSet<&crate::Name> = self.disks.iter().map(|d| &d.volume).collect();
         if self.disks.len() > MAX_DISKS || disks.len() != self.disks.len() {
             return Err(InstanceError::Disks);
+        }
+        let nets: BTreeSet<&crate::Name> = self.interfaces.iter().map(|i| &i.network).collect();
+        if self.interfaces.len() > crate::network::MAX_INTERFACES
+            || nets.len() != self.interfaces.len()
+        {
+            return Err(InstanceError::Interfaces);
         }
         if let Some(b) = &self.boot_disk
             && !(1..=crate::storage::MAX_VOLUME_GIB).contains(&b.size_gib)
@@ -191,6 +207,9 @@ impl InstanceSpec {
         if removed && !stopped {
             return Err(InstanceError::DisksWhileRunning);
         }
+        if self.interfaces != new.interfaces && !stopped {
+            return Err(InstanceError::InterfacesWhileRunning);
+        }
         Ok(())
     }
 }
@@ -229,6 +248,9 @@ pub struct InstanceStatus {
     pub observed_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// What its interfaces got, in the order of `spec.interfaces`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<crate::network::InterfaceStatus>,
     /// Operation to complete when the instance first reaches its desired power state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_operation: Option<uuid::Uuid>,
@@ -248,6 +270,7 @@ mod tests {
             claims: vec![],
             boot_disk: None,
             disks: vec![],
+            interfaces: vec![],
         };
         assert_eq!(ok.validate(), Ok(()));
         assert_eq!(
@@ -288,6 +311,7 @@ mod tests {
             claims: vec![],
             boot_disk: Some(boot.clone()),
             disks: vec![DiskRef { volume: n("data") }],
+            interfaces: vec![],
         };
         assert_eq!(spec.validate(), Ok(()));
         assert_eq!(

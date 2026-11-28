@@ -1,7 +1,7 @@
 # User guide
 
 Pre-alpha: there is an API, no command-line client or web interface yet, and a single administrator
-token. Instances have no networks yet.
+token. Instances can be given networks, but nodes do not connect them yet: interfaces get their addresses only.
 
 The API listens on the controller's loopback interface. Through a tunnel:
 
@@ -123,3 +123,23 @@ POST /v1/orgs/acme/projects/web/images?image_id=debian-13
   chunked answers), and be at most the operator's limit (64 GiB by default). Up to 5 redirects are followed, to https only.
 - `status.message` says how the import goes (`downloading`, `copying it into its volume`). An import that does not move on
   for 15 minutes fails.
+
+## Networks
+
+```
+POST /v1/orgs/acme/projects/web/networks?network_id=lan
+{"spec": {"private": {"cidr": "10.0.0.0/24"}}}
+
+POST /v1/orgs/acme/projects/web/networks?network_id=wan
+{"spec": {"provider": {"network": "public"}}}
+```
+
+- A **private** network is the project's own: its addresses, out to the internet through the node's NAT, and nothing
+  comes in. Its first address is its router's. From /29 to /20, IPv4.
+- A **provider** network gives the instance an address of a network outside the platform, chosen by the operator
+  (`GET /v1/platform/providerNetworks` lists them). **Nothing filters what comes in**: the guest's own firewall must.
+- An instance's `spec.interfaces: [{"network": "lan"}, ...]` (at most 8, each on a different network) gives it an
+  interface on each, in order. `status.interfaces` shows the MAC and address each got. Interfaces change only while the
+  instance is stopped.
+- A network that an instance uses cannot be deleted, and its kind and addresses cannot change.
+- Pre-alpha: nodes do not connect interfaces yet.

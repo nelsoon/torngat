@@ -1,0 +1,44 @@
+# Networks
+
+Pre-alpha: the API and the addresses are there; nodes do not set up networks yet.
+
+## Host networks
+
+What each node's uplinks carry. One per uplink and VLAN:
+
+```
+POST /v1/platform/hostNetworks?host_network_id=n1-provider
+{"spec": {"node": "n1", "uplink": "eno2", "vlan": 100, "mtu": 1500,
+          "roles": ["provider"], "physnet": "physnet1"}}
+```
+
+- `uplink`: the NIC or bond on the node. Without `vlan`, untagged.
+- `roles`: `platform` (nodes and controllers), `storage`, `provider` (provider networks of instances), `tenant`
+  (overlays, later). One uplink may carry several; do not put `provider` on the untagged network of `platform`.
+- `physnet`: for the provider role only: the physical network that this uplink reaches. Provider networks name it.
+- Node, uplink and VLAN cannot change.
+
+## Provider networks
+
+A network outside the platform that instances can be on directly:
+
+```
+POST /v1/platform/providerNetworks?provider_network_id=public
+{"spec": {"physnet": "physnet1", "vlan": 200,
+          "pool": {"scope": "external", "cidr": "203.0.113.0/24", "gateway": "203.0.113.1",
+                   "first": "203.0.113.10", "last": "203.0.113.200"},
+          "tenants": true, "egress": true}}
+```
+
+- `pool.scope`: `external` (reaches outside your networks) or `internal`; not guessed from the addresses. Instances get
+  addresses from `first` to `last`; the gateway is outside that range.
+- `tenants`: projects may put instances on it (with a network of theirs naming it). **There is no inbound firewall yet**:
+  instances on it are reachable, and filter themselves.
+- `egress`: the nodes' NAT for private networks goes out by it.
+- Two provider networks on the same physnet and VLAN cannot have overlapping addresses. Networks cannot be in 0/8, loopback, link-local, multicast or 240/4.
+- Physnet, VLAN and pool cannot change; `tenants` and `egress` can. A provider network with addresses in use, or named by
+  a project's network, cannot be deleted.
+- `status.allocations`: the addresses given out, by instance uid.
+
+Datapath (next version): Open vSwitch on each node, a router namespace with NAT for private networks, a DHCP server in
+the agent that answers only the instances' own MACs, and anti-spoofing rules on every instance port.
