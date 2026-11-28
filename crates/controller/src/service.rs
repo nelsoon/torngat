@@ -412,9 +412,7 @@ impl Control for ControlService {
         let (scope, name, uid) = scoped_object(r.org, r.project, r.name, &r.uid)?;
         let format = match r.format.as_str() {
             "" => None,
-            "raw" => Some(ImageFormat::Raw),
-            "qcow2" => Some(ImageFormat::Qcow2),
-            _ => return Err(bad("format")),
+            f => Some(ImageFormat::parse(f).ok_or_else(|| bad("format"))?),
         };
         let state = images::ImageState {
             uid,

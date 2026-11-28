@@ -165,6 +165,22 @@ pub enum ImageFormat {
     Qcow2,
 }
 
+impl ImageFormat {
+    /// As in JSON and in node reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImageFormat::Raw => "raw",
+            ImageFormat::Qcow2 => "qcow2",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [ImageFormat::Raw, ImageFormat::Qcow2]
+            .into_iter()
+            .find(|f| f.as_str() == s)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ImageStatus {
     #[serde(default)]

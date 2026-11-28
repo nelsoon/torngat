@@ -601,7 +601,12 @@ async fn the_agent_imports_images() {
         .state()
         .formatted
         .keys()
-        .filter_map(|p| std::fs::read(p).ok())
+        .filter_map(|p| {
+            use std::io::Read;
+            let mut head = vec![0; disk.len()];
+            std::fs::File::open(p).ok()?.read_exact(&mut head).ok()?;
+            Some(head)
+        })
         .collect();
     assert!(
         held.iter().any(|f| f.starts_with(&disk)),

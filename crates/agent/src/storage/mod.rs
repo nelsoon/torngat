@@ -44,7 +44,7 @@ const KEY_WAIT: Duration = Duration::from_secs(5);
 const MAX_KEY_WAIT: Duration = Duration::from_secs(300);
 
 /// Org and project in messages to the controller: empty for the platform's volumes.
-fn org_project(scope: &Scope) -> Option<(String, String)> {
+pub(crate) fn org_project(scope: &Scope) -> Option<(String, String)> {
     match scope {
         Scope::Platform => Some((String::new(), String::new())),
         Scope::Project { org, project } => Some((org.to_string(), project.to_string())),
@@ -137,9 +137,13 @@ impl Assigned {
             .collect::<Result<Vec<Image>, _>>()
             .map_err(|e| decode("image", e))
             .ok()?;
-        let image_settings = serde_json::from_slice(&set.image_settings_json)
-            .map_err(|e| decode("image settings", e))
-            .ok()?;
+        // Unknown or missing (another version): the defaults, the strictest.
+        let image_settings = serde_json::from_slice(&set.image_settings_json).unwrap_or_else(|e| {
+            if !set.image_settings_json.is_empty() {
+                tracing::warn!(error = %e, "undecodable image settings: the defaults apply");
+            }
+            ImageSettings::default()
+        });
         Some(Self {
             pools,
             volumes,
@@ -240,6 +244,9 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
                     == Some(VolumeOwner::Image {
                         image: image.metadata.uid,
                     })
+                // As the controller sees it: then a report that needs it is not refused.
+                && v.status.phase == VolumePhase::Ready
+                && v.status.formatted
         })?;
         let size = *self.open.get(&v.metadata.uid)?;
         Some((self.crypt.device_of(v.metadata.uid), size))

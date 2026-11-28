@@ -386,7 +386,7 @@ pub async fn session<R: Runtime, D: Drivers, C: Crypt, T: import::ImageTool>(
                 };
                 importer
                     .reconcile(&mut client, &a.images, &a.image_settings, opened)
-                    .await?;
+                    .await;
             }
             if changed || waiting || disks_changed {
                 let disks = |i: &Instance| storage.disks(assigned.as_ref(), i);

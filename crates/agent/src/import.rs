@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 use crate::fetch::{Fetcher, Limits, Reach};
 use crate::sanitize;
+use crate::storage::org_project;
 
 /// How often a step that goes on is reported, so that the controller knows the import moves on.
 const PROGRESS_EVERY: Duration = Duration::from_secs(60);
@@ -121,15 +122,14 @@ pub struct Importer<T> {
     /// Steps whose result was reported, until the controller's answer comes: not started again
     /// meanwhile (unless the answer takes long: the report may have been lost).
     reported: HashMap<Uuid, (Step, Instant)>,
+    /// Results not yet delivered.
+    pending: HashMap<Uuid, (Step, ImageReport)>,
     /// Told when a task ends.
     done: Arc<Notify>,
 }
 
 fn report_of(image: &Image) -> ImageReport {
-    let (org, project) = match &image.metadata.scope {
-        Scope::Project { org, project } => (org.to_string(), project.to_string()),
-        _ => (String::new(), String::new()),
-    };
+    let (org, project) = org_project(&image.metadata.scope).unwrap_or_default();
     ImageReport {
         org,
         project,
@@ -145,6 +145,7 @@ impl<T: ImageTool> Importer<T> {
             tool,
             tasks: HashMap::new(),
             reported: HashMap::new(),
+            pending: HashMap::new(),
             done: Arc::new(Notify::new()),
         }
     }
@@ -154,7 +155,8 @@ impl<T: ImageTool> Importer<T> {
         self.done.clone()
     }
 
-    /// Stops every step: the session ended, and what it found could not be reported.
+    /// Stops the steps that run: the session ended, and what they find could not be reported.
+    /// Results not yet delivered are kept for the next session.
     pub async fn stop_all(&mut self) {
         self.reported.clear();
         for (uid, t) in self.tasks.drain() {
@@ -171,15 +173,16 @@ impl<T: ImageTool> Importer<T> {
         images: &[Image],
         settings: &ImageSettings,
         opened: impl Fn(&Image, bool) -> Opened,
-    ) -> Result<(), tonic::Status> {
+    ) {
         let gone: Vec<Uuid> = self
             .tasks
             .keys()
             .filter(|u| !images.iter().any(|i| i.metadata.uid == **u))
             .copied()
             .collect();
-        self.reported
-            .retain(|u, _| images.iter().any(|i| i.metadata.uid == *u));
+        let listed = |u: &Uuid| images.iter().any(|i| i.metadata.uid == *u);
+        self.reported.retain(|u, _| listed(u));
+        self.pending.retain(|u, _| listed(u));
         for uid in gone {
             if let Some(t) = self.tasks.remove(&uid) {
                 t.handle.abort();
@@ -217,21 +220,23 @@ impl<T: ImageTool> Importer<T> {
                         t.reported = Instant::now();
                         let mut r = report_of(image);
                         r.message = t.step.doing().into();
-                        send(client, r).await?;
+                        if let Sent::Error(e) = send(client, r).await {
+                            tracing::warn!(image = %uid, error = %e, "cannot report progress");
+                        }
                     }
                     continue;
                 } else if let Some(t) = self.tasks.remove(&uid) {
                     let result = t.handle.await.unwrap_or_else(|e| Err(e.to_string()));
                     let mut r = report_of(image);
                     match result {
-                        Ok(Done::Length(n)) => r.download_bytes = n,
+                        Ok(Done::Length(n)) => {
+                            r.download_bytes = n;
+                            r.message = "waiting for room to download it".into();
+                        }
                         Ok(Done::Info(f, size)) => {
-                            r.format = match f {
-                                ImageFormat::Raw => "raw",
-                                ImageFormat::Qcow2 => "qcow2",
-                            }
-                            .into();
+                            r.format = f.as_str().into();
                             r.size_bytes = size;
+                            r.message = "waiting for its volume".into();
                         }
                         Ok(Done::Converted) => r.done = true,
                         Err(e) => {
@@ -243,11 +248,34 @@ impl<T: ImageTool> Importer<T> {
                             }
                         }
                     }
-                    send(client, r).await?;
-                    // The next step starts once the controller answered with the new state.
-                    self.reported.insert(uid, (t.step, Instant::now()));
-                    continue;
+                    self.pending.insert(uid, (t.step, r));
                 }
+            }
+            // A result is sent until the controller has it: a finished download is never lost
+            // to a controller that could not answer.
+            if let Some((step, r)) = self.pending.remove(&uid) {
+                match send(client, r.clone()).await {
+                    Sent::Delivered => {}
+                    // What the controller will not take fails the import, rather than having the
+                    // step done again and again.
+                    Sent::Refused(why) if !r.failed => {
+                        let mut f = report_of(image);
+                        f.failed = true;
+                        f.message = sanitize(&format!("the result was refused: {why}"));
+                        if let Sent::Error(e) = send(client, f).await {
+                            tracing::warn!(image = %uid, error = %e, "cannot report a failure");
+                        }
+                    }
+                    Sent::Refused(_) => {}
+                    Sent::Error(e) => {
+                        tracing::warn!(image = %uid, error = %e, "cannot report; trying again");
+                        self.pending.insert(uid, (step, r));
+                        continue;
+                    }
+                }
+                // The next step starts once the controller answered with the new state.
+                self.reported.insert(uid, (step, Instant::now()));
+                continue;
             }
             let Some(step) = want else { continue };
             let job = Job {
@@ -285,14 +313,20 @@ impl<T: ImageTool> Importer<T> {
                 },
             );
         }
-        Ok(())
     }
 }
 
-/// Sends a report. A refusal is logged, not an error: the controller's state decides what comes next.
-async fn send(client: &mut ControlClient<Channel>, r: ImageReport) -> Result<(), tonic::Status> {
+enum Sent {
+    Delivered,
+    /// The controller will not take it, now or later.
+    Refused(String),
+    /// It could not answer: try again.
+    Error(tonic::Status),
+}
+
+async fn send(client: &mut ControlClient<Channel>, r: ImageReport) -> Sent {
     match client.report_image(r).await {
-        Ok(_) => Ok(()),
+        Ok(_) => Sent::Delivered,
         Err(s)
             if matches!(
                 s.code(),
@@ -302,9 +336,9 @@ async fn send(client: &mut ControlClient<Channel>, r: ImageReport) -> Result<(),
             ) =>
         {
             tracing::warn!(error = %s.message(), "image report refused");
-            Ok(())
+            Sent::Refused(s.message().to_owned())
         }
-        Err(s) => Err(s),
+        Err(s) => Sent::Error(s),
     }
 }
 
@@ -382,23 +416,51 @@ impl<T: ImageTool> Job<T> {
     }
 }
 
-/// The format of the image in the first `len` bytes of `path`, from its first bytes.
+/// The format of the image in the first `len` bytes of `path`, from its first bytes. A qcow2
+/// image with a backing file or an external data file is refused here, before qemu-img opens it
+/// (it would open the file that the image names).
 async fn detect(path: &Path, len: u64) -> Result<ImageFormat, String> {
-    let mut f = tokio::fs::File::open(path)
-        .await
-        .map_err(|e| format!("cannot read the staging volume: {e}"))?;
-    let mut magic = [0u8; 4];
-    if len < magic.len() as u64 {
+    let unreadable = |e: std::io::Error| {
+        tracing::warn!(path = %path.display(), error = %e, "cannot read the staging volume");
+        "cannot read the download".to_owned()
+    };
+    let mut f = tokio::fs::File::open(path).await.map_err(unreadable)?;
+    let mut header = [0u8; QCOW2_HEADER];
+    let n = usize::try_from(len.min(QCOW2_HEADER as u64)).unwrap_or(QCOW2_HEADER);
+    f.read_exact(&mut header[..n]).await.map_err(unreadable)?;
+    if n < 4 || &header[..4] != QCOW2_MAGIC {
         return Ok(ImageFormat::Raw);
     }
-    f.read_exact(&mut magic)
-        .await
-        .map_err(|e| format!("cannot read the staging volume: {e}"))?;
-    Ok(if &magic == QCOW2_MAGIC {
-        ImageFormat::Qcow2
-    } else {
-        ImageFormat::Raw
-    })
+    qcow2_header(&header[..n])?;
+    Ok(ImageFormat::Qcow2)
+}
+
+/// Bytes of a qcow2 header that are looked at.
+const QCOW2_HEADER: usize = 80;
+
+/// Refuses a qcow2 header that names another file.
+fn qcow2_header(h: &[u8]) -> Result<(), String> {
+    let be32 = |at: usize| {
+        h.get(at..at + 4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let be64 = |at: usize| {
+        h.get(at..at + 8)
+            .map(|b| u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    };
+    let bad = || "not a valid qcow2 image".to_owned();
+    let version = be32(4).ok_or_else(bad)?;
+    if !(2..=3).contains(&version) {
+        return Err("a qcow2 version that is not supported".into());
+    }
+    if be64(8).ok_or_else(bad)? != 0 {
+        return Err("the image has a backing file: refused".into());
+    }
+    // Version 3: incompatible features, bit 2 is an external data file.
+    if version == 3 && be64(72).ok_or_else(bad)? & (1 << 2) != 0 {
+        return Err("the image has a data file: refused".into());
+    }
+    Ok(())
 }
 
 /// The block device options for qemu-img: the first `len` bytes of `src` as an image of `format`.
@@ -455,6 +517,14 @@ impl Default for QemuImg {
 /// Longest output read from qemu-img.
 const MAX_OUTPUT: u64 = 1 << 20;
 
+/// The device node behind `p` (a `/dev/mapper` link). Errors name no path: tenants see them.
+fn canonical(p: &Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(p).map_err(|e| {
+        tracing::warn!(path = %p.display(), error = %e, "volume not found");
+        "the volume is not open".to_owned()
+    })
+}
+
 fn unit(task: Uuid) -> String {
     format!("torngat-image-{task}")
 }
@@ -475,37 +545,12 @@ impl QemuImg {
             "MemorySwapMax=0".into(),
             "TasksMax=64".into(),
             "LimitCORE=0".into(),
-            format!("RuntimeMaxSec={}", self.runtime_max.as_secs()),
-            "PrivateIPC=yes".into(),
-            "PrivateNetwork=yes".into(),
-            "IPAddressDeny=any".into(),
-            "RestrictAddressFamilies=AF_UNIX".into(),
-            "CapabilityBoundingSet=".into(),
-            "AmbientCapabilities=".into(),
-            "NoNewPrivileges=yes".into(),
-            "RestrictNamespaces=yes".into(),
-            "RestrictRealtime=yes".into(),
-            "RestrictSUIDSGID=yes".into(),
-            "LockPersonality=yes".into(),
-            "MemoryDenyWriteExecute=yes".into(),
-            "SystemCallArchitectures=native".into(),
-            "SystemCallFilter=@system-service".into(),
-            "KeyringMode=private".into(),
-            "ProtectSystem=strict".into(),
-            "ProtectHome=yes".into(),
-            "PrivateTmp=yes".into(),
-            "ProtectProc=invisible".into(),
-            "ProcSubset=pid".into(),
-            "ProtectKernelTunables=yes".into(),
-            "ProtectKernelModules=yes".into(),
-            "ProtectKernelLogs=yes".into(),
-            "ProtectControlGroups=yes".into(),
-            "ProtectClock=yes".into(),
-            "ProtectHostname=yes".into(),
             "UMask=0077".into(),
-            "InaccessiblePaths=-/run/dbus -/run/systemd/private -/run/systemd/io.systemd.ManagedOOM"
-                .into(),
+            format!("RuntimeMaxSec={}", self.runtime_max.as_secs()),
+            "RestrictSUIDSGID=yes".into(),
+            "SystemCallFilter=@system-service".into(),
         ];
+        p.extend(crate::qemu::confined());
         if let Some(w) = write {
             p.push(format!("BindPaths={}", w.display()));
             p.push(format!("DeviceAllow={} rw", w.display()));
@@ -522,12 +567,11 @@ impl QemuImg {
         args: &[String],
     ) -> Result<Vec<u8>, String> {
         // The device node itself, not the /dev/mapper link: that is what is bound and allowed.
-        let node = |p: &Path| std::fs::canonicalize(p).map_err(|e| format!("{}: {e}", p.display()));
-        let read = node(read)?;
-        let write = write.map(node).transpose()?;
+        let read = canonical(read)?;
+        let write = write.map(canonical).transpose()?;
         // A unit left by an agent that stopped.
         self.stop(task).await;
-        let mut cmd = tokio::process::Command::new("systemd-run");
+        let mut cmd = tokio::process::Command::new(crate::qemu::SYSTEMD_RUN);
         cmd.args([
             "--wait",
             "--pipe",
@@ -560,22 +604,15 @@ impl QemuImg {
         let (status, (), ()) = tokio::join!(child.wait(), read_out, read_err);
         let status = status.map_err(|e| format!("systemd-run: {e}"))?;
         if !status.success() {
+            // Its own words name host paths and come from what the tenant sent: logged only.
             let text = String::from_utf8_lossy(&err);
             let last = text
                 .lines()
                 .rev()
                 .find(|l| !l.trim().is_empty())
                 .unwrap_or("");
-            // qemu-img names the devices: tenants need not see host paths.
-            let last = last.replace(&*read.to_string_lossy(), "the download");
-            let last = match &write {
-                Some(w) => last.replace(&*w.to_string_lossy(), "the image's volume"),
-                None => last,
-            };
-            return Err(format!(
-                "qemu-img failed: {}",
-                last.chars().take(200).collect::<String>()
-            ));
+            tracing::warn!(task = %task, error = %last, "qemu-img failed");
+            return Err("the image cannot be read: it is damaged or of an unsupported kind".into());
         }
         Ok(out)
     }
@@ -613,7 +650,7 @@ impl ImageTool for QemuImg {
     }
 
     async fn qcow2_size(&self, task: Uuid, src: &Path, len: u64) -> Result<u64, String> {
-        let node = std::fs::canonicalize(src).map_err(|e| format!("{}: {e}", src.display()))?;
+        let node = canonical(src)?;
         let args = vec![
             "info".into(),
             "--output=json".into(),
@@ -631,9 +668,7 @@ impl ImageTool for QemuImg {
         format: ImageFormat,
         dst: &Path,
     ) -> Result<(), String> {
-        let canon =
-            |p: &Path| std::fs::canonicalize(p).map_err(|e| format!("{}: {e}", p.display()));
-        let (s, d) = (canon(src)?, canon(dst)?);
+        let (s, d) = (canonical(src)?, canonical(dst)?);
         let target = format!(
             "driver=raw,file.driver=host_device,file.filename={}",
             d.display()
@@ -650,7 +685,7 @@ impl ImageTool for QemuImg {
     }
 
     async fn stop(&self, task: Uuid) {
-        let _ = tokio::process::Command::new("systemctl")
+        let _ = tokio::process::Command::new(crate::qemu::SYSTEMCTL)
             .args(["stop", "--quiet"])
             .arg(format!("{}.service", unit(task)))
             .stdin(std::process::Stdio::null())
@@ -813,10 +848,31 @@ mod tests {
     async fn formats_by_content() {
         let dir = tempfile::TempDir::new().unwrap();
         let p = dir.path().join("f");
-        let mut q = QCOW2_MAGIC.to_vec();
-        q.extend_from_slice(&[0; 100]);
-        std::fs::write(&p, &q).unwrap();
-        assert_eq!(detect(&p, 104).await, Ok(ImageFormat::Qcow2));
+        let header = |version: u32, backing: u64, features: u64| {
+            let mut q = QCOW2_MAGIC.to_vec();
+            q.extend_from_slice(&version.to_be_bytes());
+            q.extend_from_slice(&backing.to_be_bytes());
+            q.resize(72, 0);
+            q.extend_from_slice(&features.to_be_bytes());
+            q.resize(512, 0);
+            q
+        };
+        std::fs::write(&p, header(3, 0, 0)).unwrap();
+        assert_eq!(detect(&p, 512).await, Ok(ImageFormat::Qcow2));
+        std::fs::write(&p, header(2, 0, 4)).unwrap();
+        assert_eq!(detect(&p, 512).await, Ok(ImageFormat::Qcow2));
+        for bad in [
+            header(3, 512, 0),
+            header(3, 0, 4),
+            header(1, 0, 0),
+            header(2, 7, 0),
+        ] {
+            std::fs::write(&p, &bad).unwrap();
+            assert!(detect(&p, 512).await.is_err());
+        }
+        // Too short for a header.
+        std::fs::write(&p, &header(3, 0, 0)[..20]).unwrap();
+        assert!(detect(&p, 20).await.is_err());
         std::fs::write(&p, b"QFI").unwrap();
         assert_eq!(detect(&p, 3).await, Ok(ImageFormat::Raw));
         std::fs::write(&p, [0u8; 512]).unwrap();

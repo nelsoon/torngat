@@ -202,10 +202,18 @@ async fn step(
             let Some(node) = &image.status.node else {
                 return Ok(0);
             };
-            let stalled = image
-                .status
-                .progress_time
-                .is_none_or(|t| now() - t > PROGRESS_DEADLINE);
+            // Without a time (made by an older version): from now.
+            let Some(since) = image.status.progress_time else {
+                return changed(
+                    modify_image(store, image, |i| {
+                        let none = i.status.progress_time.is_none();
+                        i.status.progress_time.get_or_insert_with(now);
+                        none
+                    })
+                    .await,
+                );
+            };
+            let stalled = now() - since > PROGRESS_DEADLINE;
             if stalled {
                 return changed(
                     modify_image(store, image, |i| {
