@@ -10,18 +10,21 @@ publish = false
 
 [features]
 # TPM-held node keys and attestation (needs the tpm2-tss libraries).
-tpm = ["dep:tss-esapi", "dep:p256", "dep:sha2", "dep:torngat-attest"]
+tpm = ["dep:tss-esapi", "dep:p256", "dep:torngat-attest"]
 
 [dependencies]
 p256 = { version = "0.14", default-features = false, features = ["ecdsa"], optional = true }
 pem = "4"
-sha2 = { version = "0.11", optional = true }
+sha2 = "0.11"
 tss-esapi = { version = "7.7", optional = true }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { version = "0.5", features = ["util"] }
 rcgen = "0.14"
 rustix = { version = "1.1", features = ["fs", "net", "std"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

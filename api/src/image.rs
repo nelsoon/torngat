@@ -70,7 +70,7 @@ pub struct ImageSource {
 /// Whether `url` is an absolute https URL with a host, and nothing that would be a secret
 /// (credentials) or that a server never sees (a fragment). The node parses it again and checks
 /// where it leads.
-fn valid_url(url: &str) -> bool {
+pub fn valid_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
     };

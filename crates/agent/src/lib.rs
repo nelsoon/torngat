@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod fetch;
 pub mod inventory;
 pub mod join;
 pub mod qemu;
