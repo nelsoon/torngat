@@ -145,6 +145,15 @@ pub async fn images_once(ctl: &Controller) -> Result<usize, ScheduleError> {
             })
             .map(|(i, _)| i.metadata.uid)
             .collect();
+        // Those whose image is done or being deleted at once; others (an image gone) after a while.
+        for (i, _) in &images {
+            if i.spec.source.url.is_none()
+                && !wanted.contains(&i.metadata.uid)
+                && let Err(e) = u.remove(i.metadata.uid).await
+            {
+                tracing::warn!(image = %i.metadata.uid, error = %e, "cannot remove an upload");
+            }
+        }
         match u.sweep(|uid| wanted.contains(&uid), UPLOAD_STALE).await {
             Ok(0) => {}
             Ok(n) => tracing::info!(count = n, "uploads removed"),

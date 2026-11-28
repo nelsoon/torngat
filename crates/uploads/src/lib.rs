@@ -51,6 +51,30 @@ pub struct Uploads {
     root: PathBuf,
 }
 
+/// Removes a temporary file unless kept: also when the request that writes it is dropped.
+struct Tmp(Option<PathBuf>);
+
+impl Tmp {
+    fn path(&self) -> &Path {
+        self.0.as_deref().unwrap_or(Path::new(""))
+    }
+
+    fn keep(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Tmp {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// An image's upload that its controller did not record yet is not removed for this long.
+const GRACE: Duration = Duration::from_secs(3600);
+
 fn part_name(n: u32) -> String {
     format!("part-{n:05}")
 }
@@ -84,36 +108,29 @@ impl Uploads {
             return Err(UploadError::Finished);
         }
         tokio::fs::create_dir_all(&dir).await?;
-        let tmp = dir.join(format!("{}.{}.tmp", part_name(n), Uuid::now_v7()));
-        let written = async {
-            let mut f = tokio::fs::File::create(&tmp).await?;
-            let mut buf = vec![0u8; 1 << 20];
-            let mut total: u64 = 0;
-            loop {
-                let got = body.read(&mut buf).await?;
-                if got == 0 {
-                    break;
-                }
-                total += got as u64;
-                if total > MAX_PART_BYTES {
-                    return Err(UploadError::PartTooLarge);
-                }
-                f.write_all(&buf[..got]).await?;
+        let tmp = Tmp(Some(dir.join(format!(
+            "{}.{}.tmp",
+            part_name(n),
+            Uuid::now_v7()
+        ))));
+        let mut f = tokio::fs::File::create(tmp.path()).await?;
+        let mut buf = vec![0u8; 1 << 20];
+        let mut total: u64 = 0;
+        loop {
+            let got = body.read(&mut buf).await?;
+            if got == 0 {
+                break;
             }
-            f.sync_all().await?;
-            Ok(total)
+            total += got as u64;
+            if total > MAX_PART_BYTES {
+                return Err(UploadError::PartTooLarge);
+            }
+            f.write_all(&buf[..got]).await?;
         }
-        .await;
-        match written {
-            Ok(total) => {
-                tokio::fs::rename(&tmp, dir.join(part_name(n))).await?;
-                Ok(total)
-            }
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                Err(e)
-            }
-        }
+        f.sync_all().await?;
+        tokio::fs::rename(tmp.path(), dir.join(part_name(n))).await?;
+        tmp.keep();
+        Ok(total)
     }
 
     /// The parts received, with their sizes, in order.
@@ -135,7 +152,8 @@ impl Uploads {
     }
 
     /// Puts parts 1 to the last together, if none is missing, the whole is at most `max` bytes
-    /// and matches `checksum`. Returns its length. The parts are removed then.
+    /// and matches `checksum`. Returns its length. The parts are removed then. Once done, it
+    /// answers the same again (the caller may not have recorded it).
     pub async fn finish(
         &self,
         image: Uuid,
@@ -143,8 +161,10 @@ impl Uploads {
         max: u64,
     ) -> Result<u64, UploadError> {
         let dir = self.dir(image);
-        if tokio::fs::try_exists(dir.join(FILE)).await? {
-            return Err(UploadError::Finished);
+        match tokio::fs::metadata(dir.join(FILE)).await {
+            Ok(m) => return Ok(m.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
         let parts = self.parts(image).await?;
         if parts.is_empty() {
@@ -156,13 +176,14 @@ impl Uploads {
                 return Err(UploadError::Missing(want));
             }
         }
-        let total: u64 = parts.iter().map(|(_, s)| s).sum();
-        if total > max {
+        let listed: u64 = parts.iter().map(|(_, s)| s).sum();
+        if listed > max {
             return Err(UploadError::TooLarge(max));
         }
-        let tmp = dir.join(format!("{FILE}.{}.tmp", Uuid::now_v7()));
+        let tmp = Tmp(Some(dir.join(format!("{FILE}.{}.tmp", Uuid::now_v7()))));
         let joined = async {
-            let mut out = tokio::fs::File::create(&tmp).await?;
+            let mut out = tokio::fs::File::create(tmp.path()).await?;
+            let mut copied: u64 = 0;
             let mut h256 = sha2::Sha256::new();
             let mut h512 = sha2::Sha512::new();
             let mut buf = vec![0u8; 1 << 20];
@@ -177,6 +198,10 @@ impl Uploads {
                         Checksum::Sha256(_) => h256.update(&buf[..got]),
                         Checksum::Sha512(_) => h512.update(&buf[..got]),
                     }
+                    copied += got as u64;
+                    if copied > max {
+                        return Err(UploadError::TooLarge(max));
+                    }
                     out.write_all(&buf[..got]).await?;
                 }
             }
@@ -186,21 +211,19 @@ impl Uploads {
                 Checksum::Sha512(w) => torngat_pki::hex(&h512.finalize()) == *w,
             };
             if ok {
-                Ok(())
+                Ok(copied)
             } else {
                 Err(UploadError::Checksum)
             }
         }
         .await;
-        if let Err(e) = joined {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(e);
-        }
-        tokio::fs::rename(&tmp, dir.join(FILE)).await?;
+        let copied = joined?;
+        tokio::fs::rename(tmp.path(), dir.join(FILE)).await?;
+        tmp.keep();
         for (n, _) in parts {
             let _ = tokio::fs::remove_file(dir.join(part_name(n))).await;
         }
-        Ok(total)
+        Ok(copied)
     }
 
     /// The finished upload of `image`, positioned at `offset`.
@@ -243,11 +266,23 @@ impl Uploads {
             let Some(uid) = e.file_name().to_str().and_then(|n| Uuid::parse_str(n).ok()) else {
                 continue;
             };
-            let finished = tokio::fs::try_exists(e.path().join(FILE)).await?;
-            let old = !finished && untouched_for(&e.path()).await? > stale;
-            if !keep(uid) || old {
-                self.remove(uid).await?;
-                removed += 1;
+            // One that cannot be looked at does not hold back the others.
+            let gone = async {
+                let finished = tokio::fs::try_exists(e.path().join(FILE)).await?;
+                let idle = untouched_for(&e.path()).await?;
+                // An image made since its caller read the images may not be in `keep` yet.
+                let unwanted = !keep(uid) && idle > GRACE;
+                if unwanted || (!finished && idle > stale) {
+                    self.remove(uid).await?;
+                    return Ok::<_, UploadError>(true);
+                }
+                Ok(false)
+            }
+            .await;
+            match gone {
+                Ok(true) => removed += 1,
+                Ok(false) => {}
+                Err(_) => {}
             }
         }
         Ok(removed)
@@ -270,6 +305,19 @@ async fn untouched_for(dir: &Path) -> Result<Duration, UploadError> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// Makes `dir` and what is in it look two hours old.
+    fn age(dir: &Path) {
+        let old = SystemTime::now() - Duration::from_secs(7200);
+        for e in std::fs::read_dir(dir).unwrap() {
+            let f = std::fs::File::options()
+                .write(true)
+                .open(e.unwrap().path())
+                .unwrap();
+            f.set_modified(old).unwrap();
+        }
+        std::fs::File::open(dir).unwrap().set_modified(old).unwrap();
+    }
 
     #[tokio::test]
     async fn parts_put_together() {
@@ -311,6 +359,8 @@ mod tests {
             u.put_part(img, 1, &b""[..]).await,
             Err(UploadError::Finished)
         ));
+        // Finished again: the same answer.
+        assert_eq!(u.finish(img, &sha, 1 << 30).await.unwrap(), 300_000);
         let mut f = u.open(img, 299_990).await.unwrap();
         let mut tail = Vec::new();
         f.read_to_end(&mut tail).await.unwrap();
@@ -319,12 +369,11 @@ mod tests {
         // Swept once its image is gone.
         let other = Uuid::now_v7();
         u.put_part(other, 1, &b"a"[..]).await.unwrap();
-        assert_eq!(
-            u.sweep(|i| i == img, Duration::from_secs(3600))
-                .await
-                .unwrap(),
-            1
-        );
+        let hour = Duration::from_secs(3600);
+        // Not at once: its image may be new.
+        assert_eq!(u.sweep(|i| i == img, hour).await.unwrap(), 0);
+        age(&dir.path().join(other.to_string()));
+        assert_eq!(u.sweep(|i| i == img, hour).await.unwrap(), 1);
         assert!(u.open(img, 0).await.is_ok());
         // An unfinished one left alone too long.
         u.put_part(other, 1, &b"a"[..]).await.unwrap();
