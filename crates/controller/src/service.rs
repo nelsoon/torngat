@@ -259,7 +259,7 @@ impl Control for ControlService {
                 // told to ignore the storage lists, never given a partial one.
                 let storage = match storage::assigned_storage(&store, &me).await {
                     Ok((pools, volumes)) => match images::assigned_images(&store, &me).await {
-                        Ok(images) => Some((pools, volumes, images)),
+                        Ok((images, settings)) => Some((pools, volumes, images, settings)),
                         Err(e) => {
                             tracing::error!(node = %me, error = %e, "image assignments unavailable");
                             None
@@ -278,6 +278,11 @@ impl Control for ControlService {
                         pools_json: set.1.as_ref().map(|s| s.0.clone()).unwrap_or_default(),
                         volumes_json: set.1.as_ref().map(|s| s.1.clone()).unwrap_or_default(),
                         images_json: set.1.as_ref().map(|s| s.2.clone()).unwrap_or_default(),
+                        image_settings_json: set
+                            .1
+                            .as_ref()
+                            .map(|s| s.3.clone())
+                            .unwrap_or_default(),
                         storage_unavailable: set.1.is_none(),
                     };
                     if tx.send(Ok(msg)).await.is_err() {
@@ -407,9 +412,7 @@ impl Control for ControlService {
         let (scope, name, uid) = scoped_object(r.org, r.project, r.name, &r.uid)?;
         let format = match r.format.as_str() {
             "" => None,
-            "raw" => Some(ImageFormat::Raw),
-            "qcow2" => Some(ImageFormat::Qcow2),
-            _ => return Err(bad("format")),
+            f => Some(ImageFormat::parse(f).ok_or_else(|| bad("format"))?),
         };
         let state = images::ImageState {
             uid,

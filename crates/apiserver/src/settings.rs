@@ -3,7 +3,7 @@
 use axum::Json;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
-use torngat_api::settings::TpmSettings;
+use torngat_api::settings::{ImageSettings, TpmSettings};
 use torngat_pki::{TPM_POLICY_KEY, TpmPolicy};
 use torngat_store::{Key, Precondition};
 
@@ -41,5 +41,33 @@ pub async fn put_tpm(
     } else {
         tracing::warn!("TPM requirement disabled: file-key nodes may join");
     }
+    Ok(Json(req))
+}
+
+fn images_key() -> Result<Key, ApiError> {
+    Key::new("platform", ["settings", "images"]).map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+pub async fn get_images(State(st): State<AppState>) -> Result<Json<ImageSettings>, ApiError> {
+    Ok(Json(match st.store.get(&images_key()?).await? {
+        Some(v) => serde_json::from_slice(&v.value)?,
+        None => ImageSettings::default(),
+    }))
+}
+
+pub async fn put_images(
+    State(st): State<AppState>,
+    b: Result<Json<ImageSettings>, JsonRejection>,
+) -> Result<Json<ImageSettings>, ApiError> {
+    let req = body(b)?;
+    req.validate().map_err(ApiError::InvalidArgument)?;
+    st.store
+        .put(images_key()?, serde_json::to_vec(&req)?, Precondition::None)
+        .await?;
+    tracing::info!(
+        max_image_gib = req.max_image_gib,
+        platform_private_sources = req.platform_private_sources,
+        "image settings changed"
+    );
     Ok(Json(req))
 }

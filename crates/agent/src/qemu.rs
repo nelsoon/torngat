@@ -39,7 +39,7 @@ use crate::runtime::{Disk, Runtime};
 pub const UNIT_PREFIX: &str = "torngat-vm-";
 const STATE_ROOT: &str = "/var/lib/torngat-vm";
 const RUNTIME_ROOT: &str = "/run/torngat-vm";
-const SLICE: &str = "torngat-vms.slice";
+pub(crate) const SLICE: &str = "torngat-vms.slice";
 
 /// Bound on every QMP exchange.
 const QMP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -58,8 +58,8 @@ const SUPPORTED: &[Capability] = &[Capability::LiveMigratable];
 
 const MIB: u64 = 1 << 20;
 
-const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
-const SYSTEMCTL: &str = "/usr/bin/systemctl";
+pub(crate) const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
+pub(crate) const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const JOURNALCTL: &str = "/usr/bin/journalctl";
 
 #[derive(Debug, Clone)]
@@ -357,7 +357,7 @@ pub fn properties(inst: &Instance, cfg: &QemuConfig) -> Vec<String> {
     // QEMU itself: page tables, device emulation, buffers.
     let memory = guest.saturating_add(256 * MIB).saturating_add(guest / 16);
     let tasks = 64 + 4 * u64::from(inst.spec.vcpus);
-    vec![
+    let mut p = vec![
         format!("Description=Torngat instance {uid}"),
         "DynamicUser=yes".into(),
         "SupplementaryGroups=kvm".into(),
@@ -384,6 +384,20 @@ pub fn properties(inst: &Instance, cfg: &QemuConfig) -> Vec<String> {
         "BindPaths=/dev/kvm".into(),
         "DevicePolicy=closed".into(),
         "DeviceAllow=/dev/kvm rw".into(),
+    ];
+    p.extend(confined());
+    p.extend([
+        // The agent decides about restarts.
+        "Restart=no".into(),
+        format!("TimeoutStopSec={}", KILL_AFTER.as_secs()),
+    ]);
+    p
+}
+
+/// What a unit that runs untrusted input is allowed, for QEMU and qemu-img: no network, no
+/// privileges, and little of the host.
+pub(crate) fn confined() -> Vec<String> {
+    vec![
         "PrivateIPC=yes".into(),
         // Network: none for now; networks will hand QEMU its interfaces.
         "PrivateNetwork=yes".into(),
@@ -415,9 +429,6 @@ pub fn properties(inst: &Instance, cfg: &QemuConfig) -> Vec<String> {
         // The system's buses: nothing to ask systemd or others for.
         "InaccessiblePaths=-/run/dbus -/run/systemd/private -/run/systemd/io.systemd.ManagedOOM"
             .into(),
-        // The agent decides about restarts.
-        "Restart=no".into(),
-        format!("TimeoutStopSec={}", KILL_AFTER.as_secs()),
     ]
 }
 

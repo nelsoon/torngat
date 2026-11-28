@@ -19,7 +19,11 @@ use std::time::{Duration, Instant};
 
 use tonic::transport::Channel;
 use torngat_api::compute::Instance;
-use torngat_api::storage::{LUKS_HEADER_BYTES, StorageDriver, StoragePool, Volume, VolumePhase};
+use torngat_api::image::{Image, image_volume, staging_volume};
+use torngat_api::settings::ImageSettings;
+use torngat_api::storage::{
+    LUKS_HEADER_BYTES, StorageDriver, StoragePool, Volume, VolumeOwner, VolumePhase,
+};
 use torngat_api::{Name, Scope};
 use torngat_proto::storage::v1 as drv;
 use torngat_proto::v1::control_client::ControlClient;
@@ -40,7 +44,7 @@ const KEY_WAIT: Duration = Duration::from_secs(5);
 const MAX_KEY_WAIT: Duration = Duration::from_secs(300);
 
 /// Org and project in messages to the controller: empty for the platform's volumes.
-fn org_project(scope: &Scope) -> Option<(String, String)> {
+pub(crate) fn org_project(scope: &Scope) -> Option<(String, String)> {
     match scope {
         Scope::Platform => Some((String::new(), String::new())),
         Scope::Project { org, project } => Some((org.to_string(), project.to_string())),
@@ -62,6 +66,9 @@ pub struct Assigned {
     pub volumes: Vec<Volume>,
     /// Instances on this node, with the volumes each lists (in its project).
     pub instances: BTreeMap<Uuid, (Scope, BTreeSet<Name>)>,
+    /// Images that this node imports.
+    pub images: Vec<Image>,
+    pub image_settings: ImageSettings,
 }
 
 impl Assigned {
@@ -84,14 +91,27 @@ impl Assigned {
 }
 
 impl Assigned {
+    /// The image being imported here that `v` holds or stages.
+    pub fn image_of(&self, v: &Volume) -> Option<&Image> {
+        let VolumeOwner::Image { image } = v.status.owner? else {
+            return None;
+        };
+        self.images.iter().find(|i| {
+            i.metadata.uid == image
+                && i.metadata.scope == v.metadata.scope
+                && (image_volume(&i.metadata.name).as_ref() == Ok(&v.metadata.name)
+                    || staging_volume(&i.metadata.name).as_ref() == Ok(&v.metadata.name))
+        })
+    }
+
     /// `None` if the controller could not read storage, or an entry does not decode (a newer
     /// controller): then storage is left alone.
     pub fn decode(
-        pools: &[Vec<u8>],
-        volumes: &[Vec<u8>],
-        unavailable: bool,
+        set: &torngat_proto::v1::AssignmentSet,
         instances: BTreeMap<Uuid, (Scope, BTreeSet<Name>)>,
     ) -> Option<Self> {
+        let (pools, volumes, unavailable) =
+            (&set.pools_json, &set.volumes_json, set.storage_unavailable);
         if unavailable {
             return None;
         }
@@ -110,10 +130,26 @@ impl Assigned {
             .collect::<Result<Vec<Volume>, _>>()
             .map_err(|e| decode("volume", e))
             .ok()?;
+        let images = set
+            .images_json
+            .iter()
+            .map(|b| serde_json::from_slice(b))
+            .collect::<Result<Vec<Image>, _>>()
+            .map_err(|e| decode("image", e))
+            .ok()?;
+        // Unknown or missing (another version): the defaults, the strictest.
+        let image_settings = serde_json::from_slice(&set.image_settings_json).unwrap_or_else(|e| {
+            if !set.image_settings_json.is_empty() {
+                tracing::warn!(error = %e, "undecodable image settings: the defaults apply");
+            }
+            ImageSettings::default()
+        });
         Some(Self {
             pools,
             volumes,
             instances,
+            images,
+            image_settings,
         })
     }
 }
@@ -199,6 +235,23 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
         out
     }
 
+    /// The open volume `name` of `image`: where to read and write it, and its size.
+    pub fn image_volume(&self, a: &Assigned, image: &Image, name: &Name) -> Option<(PathBuf, u64)> {
+        let v = a.volumes.iter().find(|v| {
+            v.metadata.scope == image.metadata.scope
+                && v.metadata.name == *name
+                && v.status.owner
+                    == Some(VolumeOwner::Image {
+                        image: image.metadata.uid,
+                    })
+                // As the controller sees it: then a report that needs it is not refused.
+                && v.status.phase == VolumePhase::Ready
+                && v.status.formatted
+        })?;
+        let size = *self.open.get(&v.metadata.uid)?;
+        Some((self.crypt.device_of(v.metadata.uid), size))
+    }
+
     fn pool(&self, p: &StoragePool) -> drv::Pool {
         drv::Pool {
             uid: p.metadata.uid.to_string(),
@@ -235,7 +288,8 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             }
         };
         let pool_of = |v: &Volume| v.status.pool.as_ref().and_then(|r| mine.get(&r.uid));
-        // In use by an instance on this node that lists it: the only mappings that stay open.
+        // In use by an instance on this node that lists it, or by an image that this node imports:
+        // the only mappings that stay open.
         let keep: BTreeSet<String> = a
             .volumes
             .iter()
@@ -243,11 +297,11 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
                 pool_of(v).is_some()
                     && v.metadata.delete_time.is_none()
                     && v.status.phase != VolumePhase::Deleting
-                    && v.status.attached_to.is_some_and(|i| {
+                    && (v.status.attached_to.is_some_and(|i| {
                         a.instances.get(&i).is_some_and(|(scope, names)| {
                             *scope == v.metadata.scope && names.contains(&v.metadata.name)
                         })
-                    })
+                    }) || a.image_of(v).is_some())
             })
             .map(|v| mapping(v.metadata.uid))
             .collect();

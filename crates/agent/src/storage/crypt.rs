@@ -50,6 +50,10 @@ pub trait Crypt: Send + Sync + 'static {
     fn close(&self, name: &str) -> impl Future<Output = Result<(), String>> + Send;
     /// The open mappings named [`MAPPING_PREFIX`]`*`, with their size in bytes.
     fn opened(&self) -> impl Future<Output = Result<BTreeMap<String, u64>, String>> + Send;
+    /// Where the open mapping of volume `uid` is read and written.
+    fn device_of(&self, uid: Uuid) -> PathBuf {
+        device(uid)
+    }
 }
 
 /// `cryptsetup` on block devices.
@@ -308,6 +312,14 @@ impl Crypt for FakeCrypt {
         self.check()?;
         self.state().open.remove(name);
         Ok(())
+    }
+
+    fn device_of(&self, uid: Uuid) -> PathBuf {
+        self.state()
+            .open
+            .get(&mapping(uid))
+            .cloned()
+            .unwrap_or_else(|| device(uid))
     }
 
     async fn opened(&self) -> Result<BTreeMap<String, u64>, String> {

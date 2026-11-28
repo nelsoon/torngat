@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod fetch;
+pub mod import;
 pub mod inventory;
 pub mod join;
 pub mod qemu;
@@ -22,6 +23,7 @@ use std::time::Duration;
 use tonic::transport::Channel;
 use torngat_api::Scope;
 use torngat_api::compute::{Instance, PowerState, Runtime as RuntimeKind};
+use torngat_api::image::{Image, image_volume, staging_volume};
 use torngat_proto::API_VERSION;
 use torngat_proto::v1::control_client::ControlClient;
 use torngat_proto::v1::*;
@@ -258,6 +260,17 @@ pub async fn run<R: Runtime, D: Drivers, C: Crypt>(
     drivers: D,
     crypt: C,
 ) {
+    run_with(cfg, runtime, drivers, crypt, import::QemuImg::default()).await;
+}
+
+/// [`run`], with `tool` for images.
+pub async fn run_with<R: Runtime, D: Drivers, C: Crypt, T: import::ImageTool>(
+    cfg: AgentConfig,
+    runtime: R,
+    drivers: D,
+    crypt: C,
+    tool: T,
+) {
     let setup = Connector::new(&cfg).and_then(|c| Ok((c, cluster_uid(&cfg.ca_pem)?)));
     let (connector, cluster) = match setup {
         Ok(c) => c,
@@ -268,11 +281,15 @@ pub async fn run<R: Runtime, D: Drivers, C: Crypt>(
         }
     };
     let mut storage = Storage::new(drivers, crypt, cluster);
+    let mut importer = import::Importer::new(tool);
     const MIN: Duration = Duration::from_millis(200);
     let mut backoff = MIN;
     loop {
         let started = std::time::Instant::now();
-        if let Err(e) = session(&connector, &runtime, &mut storage).await {
+        let r = session(&connector, &runtime, &mut storage, &mut importer).await;
+        // What a step found can no longer be reported: the next session starts it again.
+        importer.stop_all().await;
+        if let Err(e) = r {
             tracing::warn!(error = %e, "controller session ended");
         }
         // A session that ran for a while was healthy: start backing off from scratch.
@@ -289,11 +306,13 @@ pub async fn run<R: Runtime, D: Drivers, C: Crypt>(
 type Reported = BTreeMap<Uuid, (String, u64, String)>;
 
 /// One connected session: register, heartbeat, follow assignments.
-pub async fn session<R: Runtime, D: Drivers, C: Crypt>(
+pub async fn session<R: Runtime, D: Drivers, C: Crypt, T: import::ImageTool>(
     connector: &Connector,
     runtime: &R,
     storage: &mut Storage<D, C>,
+    importer: &mut import::Importer<T>,
 ) -> Result<(), AgentError> {
+    let step_done = importer.notifier();
     storage.new_session();
     let mut client = connector.connect().await?;
     let status = inventory::collect(env!("CARGO_PKG_VERSION"));
@@ -348,19 +367,26 @@ pub async fn session<R: Runtime, D: Drivers, C: Crypt>(
                         .collect::<Result<Vec<_>, _>>()?;
                     changed = true;
                     assigned = storage::Assigned::decode(
-                        &set.pools_json,
-                        &set.volumes_json,
-                        set.storage_unavailable,
+                        &set,
                         storage::Assigned::instances(&instances),
                     );
                 }
                 _ = retry.tick(), if assigned.is_some() || waiting => {}
+                () = step_done.notified() => {}
             }
             // Storage first: it opens the disks that instances start with.
             // A volume opened or grown since: running instances get it.
             let mut disks_changed = false;
             if let Some(a) = &assigned {
                 disks_changed = storage.reconcile(&mut client, a).await?;
+                let opened = |image: &Image, staging: bool| {
+                    let n = &image.metadata.name;
+                    let name = if staging { staging_volume(n) } else { image_volume(n) };
+                    storage.image_volume(a, image, &name.ok()?)
+                };
+                importer
+                    .reconcile(&mut client, &a.images, &a.image_settings, opened)
+                    .await;
             }
             if changed || waiting || disks_changed {
                 let disks = |i: &Instance| storage.disks(assigned.as_ref(), i);

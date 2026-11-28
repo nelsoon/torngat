@@ -14,8 +14,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use std::time::Duration;
+
+use time::OffsetDateTime;
 use tonic::Status;
 use torngat_api::image::{Image, ImageFormat, ImagePhase, image_of, image_volume, staging_volume};
+use torngat_api::settings::ImageSettings;
 use torngat_api::storage::{
     GIB, MAX_VOLUME_GIB, StoragePool, Volume, VolumeOwner, VolumePhase, VolumeSpec, VolumeType,
 };
@@ -28,8 +32,20 @@ use crate::scheduler::ScheduleError;
 use crate::storage::{PlaceError, all, get, modify, place_volume, rounded, unreadable, usable};
 use crate::{Controller, keys};
 
-/// Largest download and largest disk an image may have.
-pub const MAX_IMAGE_BYTES: u64 = MAX_VOLUME_GIB * GIB;
+/// An import that does not move on for this long fails: its node is gone, or it has no room.
+pub const PROGRESS_DEADLINE: Duration = Duration::from_secs(15 * 60);
+
+/// The operator's image settings.
+pub(crate) async fn settings(store: &Store) -> Result<ImageSettings, PlaceError> {
+    Ok(get::<ImageSettings>(store, &keys::image_settings()?)
+        .await?
+        .map(|(s, _)| s)
+        .unwrap_or_default())
+}
+
+fn now() -> OffsetDateTime {
+    OffsetDateTime::now_utc()
+}
 
 /// The node with the most room in a usable pool of `volume_type`.
 fn choose_node(
@@ -174,6 +190,7 @@ async fn step(
                         return false;
                     }
                     i.status.node = Some(node.clone());
+                    i.status.progress_time = Some(now());
                     i.status.phase = ImagePhase::Importing;
                     i.status.message = None;
                     true
@@ -185,6 +202,36 @@ async fn step(
             let Some(node) = &image.status.node else {
                 return Ok(0);
             };
+            // Without a time (made by an older version): from now.
+            let Some(since) = image.status.progress_time else {
+                return changed(
+                    modify_image(store, image, |i| {
+                        let none = i.status.progress_time.is_none();
+                        i.status.progress_time.get_or_insert_with(now);
+                        none
+                    })
+                    .await,
+                );
+            };
+            let stalled = now() - since > PROGRESS_DEADLINE;
+            if stalled {
+                return changed(
+                    modify_image(store, image, |i| {
+                        if i.status.phase != ImagePhase::Importing
+                            || i.status.progress_time != image.status.progress_time
+                        {
+                            return false;
+                        }
+                        i.status.phase = ImagePhase::Failed;
+                        i.status.message = Some(format!(
+                            "the import stopped: no progress for {} minutes",
+                            PROGRESS_DEADLINE.as_secs() / 60
+                        ));
+                        true
+                    })
+                    .await,
+                );
+            }
             let mut count = 0;
             let wanted = [
                 (staging, image.status.download_bytes),
@@ -308,15 +355,20 @@ async fn tell(store: &Store, image: &Image, problem: &str) -> Result<usize, Sche
     )
 }
 
-/// The images that `node` imports now.
+/// The images that `node` imports now, and the settings for them.
 pub(crate) async fn assigned_images(
     store: &Store,
     node: &Name,
-) -> Result<Vec<Vec<u8>>, ScheduleError> {
+) -> Result<(Vec<Vec<u8>>, Vec<u8>), ScheduleError> {
+    let settings = match settings(store).await {
+        Ok(s) => serde_json::to_vec(&s)?,
+        Err(PlaceError::Controller(e)) => return Err(e),
+        Err(e) => return Err(ScheduleError::Store(StoreError::Raft(e.to_string()))),
+    };
     let images = all::<Image>(store, &keys::all_images()?)
         .await?
         .ok_or_else(unreadable)?;
-    Ok(images
+    let images = images
         .into_iter()
         .filter(|(i, _)| {
             i.status.node.as_ref() == Some(node)
@@ -324,7 +376,8 @@ pub(crate) async fn assigned_images(
                 && i.metadata.delete_time.is_none()
         })
         .map(|(_, v)| v.value)
-        .collect())
+        .collect();
+    Ok((images, settings))
 }
 
 /// Whether `v` holds or stages an image that `node` imports now: then the node may have its key.
@@ -382,7 +435,8 @@ pub(crate) async fn report_image(
             "the image is not being imported",
         ));
     }
-    let size_ok = |b: u64| (1..=MAX_IMAGE_BYTES).contains(&b);
+    let max = settings(store).await.map_err(internal)?.max_image_bytes();
+    let size_ok = |b: u64| (1..=max).contains(&b);
     if r.download_bytes.is_some_and(|b| !size_ok(b)) || r.size_bytes.is_some_and(|b| !size_ok(b)) {
         return Err(bad("size out of range"));
     }
@@ -466,9 +520,8 @@ pub(crate) async fn report_image(
         } else if r.message.is_some() {
             new.message.clone_from(&r.message);
         }
-        if new == i.status {
-            return false;
-        }
+        // Even a report with nothing new: the import goes on.
+        new.progress_time = Some(now());
         i.status = new;
         i.metadata.etag = None;
         true

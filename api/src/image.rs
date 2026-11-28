@@ -165,7 +165,23 @@ pub enum ImageFormat {
     Qcow2,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+impl ImageFormat {
+    /// As in JSON and in node reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImageFormat::Raw => "raw",
+            ImageFormat::Qcow2 => "qcow2",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [ImageFormat::Raw, ImageFormat::Qcow2]
+            .into_iter()
+            .find(|f| f.as_str() == s)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ImageStatus {
     #[serde(default)]
     pub phase: ImagePhase,
@@ -182,6 +198,13 @@ pub struct ImageStatus {
     pub size_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// When the import last moved on: its node was chosen, or the node reported.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub progress_time: Option<time::OffsetDateTime>,
 }
 
 #[cfg(test)]

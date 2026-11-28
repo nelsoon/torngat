@@ -80,6 +80,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/platform/settings/tpm",
             get(settings::get_tpm).put(settings::put_tpm),
         )
+        .route(
+            "/v1/platform/settings/images",
+            get(settings::get_images).put(settings::put_images),
+        )
         .route("/v1/platform/backup", get(backup::get_backup))
         .route(
             "/v1/platform/storagePools",

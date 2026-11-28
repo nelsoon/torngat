@@ -104,7 +104,23 @@ POST /v1/platform/images?image_id=debian-13
   once the image is ready, or failed.
 - A volume type that an image uses cannot be deleted.
 - Deleting an image deletes its volumes first; the image goes once they are gone.
-- Pre-alpha: nodes do not import images yet (the next version does), so an image stays `importing`.
+- The node checks the download against its checksum as it writes it, tells qcow2 from raw by its first bytes, and copies
+  it with `qemu-img` (only qcow2 images are read by `qemu-img` before that, to find their size). qcow2 images with a backing
+  file or a data file are refused. `qemu-img` runs in a unit of its own, `torngat-image-<uid>`: no network, no
+  capabilities, a user of its own, and no device but the two volumes (the download read-only).
+- Downloads reach public addresses only: never loopback, link-local (cloud metadata), private or shared (CGNAT) ones, at
+  every redirect. The node trusts the certificate authorities of its system store.
+- An import with no progress for 15 minutes fails (its node is gone, or it has no room): delete the image and make it again.
+
+```
+PUT /v1/platform/settings/images
+{"max_image_gib": 64, "platform_private_sources": false}
+```
+
+- `max_image_gib`: the largest download and the largest disk of an image (default 64).
+- `platform_private_sources`: platform images may come from private and shared addresses, such as a mirror on your network.
+  Project images never do. Loopback and link-local addresses are never reached. Add the mirror's certificate authority to
+  the nodes' system store if it is your own.
 
 ## On the node
 

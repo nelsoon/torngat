@@ -104,4 +104,7 @@ POST /v1/orgs/acme/projects/web/images?image_id=debian-13
 - The image's volumes are listed with the project's volumes, with `status.owner.image`. They cannot be changed, deleted or
   used in `disks`: deleting the image deletes them.
 - The operator publishes platform images (`/v1/platform/images`) for every project.
-- Pre-alpha: nodes do not import images yet, so an image stays `importing`.
+- The download must be reachable on a public address (not your own network), say how long it is (no compressed or
+  chunked answers), and be at most the operator's limit (64 GiB by default). Up to 5 redirects are followed, to https only.
+- `status.message` says how the import goes (`downloading`, `copying it into its volume`). An import that does not move on
+  for 15 minutes fails.
