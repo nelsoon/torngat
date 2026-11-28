@@ -46,6 +46,29 @@ pub struct BootDisk {
     /// The volume stays when the instance is deleted.
     #[serde(default)]
     pub keep: bool,
+    /// What it holds at first: the disk of a ready image, copied once. Without one it is blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageRef>,
+}
+
+/// An image of the instance's project, or of the platform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageRef {
+    pub name: crate::Name,
+    /// The platform's image of that name, not the project's.
+    #[serde(default)]
+    pub platform: bool,
+}
+
+impl ImageRef {
+    /// Where the image is, for an instance in `scope`.
+    pub fn scope(&self, scope: &crate::Scope) -> crate::Scope {
+        if self.platform {
+            crate::Scope::Platform
+        } else {
+            scope.clone()
+        }
+    }
 }
 
 /// An existing volume of the same project, attached as a data disk. It is never deleted with the
@@ -91,7 +114,7 @@ pub enum InstanceError {
     BootDiskName,
     #[error("disks can only be added while the instance runs; removing one needs it stopped")]
     DisksWhileRunning,
-    #[error("the boot disk cannot be added, removed or change type; its size can only grow")]
+    #[error("the boot disk cannot be added, removed, change type or image; its size can only grow")]
     BootDiskChange,
 }
 
@@ -154,7 +177,9 @@ impl InstanceSpec {
         new.validate()?;
         let same_type = match (&self.boot_disk, &new.boot_disk) {
             (None, None) => true,
-            (Some(a), Some(b)) => a.volume_type == b.volume_type && b.size_gib >= a.size_gib,
+            (Some(a), Some(b)) => {
+                a.volume_type == b.volume_type && a.image == b.image && b.size_gib >= a.size_gib
+            }
             _ => false,
         };
         if !same_type {
@@ -253,6 +278,7 @@ mod tests {
             volume_type: n("fast"),
             size_gib: 10,
             keep: false,
+            image: None,
         };
         let spec = InstanceSpec {
             vcpus: 1,

@@ -378,7 +378,12 @@ pub async fn session<R: Runtime, D: Drivers, C: Crypt, T: import::ImageTool>(
             // A volume opened or grown since: running instances get it.
             let mut disks_changed = false;
             if let Some(a) = &assigned {
-                disks_changed = storage.reconcile(&mut client, a).await?;
+                // Copies first: one that ended is reported in this pass.
+                importer.fill(storage.fills(a)).await;
+                let errors = |u| importer.fill_error(u).map(str::to_owned);
+                disks_changed = storage
+                    .reconcile(&mut client, a, importer.filled(), errors)
+                    .await?;
                 let opened = |image: &Image, staging: bool| {
                     let n = &image.metadata.name;
                     let name = if staging { staging_volume(n) } else { image_volume(n) };

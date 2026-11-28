@@ -397,6 +397,7 @@ impl Control for ControlService {
             deleted: r.deleted,
             formatted: r.formatted,
             open: r.open,
+            filled: r.filled,
             message: message(r.message)?,
         };
         storage::report_volume(&self.ctl.store, &me, &scope, &name, state).await?;

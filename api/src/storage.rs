@@ -293,6 +293,17 @@ impl VolumeOwner {
     }
 }
 
+/// The image that a volume is filled from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fill {
+    /// The image's uid.
+    pub image: Uuid,
+    /// The uid of the image's volume.
+    pub volume: Uuid,
+    /// The size of the image's disk: what is copied.
+    pub size_bytes: u64,
+}
+
 /// A pool, and not one made later with the same name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolRef {
@@ -329,6 +340,12 @@ pub struct VolumeStatus {
     /// What the platform made it for, if it made it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<VolumeOwner>,
+    /// Filled from an image by its node, at its first use: a boot disk made from an image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill: Option<Fill>,
+    /// The node filled it (it reports it): its instance may start. Never cleared.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub filled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }

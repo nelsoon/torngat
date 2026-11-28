@@ -6,9 +6,10 @@ use axum::extract::{Path, State};
 use serde::Deserialize;
 use torngat_api::Scope;
 use torngat_api::image::{Image, ImageError, ImagePhase, ImageSpec, image_volume, staging_volume};
+use torngat_api::storage::Volume;
 use uuid::Uuid;
 
-use crate::crud::{Input, Kind, Params, Update, invalid};
+use crate::crud::{Input, Kind, Params, Update, any, invalid};
 use crate::handlers::{
     DeleteQuery, ListQuery, ListResponse, body, decode, name, project_scope, query,
 };
@@ -81,6 +82,19 @@ async fn delete(
     let cur = IMAGES.find_for_delete(st, &scope, &n, query(q)?).await?;
     let rev = cur.revision;
     let mut i: Image = decode(cur)?;
+    let uid = i.metadata.uid;
+    // A boot disk of an instance, not yet filled.
+    let filling = |v: &Volume| {
+        v.status.fill.is_some_and(|f| f.image == uid)
+            && !v.status.filled
+            && v.status.owner.is_some()
+            && v.metadata.delete_time.is_none()
+    };
+    if any(st, &crate::storage::VOLUMES.all()?, filling).await? {
+        return Err(ApiError::FailedPrecondition(format!(
+            "{n} is being copied to a boot disk: try again later"
+        )));
+    }
     // The controller makes volumes only once it gave the image a node; giving it one changes the
     // revision, so the delete fails.
     if i.status.node.is_none() {

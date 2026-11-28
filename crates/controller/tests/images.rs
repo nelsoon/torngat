@@ -511,12 +511,13 @@ async fn the_agent_imports_images() {
     std::fs::create_dir(root.path().join("data")).unwrap();
     let crypt = FakeCrypt::default();
     let tool = FakeImageTool::default();
+    let runtime = torngat_agent::FakeRuntime::default();
     let disk: Vec<u8> = (0..3u32 << 20).map(|i| (i % 251) as u8).collect();
     let url = "https://cloud.example/disk.raw";
     tool.files.lock().unwrap().insert(url.into(), disk.clone());
     tokio::spawn(torngat_agent::run_with(
         node_cfg(&e, "n1").await,
-        torngat_agent::FakeRuntime::default(),
+        runtime.clone(),
         FileDriver::new(root.path(), 8 * GIB, false),
         crypt.clone(),
         tool,
@@ -612,4 +613,61 @@ async fn the_agent_imports_images() {
         held.iter().any(|f| f.starts_with(&disk)),
         "no volume holds the disk"
     );
+
+    // Instances whose boot disk is made from an image: a ready one, and one that failed.
+    let project = Scope::Project {
+        org: n("acme"),
+        project: n("web"),
+    };
+    let vm = |name: &str, image: &str| {
+        object(
+            name,
+            &project,
+            json!({"vcpus": 1, "memory_mib": 64, "boot_disk": {"volume_type": "fast",
+                   "size_gib": 1, "image": {"name": image, "platform": true}}}),
+            json!({}),
+        )
+    };
+    for (name, image) in [("web", "good"), ("other", "bad")] {
+        put(
+            &e.store,
+            keys::instance(&project, &n(name)).unwrap(),
+            &vm(name, image),
+        )
+        .await;
+    }
+    let inst = |name: &'static str| {
+        let key = keys::instance(&project, &n(name)).unwrap();
+        let e = &e;
+        async move {
+            read::<torngat_api::compute::Instance>(e, key)
+                .await
+                .unwrap()
+        }
+    };
+    until("started", || async {
+        inst("web").await.status.phase == torngat_api::compute::InstancePhase::Running
+    })
+    .await;
+    let boot = volume_now(&e, &project, "web-boot").await.unwrap();
+    assert!(boot.status.filled);
+    assert_eq!(boot.status.fill.unwrap().size_bytes, disk.len() as u64);
+    let web = inst("web").await;
+    let disks = runtime.disks(web.metadata.uid).unwrap();
+    assert_eq!(disks.len(), 1);
+    let mut head = vec![0; disk.len()];
+    {
+        use std::io::Read;
+        use torngat_agent::storage::Crypt;
+        std::fs::File::open(crypt.device_of(disks[0].volume))
+            .unwrap()
+            .read_exact(&mut head)
+            .unwrap();
+    }
+    assert_eq!(head, disk, "the boot disk does not hold the image");
+    until("told", || async {
+        inst("other").await.status.message.as_deref() == Some("image bad failed")
+    })
+    .await;
+    assert!(volume_now(&e, &project, "other-boot").await.is_none());
 }

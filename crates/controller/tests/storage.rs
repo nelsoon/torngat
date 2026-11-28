@@ -804,6 +804,7 @@ async fn interrupted_placement_growth_and_deletion() {
         message: String::new(),
         formatted: false,
         open: false,
+        filled: false,
     };
     let code = |r: Result<tonic::Response<_>, tonic::Status>| r.map(|_| ()).map_err(|s| s.code());
     assert_eq!(

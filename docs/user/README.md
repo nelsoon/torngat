@@ -1,7 +1,7 @@
 # User guide
 
 Pre-alpha: there is an API, no command-line client or web interface yet, and a single administrator
-token. Instances have no networks yet, and boot disks cannot be made from images yet.
+token. Instances have no networks yet.
 
 The API listens on the controller's loopback interface. Through a tunnel:
 
@@ -63,8 +63,12 @@ To stop it, read its `metadata.etag`, then send a `PATCH`:
 - The guest sees them as virtio disks, the boot disk first, then `disks` in order. Each has the serial number made of the last
   20 hex digits of its volume's `uid` (without dashes), so Linux guests find it at `/dev/disk/by-id/virtio-<serial>`.
 - It boots from the boot disk with UEFI firmware (no legacy BIOS): the disk needs an EFI system partition, as cloud images
-  have. Its UEFI variables (boot entries) are kept across its restarts. A blank boot disk boots nothing: images to
-  start from come later. Secure Boot inside the guest is not offered yet.
+  have. Its UEFI variables (boot entries) are kept across its restarts. A blank boot disk boots nothing: make it from an
+  image (below). Secure Boot inside the guest is not offered yet.
+- `"boot_disk": {"volume_type": "fast", "size_gib": 10, "image": {"name": "debian-13"}}` makes the boot disk from a ready
+  image of the project, copied once; with `"platform": true` from the platform's image of that name. `size_gib` must hold
+  the image's disk (`status.size_bytes`, rounded up to GiB). The instance starts once the copy is done; until then
+  `status.message` says what it waits for. The image cannot change afterwards, and it cannot be deleted while a copy runs.
 - While the instance waits for its disks to be ready on its node, it stays `starting`, and `status.message` says which.
   A start that fails is tried again every 10 seconds.
 
@@ -84,7 +88,7 @@ POST /v1/orgs/acme/projects/web/volumes?volume_id=data
 ## Images
 
 An image is the content of a disk to start from, such as a cloud image. It is downloaded once and kept as a read-only,
-encrypted copy. Boot disks made from images come in a later version.
+encrypted copy. Boot disks are made from it (see [Disks](#disks)).
 
 ```
 POST /v1/orgs/acme/projects/web/images?image_id=debian-13
