@@ -14,7 +14,7 @@ use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
 use serde_json::{Value, json};
 
 /// Longest line read from QEMU.
-const MAX_LINE: u64 = 64 * 1024;
+const MAX_LINE: u64 = 1 << 20;
 
 pub struct Qmp {
     /// Written to through `get_ref`.

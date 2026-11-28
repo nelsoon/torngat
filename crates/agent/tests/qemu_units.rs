@@ -1,4 +1,5 @@
-//! Instances as systemd units, with real QEMU and KVM. Needs root, systemd, QEMU and /dev/kvm:
+//! Instances as systemd units, with real QEMU and KVM. Needs root, systemd, QEMU, OVMF, mtools,
+//! systemd-boot-efi and /dev/kvm:
 //!
 //!   cargo test -p torngat-agent --test qemu_units --no-run
 //!   sudo <binary> --ignored --test-threads=1
@@ -146,37 +147,39 @@ async fn instances_are_units_of_their_own() {
     assert!(!r.running().await.iter().any(|u| *u == ua || *u == ub));
 }
 
-/// A boot sector that writes `TORNGAT-BOOT-OK` to the first serial port and halts.
-fn boot_sector() -> Vec<u8> {
-    let mut b = vec![
-        0x31, 0xc0, // xor ax, ax
-        0x8e, 0xd8, // mov ds, ax
-        0xfc, // cld
-        0xbe, 0x17, 0x7c, // mov si, 0x7c17 (the text)
-        0xba, 0xf8, 0x03, // mov dx, 0x3f8
-        0xac, // lodsb
-        0x84, 0xc0, // test al, al
-        0x74, 0x03, // jz +3
-        0xee, // out dx, al
-        0xeb, 0xf8, // jmp lodsb
-        0xfa, // cli
-        0xf4, // hlt
-        0xeb, 0xfd, // jmp hlt
-    ];
-    b.extend_from_slice(b"TORNGAT-BOOT-OK\r\n\0");
-    b.resize(510, 0);
-    b.extend_from_slice(&[0x55, 0xaa]);
-    b
+/// The loader a UEFI guest boots: systemd-boot (package systemd-boot-efi).
+const LOADER: &str = "/usr/lib/systemd/boot/efi/systemd-bootx64.efi";
+
+/// A disk a UEFI guest boots from: a FAT file system (no partition table) with the loader as
+/// `\EFI\BOOT\BOOTX64.EFI`, made with mtools.
+fn esp(dir: &std::path::Path) -> Vec<u8> {
+    let f = dir.join("esp");
+    std::fs::write(&f, vec![0u8; 8 << 20]).unwrap();
+    let img = f.to_str().unwrap();
+    for args in [
+        vec!["mformat", "-i", img, "::"],
+        vec!["mmd", "-i", img, "::/EFI", "::/EFI/BOOT"],
+        vec!["mcopy", "-i", img, LOADER, "::/EFI/BOOT/BOOTX64.EFI"],
+    ] {
+        let ok = Command::new(args[0])
+            .args(&args[1..])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "{args:?}");
+    }
+    std::fs::read(&f).unwrap()
 }
 
-/// A loop device over a new 1 MiB file that starts with `head`.
-struct Loop(String);
+/// A loop device over a new file of at least 1 MiB that starts with `head`, standing for a
+/// volume.
+struct Loop(String, std::path::PathBuf, Uuid);
 
 impl Loop {
     fn new(dir: &std::path::Path, name: &str, head: &[u8]) -> Self {
         let f = dir.join(name);
         let mut data = head.to_vec();
-        data.resize(1 << 20, 0);
+        data.resize(data.len().max(1 << 20), 0);
         std::fs::write(&f, data).unwrap();
         let out = Command::new("losetup")
             .args(["--find", "--show"])
@@ -184,15 +187,41 @@ impl Loop {
             .output()
             .unwrap();
         assert!(out.status.success());
-        Self(String::from_utf8(out.stdout).unwrap().trim().to_owned())
+        Self(
+            String::from_utf8(out.stdout).unwrap().trim().to_owned(),
+            f,
+            Uuid::now_v7(),
+        )
+    }
+
+    fn size(&self) -> u64 {
+        std::fs::metadata(&self.1).unwrap().len()
     }
 
     fn disk(&self, boot: bool) -> Disk {
         Disk {
-            volume: Uuid::now_v7(),
+            volume: self.2,
             path: self.0.clone().into(),
             boot,
+            size: self.size(),
         }
+    }
+
+    /// Grows the file and the device.
+    fn grow(&self, size: u64) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.1)
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+        assert!(
+            Command::new("losetup")
+                .args(["-c", &self.0])
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 }
 
@@ -202,9 +231,10 @@ impl Drop for Loop {
     }
 }
 
-async fn console_has(uid: Uuid, text: &str) -> bool {
+async fn console_line(uid: Uuid, f: impl Fn(&str) -> bool) -> bool {
     for _ in 0..100 {
-        if std::fs::read_to_string(console_log(uid)).is_ok_and(|s| s.contains(text)) {
+        let log = std::fs::read(console_log(uid)).unwrap_or_default();
+        if String::from_utf8_lossy(&log).lines().any(&f) {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -219,7 +249,7 @@ async fn instances_boot_from_their_disks() {
         .prefix("torngat-disks")
         .tempdir_in("/var/tmp")
         .unwrap();
-    let boot = Loop::new(dir.path(), "boot", &boot_sector());
+    let boot = Loop::new(dir.path(), "boot", &esp(dir.path()));
     let data = Loop::new(dir.path(), "data", &[]);
     let r = rt();
 
@@ -229,18 +259,53 @@ async fn instances_boot_from_their_disks() {
     r.start(&a, &[boot.disk(true), data.disk(false)])
         .await
         .unwrap();
-    assert!(console_has(ua, "TORNGAT-BOOT-OK").await, "did not boot");
+    // The firmware starts the loader from the boot disk (a PCI device), not one of its own.
+    assert!(
+        console_line(ua, |l| l.contains("BdsDxe: starting Boot0001")
+            && l.contains("PciRoot"))
+        .await,
+        "did not boot from its disk"
+    );
+    // Its UEFI variables are its own, kept across restarts.
+    let vars = format!("/var/lib/private/torngat-vm/{ua}/uefi-vars.fd");
+    let size = std::fs::metadata(&vars).map(|m| m.len()).ok();
+    assert_eq!(
+        size,
+        Some(540672),
+        "UEFI variables missing or of the wrong size"
+    );
     let pid = show(ua, "MainPID");
-    let open: BTreeSet<_> = std::fs::read_dir(format!("/proc/{pid}/fd"))
-        .unwrap()
-        .filter_map(|e| std::fs::read_link(e.unwrap().path()).ok())
-        .collect();
+    let open = open_in(&pid);
     for d in [&boot.0, &data.0] {
         assert!(
             open.contains(std::path::Path::new(d)),
             "{d} not open: {open:?}"
         );
     }
+
+    // Added while it runs, on a free port; and grown.
+    let extra = Loop::new(dir.path(), "extra", &[]);
+    r.attach(ua, &[boot.disk(true), data.disk(false), extra.disk(false)])
+        .await
+        .unwrap();
+    assert!(
+        open_in(&pid).contains(std::path::Path::new(&extra.0)),
+        "not added"
+    );
+    data.grow(2 << 20);
+    r.attach(ua, &[boot.disk(true), data.disk(false), extra.disk(false)])
+        .await
+        .unwrap();
+    assert_eq!(qemu_size(ua, &pid, data.2), 2 << 20, "not grown");
+    // Also from an agent that restarted, which asks QEMU what it has: nothing changes.
+    let again = rt();
+    again.running().await;
+    again
+        .attach(ua, &[boot.disk(true), data.disk(false), extra.disk(false)])
+        .await
+        .unwrap();
+    assert_eq!(qemu_size(ua, &pid, extra.2), 1 << 20);
+    assert_eq!(show(ua, "MainPID"), pid);
 
     // An agent that restarts finds it again: it ran, so it is not started again.
     assert!(rt().running().await.contains(&ua));
@@ -253,6 +318,7 @@ async fn instances_boot_from_their_disks() {
         volume: Uuid::now_v7(),
         path: dir.path().join("boot"),
         boot: true,
+        size: 0,
     };
     let e = r.start(&b, &[bad]).await.unwrap_err();
     assert!(e.contains("not a block device"), "{e}");
@@ -270,13 +336,13 @@ async fn instances_boot_from_their_disks() {
         "--service-type=exec".into(),
     ];
     run.extend(
-        qemu::properties(&c)
+        qemu::properties(&c, &QemuConfig::default())
             .into_iter()
             .map(|p| format!("--property={p}")),
     );
     run.push("--".into());
     run.push(QemuConfig::default().qemu);
-    run.extend(qemu::args(&c));
+    run.extend(qemu::args(&c, &QemuConfig::default()));
     assert!(
         Command::new("systemd-run")
             .args(&run)
@@ -297,4 +363,41 @@ async fn instances_boot_from_their_disks() {
 
     r.stop(ua).await.unwrap();
     assert!(!r.running().await.contains(&ua));
+}
+
+/// The files a process has open.
+fn open_in(pid: &str) -> BTreeSet<std::path::PathBuf> {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .filter_map(|e| std::fs::read_link(e.unwrap().path()).ok())
+        .collect()
+}
+
+/// The size QEMU gives `volume`'s disk.
+fn qemu_size(uid: Uuid, pid: &str, volume: Uuid) -> u64 {
+    use std::time::Duration;
+    let s =
+        std::os::unix::net::UnixStream::connect(format!("/run/torngat-vm/{uid}/qmp.sock")).unwrap();
+    let mut q = torngat_agent::qmp::Qmp::new(
+        s,
+        pid.parse().unwrap(),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let nodes = q
+        .execute(
+            "query-named-block-nodes",
+            Some(serde_json::json!({ "flat": true })),
+        )
+        .unwrap();
+    let node = format!("v{}", &volume.simple().to_string()[2..]);
+    nodes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["node-name"] == node.as_str())
+        .and_then(|n| n.pointer("/image/virtual-size"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| panic!("no node {node}"))
 }

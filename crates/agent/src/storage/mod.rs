@@ -39,6 +39,13 @@ use crate::{AgentError, sanitize};
 const KEY_WAIT: Duration = Duration::from_secs(5);
 const MAX_KEY_WAIT: Duration = Duration::from_secs(300);
 
+/// An instance's disks: those open on this node, and what it waits for if not all are.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Disks {
+    pub ready: Vec<Disk>,
+    pub waiting: Option<String>,
+}
+
 /// What the controller assigned: decoded, or nothing at all.
 #[derive(Debug, Default, Clone)]
 pub struct Assigned {
@@ -112,8 +119,8 @@ pub struct Storage<D, C> {
     refused: HashMap<Uuid, (Instant, Duration)>,
     pools_reported: HashMap<Uuid, PoolReport>,
     volumes_reported: HashMap<Uuid, VolumeReport>,
-    /// Volumes open for an instance on this node, as of the last pass.
-    open: BTreeSet<Uuid>,
+    /// Volumes open for an instance on this node, with their size, as of the last pass.
+    open: BTreeMap<Uuid, u64>,
 }
 
 impl<D: Drivers, C: Crypt> Storage<D, C> {
@@ -126,7 +133,7 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             refused: HashMap::new(),
             pools_reported: HashMap::new(),
             volumes_reported: HashMap::new(),
-            open: BTreeSet::new(),
+            open: BTreeMap::new(),
         }
     }
 
@@ -137,36 +144,50 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
         self.open.clear();
     }
 
-    /// `inst`'s disks, in order (its boot disk first), once all of them are open on this node;
-    /// otherwise what it waits for. `a` is `None` while storage is not available.
-    pub fn disks(&self, a: Option<&Assigned>, inst: &Instance) -> Result<Vec<Disk>, String> {
+    /// `inst`'s disks that are open on this node, in order (its boot disk first), and what it
+    /// still waits for. `a` is `None` while storage is not available.
+    pub fn disks(&self, a: Option<&Assigned>, inst: &Instance) -> Disks {
+        let mut out = Disks::default();
         let name = &inst.metadata.name;
-        let boot = inst.spec.boot_volume(name).map_err(|e| e.to_string())?;
-        let names = inst.spec.volumes(name).map_err(|e| e.to_string())?;
+        let names = match inst.spec.volumes(name) {
+            Ok(n) => n,
+            Err(e) => {
+                out.waiting = Some(e.to_string());
+                return out;
+            }
+        };
         if names.is_empty() {
-            return Ok(vec![]);
+            return out;
         }
-        let a = a.ok_or("waiting for storage")?;
-        names
-            .iter()
-            .map(|n| {
-                let v = a
-                    .volumes
-                    .iter()
-                    .find(|v| {
-                        v.metadata.scope == inst.metadata.scope
-                            && v.metadata.name == *n
-                            && v.status.attached_to == Some(inst.metadata.uid)
-                    })
-                    .filter(|v| self.open.contains(&v.metadata.uid))
-                    .ok_or_else(|| format!("waiting for volume {n}"))?;
-                Ok(Disk {
-                    volume: v.metadata.uid,
-                    path: device(v.metadata.uid),
-                    boot: boot.as_ref() == Some(n),
+        let Some(a) = a else {
+            out.waiting = Some("waiting for storage".into());
+            return out;
+        };
+        let boot = inst.spec.boot_volume(name).ok().flatten();
+        for n in &names {
+            let open = a
+                .volumes
+                .iter()
+                .find(|v| {
+                    v.metadata.scope == inst.metadata.scope
+                        && v.metadata.name == *n
+                        && v.status.attached_to == Some(inst.metadata.uid)
                 })
-            })
-            .collect()
+                .and_then(|v| Some((v.metadata.uid, *self.open.get(&v.metadata.uid)?)));
+            match open {
+                Some((uid, size)) => out.ready.push(Disk {
+                    volume: uid,
+                    path: device(uid),
+                    boot: boot.as_ref() == Some(n),
+                    size,
+                }),
+                None => {
+                    out.waiting
+                        .get_or_insert_with(|| format!("waiting for volume {n}"));
+                }
+            }
+        }
+        out
     }
 
     fn pool(&self, p: &StoragePool) -> drv::Pool {
@@ -177,13 +198,14 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
         }
     }
 
-    /// Brings the node's storage in line with `a`. Errors end the session; failures of one pool
-    /// or volume are reported and the others go on.
+    /// Brings the node's storage in line with `a`, and tells whether the open volumes or their
+    /// sizes changed. Errors end the session; failures of one pool or volume are reported and the
+    /// others go on.
     pub async fn reconcile(
         &mut self,
         client: &mut ControlClient<Channel>,
         a: &Assigned,
-    ) -> Result<(), AgentError> {
+    ) -> Result<bool, AgentError> {
         let mut mine = BTreeMap::new();
         for p in &a.pools {
             let r = self.pool_step(p, a).await;
@@ -200,7 +222,7 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             Ok(o) => o,
             Err(e) => {
                 tracing::warn!(error = %e, "cannot list the open volumes");
-                return Ok(());
+                return Ok(false);
             }
         };
         let pool_of = |v: &Volume| v.status.pool.as_ref().and_then(|r| mine.get(&r.uid));
@@ -238,7 +260,7 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             }
         }
 
-        let mut in_use = BTreeSet::new();
+        let mut in_use = BTreeMap::new();
         for v in &a.volumes {
             let Some((pool, kind)) = pool_of(v) else {
                 continue;
@@ -249,7 +271,7 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
                 continue;
             };
             if use_.is_some() && r.open {
-                in_use.insert(v.metadata.uid);
+                in_use.insert(v.metadata.uid, r.size_bytes);
             }
             // Still open: the controller does not give it to another instance yet.
             r.open |= busy.contains(&name);
@@ -258,8 +280,9 @@ impl<D: Drivers, C: Crypt> Storage<D, C> {
             })
             .await?;
         }
+        let changed = self.open != in_use;
         self.open = in_use;
-        Ok(())
+        Ok(changed)
     }
 
     async fn pool_step(&self, p: &StoragePool, a: &Assigned) -> PoolReport {

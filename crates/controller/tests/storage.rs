@@ -36,6 +36,21 @@ async fn put(store: &Store, key: Key, v: &impl Serialize) {
         .unwrap();
 }
 
+/// A stopped instance that lists volume `vol`, so that the controller keeps the volume attached to
+/// it (a volume attached to an instance that does not exist is released). Returns its uid.
+async fn user_of(e: &Env, scope: &Scope, vol: &str) -> Uuid {
+    let name = format!("user-{vol}");
+    let o = object(
+        &name,
+        scope,
+        json!({"vcpus": 1, "memory_mib": 64, "power_state": "stopped", "disks": [{"volume": vol}]}),
+        json!({}),
+    );
+    let uid: Uuid = serde_json::from_value(o["metadata"]["uid"].clone()).unwrap();
+    put(&e.store, keys::instance(scope, &n(&name)).unwrap(), &o).await;
+    uid
+}
+
 fn object(
     name: &str,
     scope: &Scope,
@@ -110,7 +125,7 @@ async fn volume(e: &Env, scope: &Scope, name: &str, pool: &StoragePool) -> Volum
         json!({
             "phase": "placed",
             "pool": {"name": pool.metadata.name, "uid": pool.metadata.uid},
-            "attached_to": Uuid::now_v7(),
+            "attached_to": user_of(e, scope, name).await,
         }),
     );
     let v: Volume = serde_json::from_value(v).unwrap();
@@ -203,6 +218,7 @@ async fn states() {
     let mut n1 = node(&e, "n1", "active").await;
     let p = pool(&e, "n1-data", "n1").await;
     let mut v = volume(&e, &scope(), "a", &p).await;
+    let user = v.status.attached_to.unwrap();
     let no = Err(Code::FailedPrecondition);
 
     for phase in [
@@ -219,7 +235,7 @@ async fn states() {
 
     // With data on it but without a key record, another key is never made.
     v.status.formatted = true;
-    v.status.attached_to = Some(Uuid::now_v7());
+    v.status.attached_to = Some(user);
     save(&e, &scope(), &v).await;
     assert_eq!(key(&mut n1, &v).await, Err(Code::Internal));
 
@@ -228,7 +244,7 @@ async fn states() {
     v.status.attached_to = None;
     save(&e, &scope(), &v).await;
     assert_eq!(key(&mut n1, &v).await, no);
-    v.status.attached_to = Some(Uuid::now_v7());
+    v.status.attached_to = Some(user);
     save(&e, &scope(), &v).await;
     let k = key(&mut n1, &v).await;
     assert!(k.is_ok());
@@ -247,7 +263,7 @@ async fn states() {
     v.status.attached_to = None;
     save(&e, &scope(), &v).await;
     assert_eq!(key(&mut n1, &v).await, no);
-    v.status.attached_to = Some(Uuid::now_v7());
+    v.status.attached_to = Some(user);
     save(&e, &scope(), &v).await;
 
     for (phase, ok) in [
@@ -805,7 +821,7 @@ async fn interrupted_placement_growth_and_deletion() {
 
     // Deletion: once the node deleted the blocks, the space, the key and the object go.
     let mut a = now;
-    a.status.attached_to = Some(Uuid::now_v7());
+    a.status.attached_to = Some(user_of(&e, &scope(), "a").await);
     save(&e, &scope(), &a).await;
     key(&mut n1, &a).await.unwrap();
     a = volume_now(&e, "a").await.unwrap();
@@ -1135,6 +1151,25 @@ async fn instances_get_their_disks() {
             .state()
             .open
             .contains_key(&mapping(data2.metadata.uid))
+    })
+    .await;
+    // The running instance gets it.
+    until("given to the instance", || async {
+        runtime
+            .disks(web.metadata.uid)
+            .is_some_and(|d| d.iter().any(|d| d.volume == data2.metadata.uid))
+    })
+    .await;
+    // Grown while it runs: the instance gets the new size.
+    let before = runtime.disks(web.metadata.uid).unwrap()[1].size;
+    change(
+        &e,
+        keys::volume(&scope(), &n("data-1")).unwrap(),
+        |v: &mut torngat_api::storage::Volume| v.spec.size_gib = 2,
+    )
+    .await;
+    until("grown in the instance", || async {
+        runtime.disks(web.metadata.uid).unwrap()[1].size > before
     })
     .await;
 
