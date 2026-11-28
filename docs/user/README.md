@@ -104,7 +104,7 @@ POST /v1/orgs/acme/projects/web/images?image_id=debian-13
   they are made for it.
 - Only `description` can change. To change anything else, delete the image and make it again.
 - `status.phase`: `pending`, `importing`, `ready`, `failed` (`status.message` says why) or `deleting`. `status.size_bytes` is
-  the size of the disk it holds, and `status.format` what was found.
+  the size of the disk it holds (for a raw image, its length rounded up to 512 bytes), and `status.format` what was found.
 - The image's volumes are listed with the project's volumes, with `status.owner.image`. They cannot be changed, deleted or
   used in `disks`: deleting the image deletes them.
 - The operator publishes platform images (`/v1/platform/images`) for every project.
