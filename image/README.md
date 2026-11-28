@@ -119,6 +119,13 @@ readable copy of the signing certificate (`dev-signing.crt` for a `--dev` image)
 machines or inside volumes are not visible, nothing is activated by itself; with `--zfs` also module
 signatures, pools of other machines, and LUKS2 on a zvol.
 
+## Image import test
+
+`image/test/images.sh IMAGE`, same environment, with internet access: imports the Debian 13 cloud image (checksum from
+Debian's `SHA512SUMS`) through the API, and checks that a wrong checksum fails, a private address is never fetched, and
+deleting the image deletes its volume. `crates/agent/tests/image_tool.rs` (as root, on a VM) checks `qemu-img` in its
+sandbox on loop devices.
+
 ## Hardware test
 
 `image/test/hardware.sh IMAGE`, same environment: boots on emulated server disk controllers and network

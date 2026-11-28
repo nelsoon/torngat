@@ -60,8 +60,8 @@ async fn until<F: Future<Output = bool>>(what: &str, mut f: impl FnMut() -> F) {
     }
 }
 
-/// An enrolled, active node, and its connection.
-async fn node(e: &Env, name: &str) -> Client {
+/// An enrolled, active node's credentials.
+async fn node_cfg(e: &Env, name: &str) -> torngat_agent::AgentConfig {
     let issued = e.ca.issue_node(&n(name)).unwrap();
     torngat_controller::identity::enroll(
         &e.store,
@@ -77,15 +77,20 @@ async fn node(e: &Env, name: &str) -> Client {
         json!({"phase": "active"}),
     );
     put(&e.store, keys::node(&n(name)).unwrap(), &o).await;
-    let mut c = torngat_agent::connect(&torngat_agent::AgentConfig {
+    torngat_agent::AgentConfig {
         controller_url: format!("https://{}", e.control),
         controller_name: torngat_pki::CONTROLLER_NAME.into(),
         ca_pem: e.ca.cert_pem().as_bytes().to_vec(),
         cert_pem: issued.chain_pem.into_bytes(),
         key: torngat_agent::NodeKey::File(issued.key_pem.unwrap().into_bytes()),
-    })
-    .await
-    .unwrap();
+    }
+}
+
+/// An enrolled, active node, and its connection.
+async fn node(e: &Env, name: &str) -> Client {
+    let mut c = torngat_agent::connect(&node_cfg(e, name).await)
+        .await
+        .unwrap();
     // Images go only to live nodes.
     c.heartbeat(torngat_proto::v1::HeartbeatRequest {})
         .await
@@ -465,10 +470,20 @@ async fn imports_are_bounded() {
     r.download_bytes = GIB + 1;
     assert_eq!(send(&mut n1, r.clone()).await, Err(Code::InvalidArgument));
     // Each report moves the deadline.
-    let before = image_now(&e, &img).await.unwrap().status.progress_time.unwrap();
+    let before = image_now(&e, &img)
+        .await
+        .unwrap()
+        .status
+        .progress_time
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
     send(&mut n1, report(&img)).await.unwrap();
-    let after = image_now(&e, &img).await.unwrap().status.progress_time.unwrap();
+    let after = image_now(&e, &img)
+        .await
+        .unwrap()
+        .status
+        .progress_time
+        .unwrap();
     assert!(after > before);
 
     // No progress for too long: failed.
@@ -484,5 +499,112 @@ async fn imports_are_bounded() {
     assert_eq!(
         i.status.message.as_deref(),
         Some("the import stopped: no progress for 15 minutes")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_agent_imports_images() {
+    use torngat_agent::import::FakeImageTool;
+    use torngat_agent::storage::{FakeCrypt, FileDriver};
+    let e = env(Vec::new(), false).await;
+    let root = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(root.path().join("data")).unwrap();
+    let crypt = FakeCrypt::default();
+    let tool = FakeImageTool::default();
+    let disk: Vec<u8> = (0..3u32 << 20).map(|i| (i % 251) as u8).collect();
+    let url = "https://cloud.example/disk.raw";
+    tool.files.lock().unwrap().insert(url.into(), disk.clone());
+    tokio::spawn(torngat_agent::run_with(
+        node_cfg(&e, "n1").await,
+        torngat_agent::FakeRuntime::default(),
+        FileDriver::new(root.path(), 8 * GIB, false),
+        crypt.clone(),
+        tool,
+    ));
+    let o = object(
+        "data",
+        &Scope::Platform,
+        json!({"node": "n1", "driver": "lvm", "source": "data"}),
+        json!({}),
+    );
+    put(&e.store, keys::storage_pool(&n("data")).unwrap(), &o).await;
+    until("pool ready", || async {
+        read::<StoragePool>(&e, keys::storage_pool(&n("data")).unwrap())
+            .await
+            .unwrap()
+            .status
+            .ready
+    })
+    .await;
+    let t = object(
+        "fast",
+        &Scope::Platform,
+        json!({"pools": ["data"]}),
+        json!(null),
+    );
+    put(&e.store, keys::volume_type(&n("fast")).unwrap(), &t).await;
+
+    let with = |name: &str, sha: String| {
+        object(
+            name,
+            &Scope::Platform,
+            json!({"source": {"url": url, "checksum": {"sha256": sha}}, "volume_type": "fast"}),
+            json!({}),
+        )
+    };
+    let good: Image = serde_json::from_value(with("good", torngat_pki::hex_sha256(&disk))).unwrap();
+    let bad: Image = serde_json::from_value(with("bad", "0".repeat(64))).unwrap();
+    for i in [&good, &bad] {
+        put(
+            &e.store,
+            keys::image(&Scope::Platform, &i.metadata.name).unwrap(),
+            i,
+        )
+        .await;
+    }
+
+    until("imported", || async {
+        image_now(&e, &good).await.unwrap().status.phase == ImagePhase::Ready
+    })
+    .await;
+    let i = image_now(&e, &good).await.unwrap();
+    assert_eq!(
+        (i.status.format, i.status.size_bytes, i.status.message),
+        (Some(ImageFormat::Raw), disk.len() as u64, None)
+    );
+    let target = volume_now(&e, &Scope::Platform, "good-image")
+        .await
+        .unwrap();
+    assert!(target.status.formatted);
+    until("bad failed", || async {
+        image_now(&e, &bad).await.unwrap().status.phase == ImagePhase::Failed
+    })
+    .await;
+    let i = image_now(&e, &bad).await.unwrap();
+    assert_eq!(
+        i.status.message.as_deref(),
+        Some("the checksum does not match")
+    );
+
+    // The staging volumes go; the image's volume holds the disk, and is closed again.
+    until("staging deleted", || async {
+        volume_now(&e, &Scope::Platform, "good-staging")
+            .await
+            .is_none()
+            && volume_now(&e, &Scope::Platform, "bad-staging")
+                .await
+                .is_none()
+    })
+    .await;
+    until("closed", || async { crypt.state().open.is_empty() }).await;
+    let held: Vec<Vec<u8>> = crypt
+        .state()
+        .formatted
+        .keys()
+        .filter_map(|p| std::fs::read(p).ok())
+        .collect();
+    assert!(
+        held.iter().any(|f| f.starts_with(&disk)),
+        "no volume holds the disk"
     );
 }

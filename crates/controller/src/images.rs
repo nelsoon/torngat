@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use time::OffsetDateTime;
 use tonic::Status;
-use torngat_api::settings::ImageSettings;
 use torngat_api::image::{Image, ImageFormat, ImagePhase, image_of, image_volume, staging_volume};
+use torngat_api::settings::ImageSettings;
 use torngat_api::storage::{
     GIB, MAX_VOLUME_GIB, StoragePool, Volume, VolumeOwner, VolumePhase, VolumeSpec, VolumeType,
 };
