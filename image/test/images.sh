@@ -20,7 +20,7 @@ file=debian-13-genericcloud-amd64.qcow2
 sha=$(curl -fsS "$base/SHA512SUMS" | awk -v f="$file" '$2 == f {print $1}')
 [ "${#sha}" = 128 ] || fail "no checksum for $file"
 
-truncate -s 8G "$work/data.raw"
+truncate -s 10G "$work/data.raw"
 qemu_args+=(-drive "file=$work/data.raw,if=none,id=data,format=raw" -device "virtio-blk-pci,drive=data,serial=data")
 boot_node
 
@@ -100,7 +100,12 @@ until_true "the guest sees the added disk" 180 vdb
 d=$(call GET "$base/volumes/data-1")
 call PATCH "$base/volumes/data-1" "$(jq -c '{etag: .metadata.etag, spec: (.spec + {size_gib: 2})}' <<<"$d")" >/dev/null
 grown() { seen 'vdb.*capacity change'; }
-until_true "the guest sees the disk grow" 180 grown
+for _ in $(seq 180); do grown && break; sleep 1; done
+grown || {
+  call GET "$base/volumes/data-1" | jq -c .status >&2
+  guest "grep -a vdb $log" | tail -n 5 >&2
+  fail "the guest did not see the disk grow"
+}
 echo "ok: the guest sees a disk added and grown while it runs"
 call DELETE "$base/instances/vm" >/dev/null
 boot_gone() { [ "$(code "$(api GET "$base/volumes/vm-boot")")" = 404 ]; }
