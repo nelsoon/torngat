@@ -83,6 +83,8 @@ pub enum NetworkError {
     Cidr(String),
     #[error("a network has at most {MAX_PREFIX_ADDRESSES} addresses (/20) and at least 8 (/29)")]
     Size,
+    #[error("{0} is in a reserved range (this host, loopback, link-local, multicast or reserved)")]
+    Reserved(String),
     #[error("gateway and range must be inside the network, and the gateway outside the range")]
     Range,
     #[error("at most {MAX_INTERFACES} interfaces, each on a different network")]
@@ -212,12 +214,35 @@ impl Cidr {
         (Ipv4Addr::from(base + 1), Ipv4Addr::from(last - 1))
     }
 
+    /// Whether the two share an address.
+    pub fn overlaps(&self, other: &Cidr) -> bool {
+        let p = self.prefix.min(other.prefix);
+        u32::from(self.addr) & Self::mask(p) == u32::from(other.addr) & Self::mask(p)
+    }
+
+    /// A network that instances may have: its size, and none of the ranges that are never a
+    /// network's (0/8, loopback, link-local, multicast and 240/4).
     fn check_size(&self) -> Result<(), NetworkError> {
-        if (8..=u64::from(MAX_PREFIX_ADDRESSES)).contains(&self.size()) {
-            Ok(())
-        } else {
-            Err(NetworkError::Size)
+        if !(8..=u64::from(MAX_PREFIX_ADDRESSES)).contains(&self.size()) {
+            return Err(NetworkError::Size);
         }
+        const RESERVED: [(u32, u8); 5] = [
+            (0x0000_0000, 8),
+            (0x7f00_0000, 8),
+            (0xa9fe_0000, 16),
+            (0xe000_0000, 4),
+            (0xf000_0000, 4),
+        ];
+        let hit = RESERVED.iter().any(|&(a, prefix)| {
+            self.overlaps(&Cidr {
+                addr: Ipv4Addr::from(a),
+                prefix,
+            })
+        });
+        if hit {
+            return Err(NetworkError::Reserved(self.to_string()));
+        }
+        Ok(())
     }
 }
 
@@ -410,6 +435,25 @@ mod m1_tests {
             cidr: Cidr::parse("10.0.0.0/16").unwrap_or_else(|e| unreachable!("{e}")),
         };
         assert_eq!(big.validate(), Err(NetworkError::Size));
+        let cidr = |s: &str| Cidr::parse(s).unwrap_or_else(|e| unreachable!("{e}"));
+        for reserved in [
+            "127.0.0.0/24",
+            "169.254.1.0/24",
+            "0.0.0.0/24",
+            "224.0.0.0/24",
+            "255.255.255.0/24",
+        ] {
+            let spec = NetworkSpec::Private {
+                cidr: cidr(reserved),
+            };
+            assert!(
+                matches!(spec.validate(), Err(NetworkError::Reserved(_))),
+                "{reserved}"
+            );
+        }
+        assert!(cidr("10.1.0.0/24").overlaps(&cidr("10.1.0.128/25")));
+        assert!(cidr("10.1.0.128/25").overlaps(&cidr("10.1.0.0/24")));
+        assert!(!cidr("10.1.0.0/25").overlaps(&cidr("10.1.0.128/25")));
     }
 
     #[test]

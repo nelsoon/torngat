@@ -35,6 +35,7 @@ POST /v1/platform/providerNetworks?provider_network_id=public
 - `tenants`: projects may put instances on it (with a network of theirs naming it). **There is no inbound firewall yet**:
   instances on it are reachable, and filter themselves.
 - `egress`: the nodes' NAT for private networks goes out by it.
+- Two provider networks on the same physnet and VLAN cannot have overlapping addresses. Networks cannot be in 0/8, loopback, link-local, multicast or 240/4.
 - Physnet, VLAN and pool cannot change; `tenants` and `egress` can. A provider network with addresses in use, or named by
   a project's network, cannot be deleted.
 - `status.allocations`: the addresses given out, by instance uid.

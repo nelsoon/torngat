@@ -38,6 +38,8 @@ async fn allocate(store: &Store, src: &Source, inst: Uuid) -> Result<Option<Ipv4
         store,
         &src.key,
         |o: &mut Object<serde_json::Value, NetworkStatus>| {
+            // Again on every try: a try that lost its write recorded nothing.
+            got = None;
             if o.metadata.uid != src.uid || o.metadata.delete_time.is_some() {
                 return false;
             }
@@ -130,6 +132,9 @@ pub async fn interfaces_once(ctl: &Controller) -> Result<usize, ScheduleError> {
         let r = async {
             let scope = &inst.metadata.scope;
             let mut out = Vec::new();
+            // Two networks of the project on one provider network would be one address for two
+            // interfaces.
+            let mut sources = BTreeSet::new();
             for (i, iref) in inst.spec.interfaces.iter().enumerate() {
                 let n = &iref.network;
                 let Some(net) = nets
@@ -164,6 +169,13 @@ pub async fn interfaces_once(ctl: &Controller) -> Result<usize, ScheduleError> {
                         }
                     }
                 };
+                if !sources.insert(src.key.clone()) {
+                    return Err(format!(
+                        "network {n} is on the same provider network as another interface's"
+                    ));
+                }
+                // Always through the store: an address read earlier may have been released
+                // since by another controller's pass.
                 let ip = allocate(store, &src, inst.metadata.uid)
                     .await
                     .map_err(|e| e.to_string())?;
@@ -219,8 +231,9 @@ pub async fn interfaces_once(ctl: &Controller) -> Result<usize, ScheduleError> {
     for (key, status) in held {
         let key = key?;
         for (ip, u) in &status.allocations {
-            // An instance that is not in the list may be one made since: only listed ones count,
-            // and nodes' addresses (not instances) are not this pass's.
+            // Kept: a listed instance's address on a network it lists, and nodes' addresses. An
+            // owner not in the list is gone: the list was read after the network, so an instance
+            // made since has no address in it.
             let unwanted = if lists.contains(u) {
                 !wanted.contains(&(key.clone(), *u))
             } else {

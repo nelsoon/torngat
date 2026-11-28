@@ -152,6 +152,18 @@ pub async fn create_provider_network(
     let n = name("provider network", &query(q)?.provider_network_id)?;
     let input = body(b)?;
     input.spec.validate()?;
+    // One segment, one table of addresses: two would give the same address twice.
+    let spec = input.spec.clone();
+    let overlaps = |p: &ProviderNetwork| {
+        p.spec.physnet == spec.physnet
+            && p.spec.vlan == spec.vlan
+            && p.spec.pool.cidr.overlaps(&spec.pool.cidr)
+    };
+    if any(&st, &PROVIDER_NETWORKS.prefix(&Scope::Platform)?, overlaps).await? {
+        return Err(ApiError::AlreadyExists(
+            "a provider network on this physnet and VLAN with overlapping addresses".into(),
+        ));
+    }
     PROVIDER_NETWORKS
         .create(&st, Scope::Platform, n, Uuid::now_v7(), input)
         .await

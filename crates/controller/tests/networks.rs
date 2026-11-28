@@ -149,4 +149,19 @@ async fn interfaces_get_addresses() {
     })
     .await;
     assert_eq!(inst("a").await.status.interfaces.len(), 1);
+
+    // Two networks of the project on one provider network: refused, not one address twice.
+    let wan2 = object("wan2", &p, json!({"provider": {"network": "public"}}));
+    put(&e, keys::network(&p, &n("wan2")).unwrap(), &wan2).await;
+    put(
+        &e,
+        keys::instance(&p, &n("f")).unwrap(),
+        &vm("f", &["wan", "wan2"]),
+    )
+    .await;
+    until("f told", || async {
+        inst("f").await.status.message.as_deref()
+            == Some("network wan2 is on the same provider network as another interface's")
+    })
+    .await;
 }

@@ -1290,6 +1290,18 @@ async fn networks() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
+    // The same segment with overlapping addresses: two tables for one range.
+    let mut overlap = pool.clone();
+    overlap["cidr"] = json!("203.0.113.128/25");
+    overlap["gateway"] = json!("203.0.113.129");
+    overlap["first"] = json!("203.0.113.130");
+    overlap["last"] = json!("203.0.113.140");
+    let (s, _) = post(
+        "/v1/platform/providerNetworks?provider_network_id=again".into(),
+        json!({"physnet": "physnet1", "pool": overlap}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
 
     // Networks of a project: a provider network only once the operator opens it.
     let nets = "/v1/orgs/acme/projects/web/networks";
