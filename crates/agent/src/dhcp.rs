@@ -289,6 +289,15 @@ pub fn on_frame(table: &PortTable, server_mac: [u8; 6], frame: &[u8]) -> Option<
     Some(frame_of(tag, server_mac, src, from, to, &payload))
 }
 
+/// [`on_frame`], with a panic in the DHCP decoder (on bytes a guest chose) counted as no answer.
+/// dhcproto has `debug_assert!`s on option lengths, and a subtraction that can go below zero.
+pub fn on_frame_guarded(table: &PortTable, server_mac: [u8; 6], frame: &[u8]) -> Option<Vec<u8>> {
+    std::panic::catch_unwind(|| on_frame(table, server_mac, frame)).unwrap_or_else(|_| {
+        tracing::debug!("a frame the decoder could not take: dropped");
+        None
+    })
+}
+
 /// A tagged Ethernet frame with IPv4 and UDP from port 67 to 68.
 fn frame_of(
     tag: u16,
@@ -342,6 +351,9 @@ fn frame_of(
 /// leases in `table` (JSON of [`PortLease`]s, written by the agent), read again when it changes.
 /// Runs until the tap fails.
 pub async fn serve(tap: &str, table: &std::path::Path) -> std::io::Result<()> {
+    // This process only serves DHCP: a panic is a frame dropped (see on_frame_guarded), not a
+    // message per frame a guest sends.
+    std::panic::set_hook(Box::new(|_| {}));
     let tun = tokio_tun::Tun::builder().name(tap).tap().build_one()?;
     let mac = tun.mac_address()?;
     let mut leases = PortTable::new();
@@ -349,7 +361,11 @@ pub async fn serve(tap: &str, table: &std::path::Path) -> std::io::Result<()> {
     let mut buf = vec![0u8; MAX_FRAME + 1];
     loop {
         let n = tun.recv(&mut buf).await?.payload().len();
-        let modified = std::fs::metadata(table).and_then(|m| m.modified()).ok();
+        // The agent writes a new file and renames it: a new inode, even within one clock tick.
+        let modified = std::fs::metadata(table).ok().map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            (m.modified().ok(), m.ino(), m.len())
+        });
         if modified != seen {
             seen = modified;
             leases =
@@ -365,7 +381,7 @@ pub async fn serve(tap: &str, table: &std::path::Path) -> std::io::Result<()> {
                     }
                 };
         }
-        if let Some(reply) = on_frame(&leases, mac, &buf[..n])
+        if let Some(reply) = on_frame_guarded(&leases, mac, &buf[..n])
             && let Err(e) = tun.send(reply.as_slice()).await
         {
             tracing::warn!(error = %e, "cannot send a DHCP reply");
@@ -647,6 +663,35 @@ mod tests {
         );
         let nak = on_frame(&t, server, &request_frame(7, MAC, &other)).unwrap();
         assert_eq!(&nak[18 + 16..18 + 20], &[255; 4]);
+    }
+
+    /// Hostile frames: nothing panics, whatever the bytes.
+    #[test]
+    fn random_frames() {
+        let t: PortTable = [(7, [(MAC, lease())].into())].into();
+        let good = request_frame(7, MAC, &request(MessageType::Discover, &MAC, &[]));
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..20_000 {
+            let mut f = good.clone();
+            // A few bytes changed, or cut short, or all random.
+            match next() % 3 {
+                0 => {
+                    for _ in 0..(next() % 8) {
+                        let i = (next() as usize) % f.len();
+                        f[i] = next() as u8;
+                    }
+                }
+                1 => f.truncate((next() as usize) % f.len()),
+                _ => f = (0..(next() % 600)).map(|_| next() as u8).collect(),
+            }
+            let _ = on_frame_guarded(&t, [2, 0, 0, 0, 0, 0xfe], &f);
+        }
     }
 
     #[test]
